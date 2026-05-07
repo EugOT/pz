@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
         const vcs_hash_raw = b.runAllowFail(
             &.{ "jj", "log", "--no-graph", "-r", "@", "-T", "commit_id.short()" },
             &code,
-            .Ignore,
+            .ignore,
         ) catch "dev";
         const vcs_hash = std.mem.trimRight(u8, vcs_hash_raw, "\n\r ");
         addSharedOpt(opts_pair, []const u8, "git_hash", vcs_hash);
@@ -68,7 +68,7 @@ pub fn build(b: *std.Build) void {
                 "commit_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\"",
             },
             &code,
-            .Ignore,
+            .ignore,
         ) catch "";
         const vcs_log = std.mem.trimRight(u8, vcs_log_raw, "\n\r ");
         addSharedOpt(opts_pair, []const u8, "changelog", vcs_log);
