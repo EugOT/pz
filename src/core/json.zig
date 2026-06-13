@@ -33,13 +33,14 @@ pub fn writeJsonStr(w: anytype, s: []const u8) !void {
 }
 
 test "writeJsonStr escapes control chars" {
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(std.testing.allocator);
-    const w = buf.writer(std.testing.allocator);
+    var buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer buf.deinit();
 
-    try writeJsonStr(w, "a\x00b\x1f\n\r\t\"\\\x08\x0c");
+    try writeJsonStr(&buf.writer, "a\x00b\x1f\n\r\t\"\\\x08\x0c");
+    const got = try buf.toOwnedSlice();
+    defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings(
         "\"a\\u0000b\\u001f\\n\\r\\t\\\"\\\\\\b\\f\"",
-        buf.items,
+        got,
     );
 }

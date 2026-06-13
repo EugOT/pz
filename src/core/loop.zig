@@ -8,6 +8,7 @@ const tools = @import("tools.zig");
 const cancel_mock = @import("../test/cancel_mock.zig");
 const provider_mock = @import("../test/provider_mock.zig");
 const time_mock = @import("../test/time_mock.zig");
+const core_time = @import("time.zig");
 
 pub const Err = error{
     EmptySessionId,
@@ -151,7 +152,7 @@ const Stage = enum {
 pub const CmdCache = struct {
     const max_cmds = 1024;
 
-    entries: std.ArrayListUnmanaged(Entry) = .{},
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
     alloc: std.mem.Allocator,
 
     pub const Key = struct {
@@ -470,7 +471,7 @@ const HistEnt = union(enum) {
 
 const Hist = struct {
     alloc: std.mem.Allocator,
-    items: std.ArrayListUnmanaged(HistEnt) = .{},
+    items: std.ArrayListUnmanaged(HistEnt) = .empty,
 
     fn deinit(self: *Hist) void {
         for (self.items.items) |ent| {
@@ -898,7 +899,7 @@ fn reportRuntimeErr(opts: Opts, stage: Stage, cause: anyerror) !void {
 
 fn nowMs(opts: Opts) i64 {
     if (opts.time) |t| return t.nowMs();
-    return std.time.milliTimestamp();
+    return core_time.milliTimestamp();
 }
 
 fn freePart(alloc: std.mem.Allocator, part: providers.Part) void {
@@ -1063,7 +1064,7 @@ fn buildReqTools(
 }
 
 fn buildSchema(alloc: std.mem.Allocator, params: []const tools.Spec.Param) ![]const u8 {
-    var buf: std.io.Writer.Allocating = .init(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
     errdefer buf.deinit();
 
     var js: std.json.Stringify = .{
@@ -1503,17 +1504,17 @@ fn fmtReqMsgs(alloc: std.mem.Allocator, msgs: []const providers.Msg) ![]u8 {
     for (msgs) |msg| {
         for (msg.parts) |part| {
             switch (part) {
-                .text => |text| try buf.writer(alloc).print("{s}|text|{s}\n", .{
+                .text => |text| try buf.print(alloc, "{s}|text|{s}\n", .{
                     @tagName(msg.role),
                     text,
                 }),
-                .tool_call => |tc| try buf.writer(alloc).print("{s}|tool_call|{s}|{s}|{s}\n", .{
+                .tool_call => |tc| try buf.print(alloc, "{s}|tool_call|{s}|{s}|{s}\n", .{
                     @tagName(msg.role),
                     tc.id,
                     tc.name,
                     tc.args,
                 }),
-                .tool_result => |tr| try buf.writer(alloc).print("{s}|tool_result|{s}|{s}|{}\n", .{
+                .tool_result => |tr| try buf.print(alloc, "{s}|tool_result|{s}|{s}|{}\n", .{
                     @tagName(msg.role),
                     tr.id,
                     tr.output,
@@ -1655,7 +1656,7 @@ test "loop smoke composes replay provider tool and mode" {
     };
 
     const DispatchImpl = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         run_ct: usize = 0,
         out: [1]tools.Output = undefined,
 
@@ -1684,7 +1685,7 @@ test "loop smoke composes replay provider tool and mode" {
                 },
             };
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const ModeImpl = struct {
@@ -1960,15 +1961,12 @@ test "loop smoke finishes single turn with no tools" {
             .evs = evs[0..],
         },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     const reg = tools.Registry.init(&.{});
 
     var mode_impl = ModeImpl{};
-    
 
     const out = try run(.{
         .alloc = std.testing.allocator,
@@ -2102,16 +2100,12 @@ test "loop cancellation emits canceled stop and exits early" {
             .evs = evs[0..],
         },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var cancel_impl = CancelImpl{};
-    
 
     const out = try run(.{
         .alloc = std.testing.allocator,
@@ -2148,7 +2142,7 @@ test "loop cancellation emits canceled stop and exits early" {
 
 test "runTool forwards cancel source to dispatch" {
     const DispatchImpl = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         run_ct: usize = 0,
         out: [1]tools.Output = undefined,
 
@@ -2175,7 +2169,7 @@ test "runTool forwards cancel source to dispatch" {
                 },
             };
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const ModeImpl = struct {
@@ -2238,16 +2232,12 @@ test "runTool forwards cancel source to dispatch" {
     };
 
     var mode_impl = ModeImpl{};
-    
 
     var provider_impl = ProviderImpl{};
-    
 
     var store_impl = StoreImpl{};
-    
 
     var cancel_impl = CancelImpl{};
-    
 
     const tr = try runTool(.{
         .alloc = std.testing.allocator,
@@ -2290,7 +2280,7 @@ test "runTool forwards cancel source to dispatch" {
 
 test "runTool approval hook binds repo policy session and cache state" {
     const DispatchImpl = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         fn run(_: *@This(), call: tools.Call, _: *tools.Sink) !tools.Result {
             return .{
                 .call_id = call.id,
@@ -2302,7 +2292,7 @@ test "runTool approval hook binds repo policy session and cache state" {
                 },
             };
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const ModeImpl = struct {
@@ -2379,11 +2369,11 @@ test "runTool approval hook binds repo policy session and cache state" {
     };
 
     var mode_impl = ModeImpl{};
-    
+
     var provider_impl = ProviderImpl{};
-    
+
     var store_impl = StoreImpl{};
-    
+
     var cache = CmdCache.init(std.testing.allocator);
     defer cache.deinit();
     try cache.add(.{
@@ -2394,7 +2384,6 @@ test "runTool approval hook binds repo policy session and cache state" {
         .life = .{ .session = "sid-approve" },
     });
     var approver_impl = ApproverImpl{};
-    
 
     const tr = try runTool(.{
         .alloc = std.testing.allocator,
@@ -2471,7 +2460,7 @@ test "loop requires approval before bash escalation from malicious comment repla
     const StoreImpl = struct {
         session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), @This().append, @This().replay, @This().deinit).vt },
         rdr: ReaderImpl,
-        events: std.ArrayListUnmanaged(session.Event) = .{},
+        events: std.ArrayListUnmanaged(session.Event) = .empty,
 
         fn append(self: *@This(), _: []const u8, ev: session.Event) !void {
             try self.events.append(std.testing.allocator, try ev.dupe(std.testing.allocator));
@@ -2536,14 +2525,14 @@ test "loop requires approval before bash escalation from malicious comment repla
     };
 
     const BashDispatch = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         run_ct: usize = 0,
 
         fn run(self: *@This(), _: tools.Call, _: *tools.Sink) !tools.Result {
             self.run_ct += 1;
             return error.TestUnexpectedResult;
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const ApproverImpl = struct {
@@ -2573,14 +2562,11 @@ test "loop requires approval before bash escalation from malicious comment repla
         .rdr = .{ .evs = replay[0..] },
     };
     defer store_impl.deinit();
-    
 
     var provider_impl = ProviderImpl{};
     defer if (provider_impl.req_snap) |snap| std.testing.allocator.free(snap);
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var bash_dispatch = BashDispatch{};
     const entries = [_]tools.Entry{
@@ -2602,7 +2588,6 @@ test "loop requires approval before bash escalation from malicious comment repla
     var cache = CmdCache.init(std.testing.allocator);
     defer cache.deinit();
     var approver_impl = ApproverImpl{};
-    
 
     _ = try run(.{
         .alloc = std.testing.allocator,
@@ -2660,7 +2645,7 @@ test "loop requires approval before web post escalation from malicious page repl
     const StoreImpl = struct {
         session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), @This().append, @This().replay, @This().deinit).vt },
         rdr: ReaderImpl,
-        events: std.ArrayListUnmanaged(session.Event) = .{},
+        events: std.ArrayListUnmanaged(session.Event) = .empty,
 
         fn append(self: *@This(), _: []const u8, ev: session.Event) !void {
             try self.events.append(std.testing.allocator, try ev.dupe(std.testing.allocator));
@@ -2725,14 +2710,14 @@ test "loop requires approval before web post escalation from malicious page repl
     };
 
     const WebDispatch = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         run_ct: usize = 0,
 
         fn run(self: *@This(), _: tools.Call, _: *tools.Sink) !tools.Result {
             self.run_ct += 1;
             return error.TestUnexpectedResult;
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const ApproverImpl = struct {
@@ -2762,14 +2747,11 @@ test "loop requires approval before web post escalation from malicious page repl
         .rdr = .{ .evs = replay[0..] },
     };
     defer store_impl.deinit();
-    
 
     var provider_impl = ProviderImpl{};
     defer if (provider_impl.req_snap) |snap| std.testing.allocator.free(snap);
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var web_dispatch = WebDispatch{};
     const entries = [_]tools.Entry{
@@ -2791,7 +2773,6 @@ test "loop requires approval before web post escalation from malicious page repl
     var cache = CmdCache.init(std.testing.allocator);
     defer cache.deinit();
     var approver_impl = ApproverImpl{};
-    
 
     _ = try run(.{
         .alloc = std.testing.allocator,
@@ -2908,16 +2889,12 @@ test "loop compaction trigger runs at configured append cadence" {
             .evs = evs[0..],
         },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var comp_impl = CompactorImpl{};
-    
 
     const out = try run(.{
         .alloc = std.testing.allocator,
@@ -3044,7 +3021,7 @@ test "loop reloads history from compacted replay across repeated compactions" {
     const StoreImpl = struct {
         session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), @This().append, @This().replay, @This().deinit).vt },
         alloc: std.mem.Allocator,
-        events: std.ArrayListUnmanaged(session.Event) = .{},
+        events: std.ArrayListUnmanaged(session.Event) = .empty,
         append_ct: usize = 0,
         replay_ct: usize = 0,
         rdr: ReaderImpl = .{},
@@ -3118,7 +3095,7 @@ test "loop reloads history from compacted replay across repeated compactions" {
     };
 
     const DispatchImpl = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         out: [1]tools.Output = undefined,
 
         fn run(self: *@This(), call: tools.Call, _: *tools.Sink) !tools.Result {
@@ -3140,7 +3117,7 @@ test "loop reloads history from compacted replay across repeated compactions" {
                 },
             };
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const replay = [_]session.Event{
@@ -3229,8 +3206,6 @@ test "loop reloads history from compacted replay across repeated compactions" {
     defer store_impl.deinit();
     try store_impl.reset(&replay);
 
-    
-
     var provider_impl = ProviderImpl{
         .turn1 = turn1[0..],
         .turn2 = turn2[0..],
@@ -3238,7 +3213,6 @@ test "loop reloads history from compacted replay across repeated compactions" {
     defer for (provider_impl.req_snap) |snap| {
         if (snap) |s| std.testing.allocator.free(s);
     };
-    
 
     var dispatch_impl = DispatchImpl{};
     const entries = [_]tools.Entry{
@@ -3261,12 +3235,10 @@ test "loop reloads history from compacted replay across repeated compactions" {
     };
 
     var mode_impl = ModeImpl{};
-    
 
     var comp_impl = CompactorImpl{
         .store = &store_impl,
     };
-    
 
     const out = try run(.{
         .alloc = std.testing.allocator,
@@ -3369,13 +3341,10 @@ test "loop unified runtime error reporting appends stage-tagged error event" {
     };
 
     var provider_impl = ProviderImpl{};
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     try std.testing.expectError(error.StartBoom, run(.{
         .alloc = std.testing.allocator,
@@ -3442,13 +3411,10 @@ test "loop runtime error append failure preserves original error and reports ses
     };
 
     var provider_impl = ProviderImpl{};
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     try std.testing.expectError(error.StartBoom, run(.{
         .alloc = std.testing.allocator,
@@ -3588,16 +3554,12 @@ test "mid-stream cancel delivers partial text then canceled stop" {
     var provider_impl = ProviderImpl{
         .stream_impl = .{ .evs = evs[0..] },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var cancel_impl = CancelImpl{};
-    
 
     const out = try run(.{
         .alloc = std.testing.allocator,
@@ -3743,16 +3705,12 @@ test "loop cancel append failure still returns canceled turn and reports session
     var provider_impl = ProviderImpl{
         .stream_impl = .{ .evs = evs[0..] },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var cancel_impl = CancelImpl{};
-    
 
     const out = try run(.{
         .alloc = std.testing.allocator,
@@ -3865,7 +3823,11 @@ test "abort slot cancels blocked provider stream quickly and preserves partial t
         slot: *providers.AbortSlot,
 
         fn run(self: *@This()) void {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+            std.Io.sleep(
+                std.Io.Threaded.global_single_threaded.io(),
+                .fromMilliseconds(20),
+                .awake,
+            ) catch return;
             self.cancel.request();
             self.slot.abort();
         }
@@ -3883,13 +3845,11 @@ test "abort slot cancels blocked provider stream quickly and preserves partial t
     defer provider_impl.deinit();
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var cancel_impl = cancel_mock.Flag{};
-    
+
     var abort_slot = providers.AbortSlot{};
     var cancel_ctx = CancelCtx{
         .cancel = &cancel_impl,
@@ -3898,7 +3858,7 @@ test "abort slot cancels blocked provider stream quickly and preserves partial t
     const cancel_thr = try std.Thread.spawn(.{}, CancelCtx.run, .{&cancel_ctx});
     defer cancel_thr.join();
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = core_time.nanoTimestamp();
     const out = try run(.{
         .alloc = std.testing.allocator,
         .sid = "sid-block-cancel",
@@ -3911,7 +3871,7 @@ test "abort slot cancels blocked provider stream quickly and preserves partial t
         .cancel = &cancel_impl.cancel_src,
         .abort_slot = &abort_slot,
     });
-    const elapsed_ms: i128 = @divTrunc(std.time.nanoTimestamp() - start_ns, std.time.ns_per_ms);
+    const elapsed_ms: i128 = @divTrunc(core_time.nanoTimestamp() - start_ns, std.time.ns_per_ms);
 
     try std.testing.expect(elapsed_ms < 200);
     const OhSnap = @import("ohsnap");
@@ -4007,7 +3967,11 @@ test "P0-2 cancel latency: streaming every 50ms cancels within 200ms with partia
 
         fn run(self: *@This()) void {
             // Cancel after 100ms — within the 50ms streaming cadence.
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            std.Io.sleep(
+                std.Io.Threaded.global_single_threaded.io(),
+                .fromMilliseconds(100),
+                .awake,
+            ) catch return;
             self.cancel.request();
             self.slot.abort();
         }
@@ -4022,13 +3986,11 @@ test "P0-2 cancel latency: streaming every 50ms cancels within 200ms with partia
     defer provider_impl.deinit();
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var cancel_impl = cancel_mock.Flag{};
-    
+
     var abort_slot = providers.AbortSlot{};
     var cancel_ctx = CancelCtx{
         .cancel = &cancel_impl,
@@ -4037,7 +3999,7 @@ test "P0-2 cancel latency: streaming every 50ms cancels within 200ms with partia
     const cancel_thr = try std.Thread.spawn(.{}, CancelCtx.run, .{&cancel_ctx});
     defer cancel_thr.join();
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = core_time.nanoTimestamp();
     const out = try run(.{
         .alloc = std.testing.allocator,
         .sid = "sid-p02-cancel",
@@ -4050,7 +4012,7 @@ test "P0-2 cancel latency: streaming every 50ms cancels within 200ms with partia
         .cancel = &cancel_impl.cancel_src,
         .abort_slot = &abort_slot,
     });
-    const elapsed_ms: i128 = @divTrunc(std.time.nanoTimestamp() - start_ns, std.time.ns_per_ms);
+    const elapsed_ms: i128 = @divTrunc(core_time.nanoTimestamp() - start_ns, std.time.ns_per_ms);
 
     // Must cancel within 200ms budget.
     try std.testing.expect(elapsed_ms < 200);
@@ -4581,13 +4543,10 @@ test "loop text streaming append OOM reports session write error and continues" 
     var provider_impl = ProviderImpl{
         .stream_impl = .{ .evs = evs[0..] },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     const out = try run(.{
         .alloc = std.testing.allocator,
@@ -4701,13 +4660,10 @@ test "loop prompt append OOM reports session write error and continues" {
     var provider_impl = ProviderImpl{
         .stream_impl = .{ .evs = evs[0..] },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     const out = try run(.{
         .alloc = std.testing.allocator,
@@ -4755,7 +4711,7 @@ test "denied tool events appear in causal order: tool_call before denied tool_re
     const StoreImpl = struct {
         session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), @This().append, @This().replay, @This().deinit).vt },
         rdr: ReaderImpl = .{},
-        events: std.ArrayListUnmanaged(session.Event) = .{},
+        events: std.ArrayListUnmanaged(session.Event) = .empty,
 
         fn append(self: *@This(), _: []const u8, ev: session.Event) !void {
             try self.events.append(std.testing.allocator, try ev.dupe(std.testing.allocator));
@@ -4818,11 +4774,11 @@ test "denied tool events appear in causal order: tool_call before denied tool_re
     };
 
     const BashDispatch = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         fn run(_: *@This(), _: tools.Call, _: *tools.Sink) !tools.Result {
             return error.TestUnexpectedResult;
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const ApproverImpl = struct {
@@ -4845,14 +4801,11 @@ test "denied tool events appear in causal order: tool_call before denied tool_re
     var provider_impl = ProviderImpl{
         .stream_impl = .{ .evs = evs[0..] },
     };
-    
 
     var store_impl = StoreImpl{};
     defer store_impl.deinit();
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var bash_dispatch = BashDispatch{};
     const entries = [_]tools.Entry{
@@ -4874,7 +4827,6 @@ test "denied tool events appear in causal order: tool_call before denied tool_re
     var cache = CmdCache.init(std.testing.allocator);
     defer cache.deinit();
     var approver_impl = ApproverImpl{};
-    
 
     _ = try run(.{
         .alloc = std.testing.allocator,
@@ -4929,7 +4881,7 @@ test "UX9 walkthrough: denied bash renders denial text in mode and store events"
     const StoreImpl = struct {
         session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), @This().append, @This().replay, @This().deinit).vt },
         rdr: ReaderImpl = .{},
-        events: std.ArrayListUnmanaged(session.Event) = .{},
+        events: std.ArrayListUnmanaged(session.Event) = .empty,
 
         fn append(self: *@This(), _: []const u8, ev: session.Event) !void {
             try self.events.append(std.testing.allocator, try ev.dupe(std.testing.allocator));
@@ -5000,14 +4952,14 @@ test "UX9 walkthrough: denied bash renders denial text in mode and store events"
     };
 
     const BashDispatch = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         ran: bool = false,
 
         fn run(self: *@This(), _: tools.Call, _: *tools.Sink) !tools.Result {
             self.ran = true;
             return error.TestUnexpectedResult;
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const ApproverImpl = struct {
@@ -5030,14 +4982,12 @@ test "UX9 walkthrough: denied bash renders denial text in mode and store events"
     var provider_impl = ProviderImpl{
         .stream_impl = .{ .evs = evs[0..] },
     };
-    
 
     var store_impl = StoreImpl{};
     defer store_impl.deinit();
-    
 
     var mode_impl = ModeImpl{};
-    
+
     defer mode_impl.deinit();
 
     var bash_dispatch = BashDispatch{};
@@ -5060,7 +5010,6 @@ test "UX9 walkthrough: denied bash renders denial text in mode and store events"
     var cache = CmdCache.init(std.testing.allocator);
     defer cache.deinit();
     var approver_impl = ApproverImpl{};
-    
 
     _ = try run(.{
         .alloc = std.testing.allocator,
@@ -5170,7 +5119,7 @@ test "UX8b: agent tool returns structured result with status" {
     };
 
     const AgentDispatch = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         out: [1]tools.Output = undefined,
 
         fn run(self: *@This(), call: tools.Call, _: *tools.Sink) !tools.Result {
@@ -5190,7 +5139,7 @@ test "UX8b: agent tool returns structured result with status" {
                 .final = .{ .ok = .{ .code = 0 } },
             };
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const ModeImpl = struct {
@@ -5211,13 +5160,10 @@ test "UX8b: agent tool returns structured result with status" {
     var provider_impl = ProviderImpl{
         .stream_impl = .{ .evs = evs[0..] },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var agent_dispatch = AgentDispatch{};
     const entries = [_]tools.Entry{
@@ -5320,14 +5266,14 @@ test "UX8b: denied agent tool blocked by policy returns error result" {
     };
 
     const AgentDispatch = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         ran: bool = false,
 
         fn run(self: *@This(), _: tools.Call, _: *tools.Sink) !tools.Result {
             self.ran = true;
             return error.TestUnexpectedResult;
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     const ModeImpl = struct {
@@ -5356,13 +5302,10 @@ test "UX8b: denied agent tool blocked by policy returns error result" {
     var provider_impl = ProviderImpl{
         .stream_impl = .{ .evs = evs[0..] },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var mode_impl = ModeImpl{};
-    
 
     var agent_dispatch = AgentDispatch{};
     const entries = [_]tools.Entry{
@@ -5385,7 +5328,6 @@ test "UX8b: denied agent tool blocked by policy returns error result" {
     };
 
     var auth_impl = AuthImpl{};
-    
 
     _ = try run(.{
         .alloc = std.testing.allocator,
@@ -5421,7 +5363,7 @@ test "UX9: denied web tool emits audit via tool_auth and blocks dispatch" {
     const StoreImpl = struct {
         session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), @This().append, @This().replay, @This().deinit).vt },
         rdr: ReaderImpl = .{},
-        events: std.ArrayListUnmanaged(session.Event) = .{},
+        events: std.ArrayListUnmanaged(session.Event) = .empty,
 
         fn append(self: *@This(), _: []const u8, ev: session.Event) !void {
             try self.events.append(std.testing.allocator, try ev.dupe(std.testing.allocator));
@@ -5487,14 +5429,14 @@ test "UX9: denied web tool emits audit via tool_auth and blocks dispatch" {
     };
 
     const WebDispatch = struct {
-            dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
+        dispatch: tools.Dispatch = .{ .vt = &Bind.vt },
         ran: bool = false,
 
         fn run(self: *@This(), _: tools.Call, _: *tools.Sink) !tools.Result {
             self.ran = true;
             return error.TestUnexpectedResult;
         }
-            const Bind = tools.Dispatch.Bind(@This(), @This().run);
+        const Bind = tools.Dispatch.Bind(@This(), @This().run);
     };
 
     // ToolAuth that records the denied call and returns PolicyDenied
@@ -5525,15 +5467,12 @@ test "UX9: denied web tool emits audit via tool_auth and blocks dispatch" {
     var provider_impl = ProviderImpl{
         .stream_impl = .{ .evs = evs[0..] },
     };
-    
 
     var store_impl = StoreImpl{};
     defer store_impl.deinit();
-    
 
     var mode_impl = ModeImpl{};
     defer mode_impl.deinit();
-    
 
     var web_dispatch = WebDispatch{};
     const entries = [_]tools.Entry{
@@ -5553,7 +5492,6 @@ test "UX9: denied web tool emits audit via tool_auth and blocks dispatch" {
     };
 
     var auth_impl = AuthImpl{};
-    
 
     _ = try run(.{
         .alloc = std.testing.allocator,

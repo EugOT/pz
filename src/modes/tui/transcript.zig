@@ -12,6 +12,17 @@ pub const Rect = frame.Rect;
 const tbl = @import("table_layout.zig");
 const image = @import("image.zig");
 
+fn appendPrint(
+    alloc: std.mem.Allocator,
+    out: anytype,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const text = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(text);
+    try out.appendSlice(alloc, text);
+}
+
 const Kind = enum { text, user, thinking, tool, err, meta, image, agent };
 
 const ToolPhase = enum { none, call, result };
@@ -804,9 +815,9 @@ fn formatAskResultAlloc(alloc: std.mem.Allocator, out: []const u8) std.mem.Alloc
     }
 
     const noun = if (parsed.value.answers.len == 1) "answer" else "answers";
-    try std.fmt.format(buf.writer(alloc), "ask: {d} {s}\n", .{ parsed.value.answers.len, noun });
+    try appendPrint(alloc, &buf, "ask: {d} {s}\n", .{ parsed.value.answers.len, noun });
     for (parsed.value.answers, 0..) |ans, i| {
-        try std.fmt.format(buf.writer(alloc), "  [{d}] {s}: {s}", .{ ans.index, ans.id, ans.answer });
+        try appendPrint(alloc, &buf, "  [{d}] {s}: {s}", .{ ans.index, ans.id, ans.answer });
         if (i + 1 < parsed.value.answers.len) try buf.append(alloc, '\n');
     }
     return try buf.toOwnedSlice(alloc);
@@ -920,7 +931,6 @@ pub const MdWrapIter = struct {
 pub fn mdWrapIter(text: []const u8, w: usize) MdWrapIter {
     return .{ .text = text, .pos = 0, .w = w };
 }
-
 
 pub fn countLines(text: []const u8, w: usize) usize {
     if (w == 0) return 0;
@@ -1297,7 +1307,6 @@ fn writeEllipsisUtf8(
     return col;
 }
 
-
 fn rowAscii(frm: *const frame.Frame, y: usize, out: []u8) ![]const u8 {
     std.debug.assert(out.len >= frm.w);
     var x: usize = 0;
@@ -1324,8 +1333,8 @@ fn frameRowsSnap(
     while (y <= y1) : (y += 1) {
         if (y != y0) try out.append(alloc, '\n');
         const row = try rowAscii(frm, y, raw);
-        const trimmed = std.mem.trimRight(u8, row, " ");
-        try std.fmt.format(out.writer(alloc), "{d}:{s}", .{ y, trimmed });
+        const trimmed = std.mem.trimEnd(u8, row, " ");
+        try appendPrint(alloc, &out, "{d}:{s}", .{ y, trimmed });
     }
     return out.toOwnedSlice(alloc);
 }
@@ -1337,7 +1346,7 @@ fn allocBigMdTable(alloc: std.mem.Allocator, n: usize) ![]u8 {
     try buf.appendSlice(alloc, "| --- | --- |\n");
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        try std.fmt.format(buf.writer(alloc), "| r{d} | v{d} |\n", .{ i + 1, i + 1 });
+        try appendPrint(alloc, &buf, "| r{d} | v{d} |\n", .{ i + 1, i + 1 });
     }
     return buf.toOwnedSlice(alloc);
 }
@@ -1386,8 +1395,8 @@ fn collectLines(alloc: std.mem.Allocator, it_ptr: anytype) ![]u8 {
 fn appendColor(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, c: frame.Color) !void {
     switch (c) {
         .default => try out.appendSlice(alloc, "default"),
-        .idx => |idx| try std.fmt.format(out.writer(alloc), "idx:{d}", .{idx}),
-        .rgb => |rgb| try std.fmt.format(out.writer(alloc), "rgb:{x:0>6}", .{rgb}),
+        .idx => |idx| try appendPrint(alloc, out, "idx:{d}", .{idx}),
+        .rgb => |rgb| try appendPrint(alloc, out, "rgb:{x:0>6}", .{rgb}),
     }
 }
 
@@ -1395,18 +1404,18 @@ fn styledTextSnap(alloc: std.mem.Allocator, text: []const u8, spans: []const Spa
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    try std.fmt.format(out.writer(alloc), "buf={s}", .{text});
+    try appendPrint(alloc, &out, "buf={s}", .{text});
     if (spans.len == 0) {
         try out.appendSlice(alloc, "\nspans=0");
         return out.toOwnedSlice(alloc);
     }
 
     for (spans) |span| {
-        try std.fmt.format(out.writer(alloc), "\nspan {d}..{d} fg=", .{ span.start, span.end });
+        try appendPrint(alloc, &out, "\nspan {d}..{d} fg=", .{ span.start, span.end });
         try appendColor(&out, alloc, span.st.fg);
         try out.appendSlice(alloc, " bg=");
         try appendColor(&out, alloc, span.st.bg);
-        try std.fmt.format(out.writer(alloc), " bold={d} dim={d} italic={d} underline={d} inverse={d}", .{
+        try appendPrint(alloc, &out, " bold={d} dim={d} italic={d} underline={d} inverse={d}", .{
             @intFromBool(span.st.bold),
             @intFromBool(span.st.dim),
             @intFromBool(span.st.italic),

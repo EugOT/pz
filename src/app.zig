@@ -8,22 +8,22 @@ pub const report = @import("app/report.zig");
 pub const runtime = @import("app/runtime.zig");
 pub const update = @import("app/update.zig");
 
-pub fn run() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-
-    const alloc = arena.allocator();
-    const argv = try std.process.argsAlloc(alloc);
-    var env = try config.Env.fromProcess(alloc);
+pub fn run(init: std.process.Init) !u8 {
+    const alloc = init.arena.allocator();
+    const argv = try init.minimal.args.toSlice(alloc);
+    var env = try config.Env.fromMap(alloc, init.environ_map);
     defer env.deinit(alloc);
-    var out = std.fs.File.stdout().deprecatedWriter();
+    var out_buf: [4096]u8 = undefined;
+    var out_file = std.Io.File.stdout().writerStreaming(init.io, &out_buf);
+    var out = &out_file.interface;
+    defer out.flush() catch {};
 
-    var cmd = cli.parse(alloc, std.fs.cwd(), argv[1..], env) catch |err| {
+    var cmd = cli.parse(alloc, init.io, std.Io.Dir.cwd(), argv[1..], env) catch |err| {
         if (err == error.OutOfMemory) return err;
         const msg = try report.cli(alloc, "parse arguments", err);
-        defer alloc.free(msg);
         try out.writeAll(msg);
-        std.process.exit(1);
+        try out.flush();
+        return 1;
     };
     defer cmd.deinit(alloc);
 
@@ -32,7 +32,7 @@ pub fn run() !void {
         .version => |txt| try out.writeAll(txt),
         .changelog => |txt| try out.writeAll(txt),
         .upgrade => {
-            const outcome = try update.runOutcome(alloc, env.home);
+            const outcome = try update.runOutcome(alloc, init.io, init.environ_map, env.home);
             defer outcome.deinit(alloc);
             try out.writeAll(outcome.msg);
         },
@@ -40,11 +40,13 @@ pub fn run() !void {
             const sid = runtime.exec(alloc, run_cmd) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 const msg = try report.cli(alloc, "run command", err);
-                defer alloc.free(msg);
                 try out.writeAll(msg);
-                std.process.exit(1);
+                try out.flush();
+                return 1;
             };
             alloc.free(sid);
         },
     }
+    try out.flush();
+    return 0;
 }

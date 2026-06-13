@@ -48,31 +48,31 @@ test "tool contract handlers emit deterministic envelopes" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const in_path = try std.fs.path.join(std.testing.allocator, &.{ path, "in.txt" });
     defer std.testing.allocator.free(in_path);
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "in.txt",
         .data = "a\nb\n",
     });
 
     const out_path = try std.fs.path.join(std.testing.allocator, &.{ path, "out.txt" });
     defer std.testing.allocator.free(out_path);
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "out.txt",
         .data = "x",
     });
 
     const edit_path = try std.fs.path.join(std.testing.allocator, &.{ path, "edit.txt" });
     defer std.testing.allocator.free(edit_path);
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "edit.txt",
         .data = "abc abc",
     });
-    try tmp.dir.makePath("tree/sub");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, "tree/sub");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "tree/sub/hit.txt",
         .data = "needle\n",
     });
@@ -395,14 +395,14 @@ test "tool contract handlers deny nested symlink escapes" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.makePath("safe/nest");
-    try outer.dir.writeFile(.{ .sub_path = "secret.txt", .data = "top-secret\n" });
+    try tmp.dir.createDirPath(std.testing.io, "safe/nest");
+    try outer.dir.writeFile(std.testing.io, .{ .sub_path = "secret.txt", .data = "top-secret\n" });
 
-    const outer_root = try outer.dir.realpathAlloc(std.testing.allocator, ".");
+    const outer_root = try outer.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(outer_root);
-    try tmp.dir.symLink(outer_root, "safe/nest/link", .{ .is_directory = true });
+    try tmp.dir.symLink(std.testing.io, outer_root, "safe/nest/link", .{ .is_directory = true });
 
-    const cwd_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_root);
     const escaped_dir = try std.fs.path.join(std.testing.allocator, &.{ cwd_root, "safe/nest/link" });
     defer std.testing.allocator.free(escaped_dir);

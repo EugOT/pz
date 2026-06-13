@@ -54,11 +54,12 @@ pub const SeqTracker = struct {
     high: u64,
     path: ?[]const u8,
     alloc: std.mem.Allocator,
+    io: std.Io,
 
-    pub fn init(alloc: std.mem.Allocator, path: ?[]const u8) SeqTracker {
-        var self = SeqTracker{ .high = 0, .path = path, .alloc = alloc };
+    pub fn init(alloc: std.mem.Allocator, io: std.Io, path: ?[]const u8) SeqTracker {
+        var self = SeqTracker{ .high = 0, .path = path, .alloc = alloc, .io = io };
         if (path) |p| {
-            const raw = std.fs.cwd().readFileAlloc(alloc, p, 64) catch return self;
+            const raw = std.Io.Dir.cwd().readFileAlloc(io, p, alloc, .limited(64)) catch return self;
             defer alloc.free(raw);
             self.high = std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t\r\n"), 10) catch 0;
         }
@@ -85,15 +86,15 @@ pub const SeqTracker = struct {
         }
     }
 
-    const PersistError = std.fs.File.OpenError || std.posix.WriteError;
+    const PersistError = std.Io.File.OpenError || std.Io.File.Writer.Error;
 
     fn persist(self: *const SeqTracker) PersistError!void {
         const p = self.path orelse return;
         var buf: [20]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{d}", .{self.high}) catch unreachable; // max u64 = 20 digits = 20 <= 20
-        const file = try std.fs.cwd().createFile(p, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(s);
+        const file = try std.Io.Dir.cwd().createFile(self.io, p, .{ .truncate = true });
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, s);
     }
 };
 
@@ -106,9 +107,9 @@ pub fn sealAllocSeq(alloc: std.mem.Allocator, key: Key, prev: ?Mac, body: []cons
     var prev_hex_buf: [mac_len * 2]u8 = undefined;
     var mac_hex_buf: [mac_len * 2]u8 = undefined;
 
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(alloc);
-    const w = out.writer(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const w = &out.writer;
 
     try w.writeAll("{\"v\":1,\"kid\":");
     try w.print("{d}", .{key.id});
@@ -128,7 +129,7 @@ pub fn sealAllocSeq(alloc: std.mem.Allocator, key: Key, prev: ?Mac, body: []cons
     try writeJsonStr(w, body);
     try w.writeByte('}');
 
-    return try out.toOwnedSlice(alloc);
+    return try out.toOwnedSlice();
 }
 
 pub fn verifyLogAlloc(alloc: std.mem.Allocator, raw: []const u8, keys: []const Key) !Verify {
@@ -194,9 +195,9 @@ pub fn verifyLogAlloc(alloc: std.mem.Allocator, raw: []const u8, keys: []const K
 }
 
 fn calcMac(alloc: std.mem.Allocator, key: Key, prev: ?Mac, body: []const u8) !Mac {
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(alloc);
-    const w = buf.writer(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    const w = &buf.writer;
 
     try w.print("{d}\n", .{key.id});
     if (prev) |tag| {
@@ -209,7 +210,7 @@ fn calcMac(alloc: std.mem.Allocator, key: Key, prev: ?Mac, body: []const u8) !Ma
     try w.writeAll(body);
 
     var out: Mac = undefined;
-    HmacSha256.create(out[0..], buf.items, &key.bytes);
+    HmacSha256.create(out[0..], buf.written(), &key.bytes);
     return out;
 }
 
@@ -358,12 +359,12 @@ test "snapshot: verify stops at first tampered line" {
 test "seq tracker persists and rejects replayed seq" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
     const path = try std.fmt.allocPrint(testing.allocator, "{s}/seq.hwm", .{dir});
     defer testing.allocator.free(path);
 
-    var tracker = SeqTracker.init(testing.allocator, path);
+    var tracker = SeqTracker.init(testing.allocator, testing.io, path);
     const s1 = try tracker.next();
     try testing.expectEqual(@as(u64, 1), s1);
     const s2 = try tracker.next();
@@ -373,7 +374,7 @@ test "seq tracker persists and rejects replayed seq" {
     try testing.expect(tracker.check(3));
 
     // Reload from disk
-    var tracker2 = SeqTracker.init(testing.allocator, path);
+    var tracker2 = SeqTracker.init(testing.allocator, testing.io, path);
     try testing.expectEqual(@as(u64, 2), tracker2.high);
     try testing.expect(!tracker2.check(2));
     try testing.expect(tracker2.check(3));

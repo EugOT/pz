@@ -807,11 +807,11 @@ test "builtin runtime uses call timestamp in result envelope" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "in.txt",
         .data = "abc\n",
     });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "in.txt");
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "in.txt", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     var rt = Runtime.init(.{

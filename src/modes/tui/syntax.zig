@@ -481,10 +481,10 @@ fn writeSnapStr(w: anytype, s: []const u8) !void {
 }
 
 fn tokSnapAlloc(alloc: std.mem.Allocator, line: []const u8, toks: []const Token) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
 
-    const w = buf.writer(alloc);
+    const w = &buf.writer;
     try w.writeAll("line=");
     try writeSnapStr(w, line);
     for (toks, 0..) |tok, i| {
@@ -496,7 +496,7 @@ fn tokSnapAlloc(alloc: std.mem.Allocator, line: []const u8, toks: []const Token)
         });
         try writeSnapStr(w, line[tok.start..tok.end]);
     }
-    return buf.toOwnedSlice(alloc);
+    return try buf.toOwnedSlice();
 }
 
 fn expectTokSnap(

@@ -1,5 +1,10 @@
 //! Local HTTP server for OAuth redirect callback.
 const std = @import("std");
+const net = std.Io.net;
+
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
 
 pub const Opts = struct {
     bind_ip: []const u8 = "127.0.0.1",
@@ -23,18 +28,18 @@ pub const CodeState = struct {
 
 pub const Listener = struct {
     alloc: std.mem.Allocator,
-    server: std.net.Server,
+    server: net.Server,
     redirect_uri: []u8,
     path: []u8,
     success_redirect_url: ?[]u8,
     read_deadline_ms: u32,
 
     pub fn init(alloc: std.mem.Allocator, opts: Opts) !Listener {
-        const addr = try std.net.Address.parseIp(opts.bind_ip, 0);
-        var server = try addr.listen(.{ .reuse_address = true });
-        errdefer server.deinit();
+        const addr = try net.IpAddress.parse(opts.bind_ip, 0);
+        var server = try addr.listen(defaultIo(), .{ .reuse_address = true });
+        errdefer server.deinit(defaultIo());
 
-        const listen_port = server.listen_address.getPort();
+        const listen_port = server.socket.address.getPort();
         const redirect_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}{s}", .{
             opts.redirect_host,
             listen_port,
@@ -61,7 +66,7 @@ pub const Listener = struct {
     }
 
     pub fn deinit(self: *Listener) void {
-        self.server.deinit();
+        self.server.deinit(defaultIo());
         self.alloc.free(self.redirect_uri);
         self.alloc.free(self.path);
         if (self.success_redirect_url) |url| self.alloc.free(url);
@@ -69,7 +74,7 @@ pub const Listener = struct {
     }
 
     pub fn port(self: *const Listener) u16 {
-        return self.server.listen_address.getPort();
+        return self.server.socket.address.getPort();
     }
 
     pub fn waitForCodeState(
@@ -77,9 +82,9 @@ pub const Listener = struct {
         alloc: std.mem.Allocator,
         timeout_ms: i32,
     ) !CodeState {
-        var timer = std.time.Timer.start() catch return error.OAuthCallbackTimeout;
-        const deadline_ns: u64 = if (timeout_ms > 0)
-            @as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms
+        const start_ns = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
+        const deadline_ns: i96 = if (timeout_ms > 0)
+            @as(i96, @intCast(timeout_ms)) * std.time.ns_per_ms
         else
             0;
 
@@ -88,10 +93,11 @@ pub const Listener = struct {
             const remaining_ms: i32 = if (timeout_ms <= 0)
                 timeout_ms // 0 = immediate, negative = infinite
             else blk: {
-                const elapsed_ns = timer.read();
+                const now_ns = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
+                const elapsed_ns = now_ns - start_ns;
                 if (elapsed_ns >= deadline_ns) return error.OAuthCallbackTimeout;
                 const left_ns = deadline_ns - elapsed_ns;
-                const left_ms = left_ns / std.time.ns_per_ms;
+                const left_ms = @divTrunc(left_ns, std.time.ns_per_ms);
                 break :blk if (left_ms > std.math.maxInt(i32))
                     std.math.maxInt(i32)
                 else
@@ -99,7 +105,7 @@ pub const Listener = struct {
             };
 
             var fds = [_]std.posix.pollfd{.{
-                .fd = self.server.stream.handle,
+                .fd = self.server.socket.handle,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
@@ -122,19 +128,19 @@ pub const Listener = struct {
 
     /// Accept a single connection and try to extract code+state from it.
     fn tryAcceptOne(self: *Listener, alloc: std.mem.Allocator) !CodeState {
-        var conn = try self.server.accept();
-        defer conn.stream.close();
+        const conn = try self.server.accept(defaultIo());
+        defer conn.close(defaultIo());
 
         // Reject non-loopback peers.
-        if (!isLoopback(conn.address)) return error.NonLoopbackPeer;
+        if (!isLoopback(conn.socket.address)) return error.NonLoopbackPeer;
 
         // Set per-connection read deadline to abort trickle/stalled clients.
-        try setRecvTimeout(conn.stream.handle, self.read_deadline_ms);
+        try setRecvTimeout(conn.socket.handle, self.read_deadline_ms);
 
         var req_buf: [8192]u8 = undefined;
         var req_len: usize = 0;
         while (req_len < req_buf.len) {
-            const n = std.posix.read(conn.stream.handle, req_buf[req_len..]) catch |err| switch (err) {
+            const n = fdRead(conn.socket.handle, req_buf[req_len..]) catch |err| switch (err) {
                 error.WouldBlock => return error.OAuthReadTimeout,
                 else => return err,
             };
@@ -143,29 +149,29 @@ pub const Listener = struct {
             if (std.mem.indexOf(u8, req_buf[0..req_len], "\r\n\r\n") != null) break;
         }
         if (req_len == 0) {
-            try writeHtml(conn.stream.handle, "400 Bad Request", callback_error_body);
+            try writeHtml(conn.socket.handle, "400 Bad Request", callback_error_body);
             return error.InvalidOAuthCallbackRequest;
         }
 
         const query = parseQueryFromHttpRequest(req_buf[0..req_len], self.path) catch {
-            try writeHtml(conn.stream.handle, "400 Bad Request", callback_error_body);
+            try writeHtml(conn.socket.handle, "400 Bad Request", callback_error_body);
             return error.InvalidOAuthCallbackRequest;
         };
         var out = parseCodeStateQuery(alloc, query) catch {
-            try writeHtml(conn.stream.handle, "400 Bad Request", callback_error_body);
+            try writeHtml(conn.socket.handle, "400 Bad Request", callback_error_body);
             return error.InvalidOAuthCallbackRequest;
         };
         errdefer out.deinit(alloc);
 
         if (out.code.len == 0 or out.state.len == 0) {
-            try writeHtml(conn.stream.handle, "400 Bad Request", callback_error_body);
+            try writeHtml(conn.socket.handle, "400 Bad Request", callback_error_body);
             return error.InvalidOAuthCallbackRequest;
         }
 
         if (self.success_redirect_url) |url| {
-            try writeRedirect(conn.stream.handle, url);
+            try writeRedirect(conn.socket.handle, url);
         } else {
-            try writeHtml(conn.stream.handle, "200 OK", callback_ok_body);
+            try writeHtml(conn.socket.handle, "200 OK", callback_ok_body);
         }
         return out;
     }
@@ -218,11 +224,13 @@ fn parseQueryFromHttpRequest(request: []const u8, expected_path: []const u8) ![]
 const decodeQueryValue = @import("../url.zig").decodeQueryValue;
 
 /// True if the peer address is IPv4 127.0.0.0/8 or IPv6 ::1.
-fn isLoopback(addr: std.net.Address) bool {
-    return switch (addr.any.family) {
-        std.posix.AF.INET => std.mem.asBytes(&addr.in.sa.addr)[0] == 127,
-        std.posix.AF.INET6 => std.mem.eql(u8, &addr.in6.sa.addr, &[_]u8{0} ** 15 ++ [_]u8{1}),
-        else => false,
+fn isLoopback(addr: net.IpAddress) bool {
+    return switch (addr) {
+        .ip4 => |ip4| ip4.bytes[0] == 127,
+        .ip6 => |ip6| blk: {
+            const loopback = [_]u8{0} ** 15 ++ [_]u8{1};
+            break :blk std.mem.eql(u8, &ip6.bytes, &loopback);
+        },
     };
 }
 
@@ -243,8 +251,8 @@ fn writeHtml(fd: std.posix.fd_t, status: []const u8, body: []const u8) !void {
         "HTTP/1.1 {s}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
         .{ status, body.len },
     );
-    _ = std.posix.write(fd, hdr) catch {}; // cleanup: propagation impossible
-    _ = std.posix.write(fd, body) catch {}; // cleanup: propagation impossible
+    try writeAllFd(fd, hdr);
+    try writeAllFd(fd, body);
 }
 
 fn writeRedirect(fd: std.posix.fd_t, location: []const u8) !void {
@@ -255,8 +263,41 @@ fn writeRedirect(fd: std.posix.fd_t, location: []const u8) !void {
         "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
         .{ location, body.len },
     );
-    _ = std.posix.write(fd, hdr) catch {}; // cleanup: propagation impossible
-    _ = std.posix.write(fd, body) catch {}; // cleanup: propagation impossible
+    try writeAllFd(fd, hdr);
+    try writeAllFd(fd, body);
+}
+
+fn writeAllFd(fd: std.posix.fd_t, bytes: []const u8) !void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const n = try fdWrite(fd, bytes[written..]);
+        if (n == 0) return error.WriteZero;
+        written += n;
+    }
+}
+
+fn fdRead(fd: std.posix.fd_t, buf: []u8) !usize {
+    while (true) {
+        const rc = std.c.read(fd, buf.ptr, buf.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn fdWrite(fd: std.posix.fd_t, bytes: []const u8) !usize {
+    while (true) {
+        const rc = std.c.write(fd, bytes.ptr, bytes.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
 }
 
 const callback_ok_body =
@@ -265,29 +306,32 @@ const callback_error_body =
     "<!doctype html><html><body><h1>Login failed</h1><p>Missing or invalid OAuth callback parameters.</p></body></html>";
 
 fn sendTestCallback(port: u16, req: []const u8) void {
-    std.Thread.sleep(20 * std.time.ns_per_ms);
-    const addr = std.net.Address.parseIp("127.0.0.1", port) catch return;
-    var stream = std.net.tcpConnectToAddress(addr) catch return;
-    defer stream.close();
-    _ = std.posix.write(stream.handle, req) catch return;
+    std.Io.sleep(defaultIo(), .fromMilliseconds(20), .awake) catch return;
+    var stream = connectLoopback(port) catch return;
+    defer stream.close(defaultIo());
+    writeAllFd(stream.socket.handle, req) catch return;
     var sink: [256]u8 = undefined;
-    _ = std.posix.read(stream.handle, &sink) catch {}; // cleanup: propagation impossible
+    _ = fdRead(stream.socket.handle, &sink) catch return;
 }
 
 fn sendTestCallbackReadAlloc(alloc: std.mem.Allocator, port: u16, req: []const u8) ![]u8 {
-    const addr = try std.net.Address.parseIp("127.0.0.1", port);
-    var stream = try std.net.tcpConnectToAddress(addr);
-    defer stream.close();
-    _ = try std.posix.write(stream.handle, req);
+    const stream = try connectLoopback(port);
+    defer stream.close(defaultIo());
+    try writeAllFd(stream.socket.handle, req);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(alloc);
     var buf: [1024]u8 = undefined;
     while (true) {
-        const n = try std.posix.read(stream.handle, &buf);
+        const n = try fdRead(stream.socket.handle, &buf);
         if (n == 0) break;
         try out.appendSlice(alloc, buf[0..n]);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+fn connectLoopback(port: u16) !net.Stream {
+    const addr = try net.IpAddress.parse("127.0.0.1", port);
+    return addr.connect(defaultIo(), .{ .mode = .stream });
 }
 
 test "parseCodeStateQuery decodes URL-encoded params" {
@@ -327,7 +371,7 @@ test "listener redirects browser to success url after valid callback" {
 
     const t = try std.Thread.spawn(.{}, struct {
         fn run(p: u16) void {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+            std.Io.sleep(defaultIo(), .fromMilliseconds(20), .awake) catch return;
             const resp = sendTestCallbackReadAlloc(std.testing.allocator, p, req) catch return;
             defer std.testing.allocator.free(resp);
             std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 302 Found") != null) catch return;
@@ -400,24 +444,24 @@ test "listener retries invalid then accepts valid callback" {
 }
 
 test "isLoopback accepts 127.x.x.x" {
-    const lo = try std.net.Address.parseIp("127.0.0.1", 0);
+    const lo = try net.IpAddress.parse("127.0.0.1", 0);
     try std.testing.expect(isLoopback(lo));
-    const lo2 = try std.net.Address.parseIp("127.255.0.1", 0);
+    const lo2 = try net.IpAddress.parse("127.255.0.1", 0);
     try std.testing.expect(isLoopback(lo2));
 }
 
 test "isLoopback rejects non-loopback IPv4" {
-    const ext = try std.net.Address.parseIp("192.168.1.1", 0);
+    const ext = try net.IpAddress.parse("192.168.1.1", 0);
     try std.testing.expect(!isLoopback(ext));
 }
 
 test "isLoopback accepts ::1" {
-    const lo6 = try std.net.Address.parseIp("::1", 0);
+    const lo6 = try net.IpAddress.parse("::1", 0);
     try std.testing.expect(isLoopback(lo6));
 }
 
 test "isLoopback rejects non-loopback IPv6" {
-    const ext6 = try std.net.Address.parseIp("::2", 0);
+    const ext6 = try net.IpAddress.parse("::2", 0);
     try std.testing.expect(!isLoopback(ext6));
 }
 
@@ -428,12 +472,11 @@ test "listener stalled client retried then times out" {
     // Connect but send nothing; read deadline fires, retry loop exhausts overall timeout.
     const t = try std.Thread.spawn(.{}, struct {
         fn run(p: u16) void {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
-            const addr = std.net.Address.parseIp("127.0.0.1", p) catch return;
-            var stream = std.net.tcpConnectToAddress(addr) catch return;
+            std.Io.sleep(defaultIo(), .fromMilliseconds(20), .awake) catch return;
+            const stream = connectLoopback(p) catch return;
             // Hold connection open without sending.
-            std.Thread.sleep(1 * std.time.ns_per_s);
-            stream.close();
+            std.Io.sleep(defaultIo(), .fromSeconds(1), .awake) catch return;
+            stream.close(defaultIo());
         }
     }.run, .{listener.port()});
     defer t.join();

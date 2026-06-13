@@ -23,7 +23,7 @@ fn makeClientWithKey(key: []const u8) !anthropic.Client {
             .arena = arena,
             .auth = .{ .api_key = key_dup },
         },
-        .http = .{ .allocator = std.heap.page_allocator },
+        .http = .{ .allocator = std.heap.page_allocator, .io = std.testing.io },
         .ca_file = null,
     };
 }
@@ -70,7 +70,7 @@ test "real API: simple prompt returns text" {
     var client = anthropic.Client{
         .alloc = e2e_alloc,
         .auth = auth_result,
-        .http = .{ .allocator = std.heap.page_allocator },
+        .http = .{ .allocator = std.heap.page_allocator, .io = std.testing.io },
         .ca_file = null,
     };
     defer client.deinit(); // owns auth arena
@@ -103,7 +103,7 @@ test "real API: streaming delivers events" {
     var client = anthropic.Client{
         .alloc = e2e_alloc,
         .auth = auth_result,
-        .http = .{ .allocator = std.heap.page_allocator },
+        .http = .{ .allocator = std.heap.page_allocator, .io = std.testing.io },
         .ca_file = null,
     };
     defer client.deinit();
@@ -121,7 +121,7 @@ test "real API: bad model returns error" {
     var client = anthropic.Client{
         .alloc = e2e_alloc,
         .auth = auth_result,
-        .http = .{ .allocator = std.heap.page_allocator },
+        .http = .{ .allocator = std.heap.page_allocator, .io = std.testing.io },
         .ca_file = null,
     };
     defer client.deinit();

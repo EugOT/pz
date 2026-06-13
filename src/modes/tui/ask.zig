@@ -33,7 +33,7 @@ pub const PauseCtl = struct {
 pub const AskUiCtx = struct {
     alloc: std.mem.Allocator,
     ui: *tui_harness.Ui,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     pause: *PauseCtl,
 
     pub const Answer = struct {

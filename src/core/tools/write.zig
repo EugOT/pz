@@ -5,6 +5,10 @@ const tools = @import("../tools.zig");
 const shared = @import("shared.zig");
 const noop = @import("../../test/noop_sink.zig");
 
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const Err = error{
     KindMismatch,
     InvalidArgs,
@@ -40,15 +44,13 @@ pub const Handler = struct {
         }) catch |open_err| {
             return shared.mapFsErr(open_err);
         };
-        defer file.close();
+        defer file.close(defaultIo());
 
         if (args.append) {
-            file.seekFromEnd(0) catch |seek_err| {
-                return shared.mapFsErr(seek_err);
-            };
+            try seekEnd(file);
         }
 
-        file.writeAll(args.text) catch |write_err| {
+        file.writeStreamingAll(defaultIo(), args.text) catch |write_err| {
             return shared.mapFsErr(write_err);
         };
 
@@ -64,6 +66,13 @@ pub const Handler = struct {
     }
 };
 
+fn seekEnd(file: std.Io.File) Err!void {
+    const rc = std.c.lseek(file.handle, 0, std.c.SEEK.END);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| return shared.mapFsErr(std.posix.unexpectedErrno(err)),
+    }
+}
 
 test "write handler overwrites file with deterministic timestamps" {
     const OhSnap = @import("ohsnap");
@@ -77,8 +86,8 @@ test "write handler overwrites file with deterministic timestamps" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "out.txt", .data = "old" });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "out.txt");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "out.txt", .data = "old" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "out.txt", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const sink = noop.sink();
@@ -100,7 +109,7 @@ test "write handler overwrites file with deterministic timestamps" {
 
     const res = try handler.run(call, sink);
 
-    const got = try tmp.dir.readFileAlloc(std.testing.allocator, "out.txt", 64);
+    const got = try tmp.dir.readFileAlloc(std.testing.io, "out.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(got);
     const snap = Snap{
         .res = res,
@@ -131,8 +140,8 @@ test "write handler appends when append is true" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "out.txt", .data = "a" });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "out.txt");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "out.txt", .data = "a" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "out.txt", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const sink = noop.sink();
@@ -154,7 +163,7 @@ test "write handler appends when append is true" {
 
     _ = try handler.run(call, sink);
 
-    const got = try tmp.dir.readFileAlloc(std.testing.allocator, "out.txt", 64);
+    const got = try tmp.dir.readFileAlloc(std.testing.io, "out.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("ab", got);
 }
@@ -185,7 +194,7 @@ test "write handler returns not found for missing parent" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    const dir_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(dir_path);
 
     const path = try std.fs.path.join(std.testing.allocator, &.{
@@ -238,9 +247,9 @@ test "write handler denies replaced target before truncation" {
 
     const HookCtx = struct {
         race_hook: path_guard.RaceHook = .{ .vt = &Bind.vt },
-        fn run(_: *@This(), dir: std.fs.Dir, path: []const u8) !void {
-            try dir.rename(path, "gone.txt");
-            try dir.rename("swap.txt", path);
+        fn run(_: *@This(), dir: std.Io.Dir, path: []const u8) !void {
+            try dir.rename(path, dir, "gone.txt", std.testing.io);
+            try dir.rename("swap.txt", dir, path, std.testing.io);
         }
         const Bind = path_guard.RaceHook.Bind(@This(), run);
     };
@@ -250,8 +259,8 @@ test "write handler denies replaced target before truncation" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "victim.txt", .data = "keep\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "swap.txt", .data = "swap\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "victim.txt", .data = "keep\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "swap.txt", .data = "swap\n" });
 
     const sink = noop.sink();
 
@@ -273,7 +282,7 @@ test "write handler denies replaced target before truncation" {
         .at_ms = 0,
     }, sink));
 
-    const kept = try tmp.dir.readFileAlloc(std.testing.allocator, "victim.txt", 64);
+    const kept = try tmp.dir.readFileAlloc(std.testing.io, "victim.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(kept);
     try std.testing.expectEqualStrings("swap\n", kept);
 }

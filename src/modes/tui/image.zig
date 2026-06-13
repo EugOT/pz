@@ -16,16 +16,24 @@ const term_program_cap_map = std.StaticStringMap(Protocol).initComptime(.{
     .{ "WezTerm", .kitty },
 });
 
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    return if (std.c.getenv(name)) |value| std.mem.span(value) else null;
+}
+
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub fn detect() Protocol {
-    if (std.posix.getenv("KITTY_WINDOW_ID") != null) return .kitty;
-    if (std.posix.getenv("TERM")) |term| {
+    if (getenv("KITTY_WINDOW_ID") != null) return .kitty;
+    if (getenv("TERM")) |term| {
         if (term_cap_map.get(term)) |cap| return cap;
     }
-    if (std.posix.getenv("TERM_PROGRAM")) |tp| {
+    if (getenv("TERM_PROGRAM")) |tp| {
         if (term_program_cap_map.get(tp)) |cap| return cap;
         if (std.mem.indexOf(u8, tp, "iTerm") != null) return .iterm;
     }
-    if (std.posix.getenv("LC_TERMINAL")) |lt| {
+    if (getenv("LC_TERMINAL")) |lt| {
         if (std.mem.indexOf(u8, lt, "iTerm") != null) return .iterm;
     }
     return .none;
@@ -81,7 +89,7 @@ fn writeKittyFile(out: anytype, path: []const u8, cols: usize) !void {
 /// iTerm2: transmit image by reading file and base64-encoding data.
 fn writeItermFile(out: anytype, alloc: std.mem.Allocator, path: []const u8, cols: usize) !void {
     // Read file
-    const data = try std.fs.cwd().readFileAlloc(alloc, path, 4 * 1024 * 1024);
+    const data = try std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, alloc, .limited(4 * 1024 * 1024));
     defer alloc.free(data);
 
     var hdr: [128]u8 = undefined;

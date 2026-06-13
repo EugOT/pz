@@ -13,6 +13,7 @@ const cmdpicker_mod = @import("cmdpicker.zig");
 const path_complete_mod = @import("path_complete.zig");
 const image_mod = @import("image.zig");
 const spinner = @import("spinner.zig");
+const core_time = @import("../../core/time.zig");
 
 pub const Ui = struct {
     alloc: std.mem.Allocator,
@@ -429,7 +430,7 @@ pub const Ui = struct {
 
     fn drawBorderWithStatus(self: *Ui, y: usize) !void {
         const t = theme.get();
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = core_time.milliTimestamp();
         const compact_on = self.panels.compactionActive(now_ms);
         const active = self.panels.run_state == .streaming or self.panels.run_state == .tool or compact_on;
         if (active) self.spin +%= 1;
@@ -796,17 +797,17 @@ test "harness onMouse scrolls transcript" {
     try ui.tr.userText("line5");
     var got: std.ArrayListUnmanaged(u8) = .empty;
     defer got.deinit(std.testing.allocator);
-    try got.writer(std.testing.allocator).print("init={d}\n", .{ui.tr.scroll_off});
+    try got.print(std.testing.allocator, "init={d}\n", .{ui.tr.scroll_off});
 
     ui.onMouse(.scroll_up);
-    try got.writer(std.testing.allocator).print("up={d}\n", .{ui.tr.scroll_off});
+    try got.print(std.testing.allocator, "up={d}\n", .{ui.tr.scroll_off});
 
     ui.onMouse(.scroll_down);
-    try got.writer(std.testing.allocator).print("down={d}\n", .{ui.tr.scroll_off});
+    try got.print(std.testing.allocator, "down={d}\n", .{ui.tr.scroll_off});
 
     // Extra scroll down doesn't underflow
     ui.onMouse(.scroll_down);
-    try got.writer(std.testing.allocator).print("down2={d}", .{ui.tr.scroll_off});
+    try got.print(std.testing.allocator, "down2={d}", .{ui.tr.scroll_off});
     try expectSnapText(@src(), "init=0\nup=3\ndown=0\ndown2=0", got.items);
 }
 
@@ -832,7 +833,11 @@ test "harness draw clamps streamed transcript viewport to visible rows" {
             try buf.appendSlice(alloc, "| --- | --- |\n");
             var i: usize = 0;
             while (i < n) : (i += 1) {
-                try std.fmt.format(buf.writer(alloc), "| r{d} | v{d} |\n", .{ i + 1, i + 1 });
+                {
+                    const line = try std.fmt.allocPrint(alloc, "| r{d} | v{d} |\n", .{ i + 1, i + 1 });
+                    defer alloc.free(line);
+                    try buf.appendSlice(alloc, line);
+                }
             }
             return buf.toOwnedSlice(alloc);
         }

@@ -6,7 +6,7 @@ const types = @import("types.zig");
 pub const Err = types.Err;
 
 pub const Parser = struct {
-    buf: std.ArrayListUnmanaged(u8) = .{},
+    buf: std.ArrayListUnmanaged(u8) = .empty,
     saw_stop: bool = false,
 
     pub fn deinit(self: *Parser, alloc: std.mem.Allocator) void {
@@ -185,7 +185,7 @@ fn parseChunks(alloc: std.mem.Allocator, chunks: []const []const u8) Err!ParseRe
     var p = Parser{};
     defer p.deinit(ar);
 
-    var evs: std.ArrayListUnmanaged(providers.Event) = .{};
+    var evs: std.ArrayListUnmanaged(providers.Event) = .empty;
     errdefer evs.deinit(ar);
 
     for (chunks) |chunk| {

@@ -7,6 +7,10 @@ const tool_snap = @import("../../test/tool_snap.zig");
 const noop = @import("../../test/noop_sink.zig");
 const Acc = shared.Acc;
 
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const Err = error{
     KindMismatch,
     InvalidArgs,
@@ -71,7 +75,7 @@ fn readSelected(self: Handler, path: []const u8, from_line: u32, to_line: ?u32) 
     var file = path_guard.openFile(path, .{ .mode = .read_only }) catch |open_err| {
         return shared.mapFsErr(open_err);
     };
-    defer file.close();
+    defer file.close(defaultIo());
 
     const last_line = to_line orelse std.math.maxInt(u32);
     var line_no: u32 = 1;
@@ -82,7 +86,7 @@ fn readSelected(self: Handler, path: []const u8, from_line: u32, to_line: ?u32) 
 
     var scratch: [4096]u8 = undefined;
     while (true) {
-        const n = file.read(&scratch) catch |read_err| {
+        const n = file.readStreaming(defaultIo(), &.{scratch[0..]}) catch |read_err| {
             return shared.mapFsErr(read_err);
         };
         if (n == 0) break;
@@ -111,8 +115,6 @@ fn readSelected(self: Handler, path: []const u8, from_line: u32, to_line: ?u32) 
     };
 }
 
-
-
 test "read handler returns selected lines with deterministic timestamps" {
     const OhSnap = @import("ohsnap");
     const oh = OhSnap{};
@@ -121,8 +123,8 @@ test "read handler returns selected lines with deterministic timestamps" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "in.txt", .data = "a\nb\nc\n" });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "in.txt");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "in.txt", .data = "a\nb\nc\n" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "in.txt", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const sink = noop.sink();
@@ -259,8 +261,8 @@ test "read handler truncates oversized output instead of failing TooLarge" {
         try text.appendSlice(std.testing.allocator, "line-data-1234567890\n");
     }
 
-    try tmp.dir.writeFile(.{ .sub_path = "big.txt", .data = text.items });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "big.txt");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = text.items });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "big.txt", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const sink = noop.sink();
@@ -314,14 +316,13 @@ test "read handler can target a line in very large file without TooLarge" {
 
     var txt = std.ArrayList(u8).empty;
     defer txt.deinit(std.testing.allocator);
-    var w = txt.writer(std.testing.allocator);
     var i: usize = 0;
     while (i < 10_000) : (i += 1) {
-        try w.print("line-{d}\n", .{i + 1});
+        try txt.print(std.testing.allocator, "line-{d}\n", .{i + 1});
     }
-    try tmp.dir.writeFile(.{ .sub_path = "huge.txt", .data = txt.items });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "huge.txt", .data = txt.items });
 
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "huge.txt");
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "huge.txt", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const sink = noop.sink();
@@ -370,8 +371,8 @@ test "read handler denies hardlinked file" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "base.txt", .data = "secret\n" });
-    try std.posix.linkat(tmp.dir.fd, "base.txt", tmp.dir.fd, "alias.txt", 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "base.txt", .data = "secret\n" });
+    try tmp.dir.hardLink("base.txt", tmp.dir, "alias.txt", std.testing.io, .{});
 
     const sink = noop.sink();
 

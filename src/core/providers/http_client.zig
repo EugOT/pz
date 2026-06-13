@@ -7,6 +7,7 @@ const std = @import("std");
 const providers = @import("api.zig");
 const auth_mod = @import("auth.zig");
 const audit = @import("../audit.zig");
+const core_time = @import("../time.zig");
 const utf8 = @import("../utf8.zig");
 const el_mod = @import("../event_loop.zig");
 pub const EventLoop = el_mod.EventLoop;
@@ -82,7 +83,7 @@ pub fn refreshAuth(
     var reloaded = auth_mod.loadForProvider(alloc, tag) catch return error.RefreshFailed;
     switch (reloaded.auth) {
         .oauth => |oauth| {
-            const now = std.time.milliTimestamp();
+            const now = core_time.milliTimestamp();
             if (now < oauth.expires) {
                 auth.deinit();
                 auth.* = reloaded;
@@ -107,7 +108,7 @@ pub fn tryProactiveRefresh(
     ar: std.mem.Allocator,
 ) !void {
     if (auth.auth != .oauth) return;
-    const now = std.time.milliTimestamp();
+    const now = core_time.milliTimestamp();
     if (now < auth.auth.oauth.expires) return;
     refreshAuth(alloc, auth, tag, ca_file, ar) catch |err| {
         // Token is expired and refresh failed — no point sending it
@@ -158,15 +159,16 @@ pub const RealSleeper = struct {
     fn selfPipeFd() std.posix.fd_t {
         const S = struct {
             var fd: std.posix.fd_t = -1;
-            var mu: std.Thread.Mutex = .{};
+            var mu: std.Io.Mutex = .init;
         };
+        const io = std.Io.Threaded.global_single_threaded.io();
         // Fast path: already initialized.
         if (@atomicLoad(std.posix.fd_t, &S.fd, .acquire) >= 0) return S.fd;
-        S.mu.lock();
-        defer S.mu.unlock();
+        S.mu.lock(io) catch return -1;
+        defer S.mu.unlock(io);
         // Double-check after acquiring lock.
         if (S.fd >= 0) return S.fd;
-        const fds = std.posix.pipe2(.{ .CLOEXEC = true }) catch return -1;
+        const fds = el_mod.makePipe() catch return -1;
         @atomicStore(std.posix.fd_t, &S.fd, fds[0], .release);
         // Write end intentionally leaked — never written.
         return fds[0];
@@ -329,7 +331,7 @@ pub fn sseNext(self: anytype) anyerror!?providers.Event {
             return null;
         };
 
-        const raw = std.mem.trimRight(u8, raw_line, "\r");
+        const raw = std.mem.trimEnd(u8, raw_line, "\r");
         if (try processSseLine(self, raw)) |ev| return ev;
     }
 }
@@ -339,7 +341,7 @@ fn processSseLine(self: anytype, raw: []const u8) anyerror!?providers.Event {
     const data = if (std.mem.startsWith(u8, raw, "data: "))
         raw["data: ".len..]
     else if (std.mem.startsWith(u8, raw, "data:"))
-        std.mem.trimLeft(u8, raw["data:".len..], " ")
+        std.mem.trimStart(u8, raw["data:".len..], " ")
     else
         return null;
 
@@ -416,7 +418,7 @@ pub fn SseClient(comptime Cfg: type) type {
             return .{
                 .alloc = alloc,
                 .auth = auth_res,
-                .http = .{ .allocator = alloc },
+                .http = .{ .allocator = alloc, .io = std.Io.Threaded.global_single_threaded.io() },
                 .ca_file = ca_dup,
             };
         }
@@ -436,9 +438,10 @@ pub fn SseClient(comptime Cfg: type) type {
         };
 
         fn providerStart(p: *providers.Provider, req: providers.Request) anyerror!*providers.Stream {
-            const self: *Self = @fieldParentPtr("provider", p);
+            const self: *Self = @alignCast(@fieldParentPtr("provider", p));
             const stream = try self.alloc.create(Stream);
             stream.* = Stream.initFields(self.alloc);
+            stream.io = self.http.io;
             errdefer {
                 stream.arena.deinit();
                 self.alloc.destroy(stream);
@@ -480,6 +483,7 @@ pub fn SseStream(comptime Cfg: type) type {
 
         // Shared fields
         alloc: std.mem.Allocator,
+        io: std.Io,
         arena: std.heap.ArenaAllocator,
         req: std.http.Client.Request,
         response: std.http.Client.Response,
@@ -518,7 +522,8 @@ pub fn SseStream(comptime Cfg: type) type {
 
         fn doAbort(self: *Self) void {
             if (self.req.connection) |conn| {
-                std.posix.shutdown(conn.stream_reader.getStream().handle, .recv) catch {}; // cleanup: propagation impossible
+                var stream = conn.stream_reader.stream;
+                stream.shutdown(self.io, .recv) catch {}; // cleanup: propagation impossible
             }
         }
 
@@ -538,10 +543,10 @@ pub fn SseStream(comptime Cfg: type) type {
             alloc.destroy(self);
         }
 
-
         pub fn initFields(alloc: std.mem.Allocator) Self {
             return .{
                 .alloc = alloc,
+                .io = std.Io.failing,
                 .arena = std.heap.ArenaAllocator.init(alloc),
                 .req = undefined,
                 .response = undefined,
@@ -552,8 +557,8 @@ pub fn SseStream(comptime Cfg: type) type {
                 .in_tok = 0,
                 .out_tok = 0,
                 .cache_read = 0,
-                .tool_name = .{},
-                .tool_args = .{},
+                .tool_name = .empty,
+                .tool_args = .empty,
                 .in_tool = false,
                 .done = false,
                 .err_mode = false,

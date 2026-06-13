@@ -397,15 +397,14 @@ pub const Manifest = struct {
 
     /// Build the canonical signed payload (everything except the sig= line).
     pub fn canonical(self: Manifest, buf: *[max_len]u8) error{Overflow}![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         w.writeAll(header) catch return error.Overflow;
         w.print("version={s}\n", .{self.version}) catch return error.Overflow;
         w.print("asset={s}\n", .{self.asset}) catch return error.Overflow;
         w.print("sha256={s}\n", .{self.sha256}) catch return error.Overflow;
         w.print("url={s}\n", .{self.url}) catch return error.Overflow;
         w.print("key_id={s}\n", .{self.key_id}) catch return error.Overflow;
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Parse a manifest from wire text.

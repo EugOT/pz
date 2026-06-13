@@ -3,6 +3,10 @@ const std = @import("std");
 const args = @import("args.zig");
 const core = @import("../core.zig");
 
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const model_default = "default";
 pub const provider_default = "default";
 pub const session_dir_default = ".pz/sessions";
@@ -29,19 +33,22 @@ pub const Env = struct {
         return self.tmp_dir orelse tmp_dir_default;
     }
 
-    pub fn fromProcess(alloc: std.mem.Allocator) !Env {
+    pub fn fromMap(
+        alloc: std.mem.Allocator,
+        environ_map: *const std.process.Environ.Map,
+    ) !Env {
         return .{
-            .model = try dupEnv(alloc, "PZ_MODEL"),
-            .models = try dupEnv(alloc, "PZ_MODELS"),
-            .provider = try dupEnv(alloc, "PZ_PROVIDER"),
-            .session_dir = try dupEnv(alloc, "PZ_SESSION_DIR"),
-            .mode = try dupEnv(alloc, "PZ_MODE"),
-            .theme = try dupEnv(alloc, "PZ_THEME"),
-            .provider_cmd = try dupEnv(alloc, "PZ_PROVIDER_CMD"),
-            .home = try validatedHome(alloc),
-            .tmp_dir = try dupEnv(alloc, "TMPDIR"),
-            .state_dir = try dupEnv(alloc, "PZ_STATE_DIR"),
-            .xdg_state_home = try dupEnv(alloc, "XDG_STATE_HOME"),
+            .model = try dupEnvMap(alloc, environ_map, "PZ_MODEL"),
+            .models = try dupEnvMap(alloc, environ_map, "PZ_MODELS"),
+            .provider = try dupEnvMap(alloc, environ_map, "PZ_PROVIDER"),
+            .session_dir = try dupEnvMap(alloc, environ_map, "PZ_SESSION_DIR"),
+            .mode = try dupEnvMap(alloc, environ_map, "PZ_MODE"),
+            .theme = try dupEnvMap(alloc, environ_map, "PZ_THEME"),
+            .provider_cmd = try dupEnvMap(alloc, environ_map, "PZ_PROVIDER_CMD"),
+            .home = try validatedHome(alloc, environ_map),
+            .tmp_dir = try dupEnvMap(alloc, environ_map, "TMPDIR"),
+            .state_dir = try dupEnvMap(alloc, environ_map, "PZ_STATE_DIR"),
+            .xdg_state_home = try dupEnvMap(alloc, environ_map, "XDG_STATE_HOME"),
         };
     }
 
@@ -109,8 +116,11 @@ pub fn validateHome(home: ?[]const u8) ?[]const u8 {
 }
 
 /// Read and validate HOME from env, allocating a copy. Called once at startup.
-fn validatedHome(alloc: std.mem.Allocator) error{OutOfMemory}!?[]const u8 {
-    const raw = try dupEnv(alloc, "HOME") orelse return null;
+fn validatedHome(
+    alloc: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+) error{OutOfMemory}!?[]const u8 {
+    const raw = try dupEnvMap(alloc, environ_map, "HOME") orelse return null;
     if (validateHome(raw) != null) return raw;
     alloc.free(raw);
     return null;
@@ -132,7 +142,7 @@ pub const PzState = struct {
     pub fn loadForHome(alloc: std.mem.Allocator, home_override: ?[]const u8) !?PzState {
         const path = (try statePathAlloc(alloc, home_override)) orelse return null;
         defer alloc.free(path);
-        const raw = std.fs.cwd().readFileAlloc(alloc, path, 64 * 1024) catch |err| switch (err) {
+        const raw = std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, alloc, .limited(64 * 1024)) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -162,8 +172,8 @@ pub const PzState = struct {
         const json = try std.json.Stringify.valueAlloc(alloc, self, .{});
         defer alloc.free(json);
         const file = try core.fs_secure.createFilePath(path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(json);
+        defer file.close(defaultIo());
+        try file.writeStreamingAll(defaultIo(), json);
     }
 
     pub fn deinit(self: *PzState, alloc: std.mem.Allocator) void {
@@ -183,9 +193,9 @@ pub const Err = @typeInfo(
     @typeInfo(@TypeOf(discover)).@"fn".return_type.?,
 ).error_union.error_set;
 
-fn writeAutoCfg(dir: std.fs.Dir, data: []const u8) !void {
-    try dir.makePath(".pz");
-    try dir.writeFile(.{ .sub_path = auto_cfg_path, .data = data });
+fn writeAutoCfg(dir: std.Io.Dir, data: []const u8) !void {
+    try dir.createDirPath(std.testing.io, ".pz");
+    try dir.writeFile(std.testing.io, .{ .sub_path = auto_cfg_path, .data = data });
 }
 
 const SettingsCfg = struct {
@@ -214,8 +224,8 @@ test "pz state save and load are home-overrideable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home");
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     var state = PzState{ .last_hash = try std.testing.allocator.dupe(u8, "abc123") };
@@ -233,8 +243,8 @@ test "pz state save locks dir and file modes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home");
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    try tmp.dir.createDirPath(std.testing.io, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     var state = PzState{ .last_hash = try std.testing.allocator.dupe(u8, "abc123") };
@@ -243,14 +253,14 @@ test "pz state save locks dir and file modes" {
 
     const dir_path = try std.fs.path.join(std.testing.allocator, &.{ home, pz_state_dir });
     defer std.testing.allocator.free(dir_path);
-    var dir = try std.fs.openDirAbsolute(dir_path, .{ .iterate = true });
-    defer dir.close();
-    try std.testing.expectEqual(@as(std.fs.File.Mode, core.fs_secure.dir_mode), (try dir.stat()).mode & 0o777);
+    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, dir_path, .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    try std.testing.expectEqual(core.fs_secure.dir_mode.toMode() & 0o777, (try dir.stat(std.testing.io)).permissions.toMode() & 0o777);
 
     const file_path = try std.fs.path.join(std.testing.allocator, &.{ dir_path, pz_state_file });
     defer std.testing.allocator.free(file_path);
-    const st = try std.fs.cwd().statFile(file_path);
-    try std.testing.expectEqual(@as(std.fs.File.Mode, core.fs_secure.file_mode), st.mode & 0o777);
+    const st = try std.Io.Dir.cwd().statFile(std.testing.io, file_path, .{});
+    try std.testing.expectEqual(core.fs_secure.file_mode.toMode() & 0o777, st.permissions.toMode() & 0o777);
 }
 
 test "pz state load returns null without overrideable home" {
@@ -259,7 +269,8 @@ test "pz state load returns null without overrideable home" {
 
 pub fn discover(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
     parsed: args.Parsed,
     env: Env,
 ) !Config {
@@ -271,9 +282,9 @@ pub fn discover(
     };
     errdefer out.deinit(alloc);
 
-    const cwd = try dir.realpathAlloc(alloc, ".");
+    const cwd = try dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(cwd);
-    const resolved = try core.policy.loadResolved(alloc, cwd, env.home);
+    const resolved = try core.policy.loadResolved(alloc, io, cwd, env.home);
     defer core.policy.deinitResolved(alloc, resolved);
     out.policy_lock = resolved.doc.lock;
     out.audit_overflow = resolved.doc.audit_overflow;
@@ -281,20 +292,20 @@ pub fn discover(
     if (out.policy_lock.cfg) {
         switch (parsed.cfg) {
             .auto => {
-                if (try hasFile(dir, auto_cfg_path)) return error.PolicyLockedConfig;
-                if (try hasGlobalSettings(alloc, env.home)) return error.PolicyLockedConfig;
+                if (try hasFile(dir, io, auto_cfg_path)) return error.PolicyLockedConfig;
+                if (try hasGlobalSettings(alloc, io, env.home)) return error.PolicyLockedConfig;
             },
             .off, .path => return error.PolicyLockedConfig,
         }
     } else if (parsed.cfg != .off) {
-        if (try loadGlobalSettings(alloc, env.home)) |global_cfg| {
+        if (try loadGlobalSettings(alloc, io, env.home)) |global_cfg| {
             defer global_cfg.deinit();
             try applySettingsCfg(alloc, &out, global_cfg.value, error.InvalidFileMode);
         }
     }
 
     if (!out.policy_lock.cfg) {
-        if (try loadFile(alloc, dir, parsed.cfg)) |file_cfg| {
+        if (try loadFile(alloc, io, dir, parsed.cfg)) |file_cfg| {
             defer file_cfg.deinit();
             try applyRawCfg(
                 alloc,
@@ -401,16 +412,17 @@ const FileCfg = struct {
 
 fn loadFile(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
     cfg_sel: args.ConfigSelection,
 ) !?std.json.Parsed(FileCfg) {
     const path = switch (cfg_sel) {
         .off => return null,
         .path => |p| p,
-        .auto => if (hasFile(dir, auto_cfg_path) catch false) auto_cfg_path else return null,
+        .auto => if (hasFile(dir, io, auto_cfg_path) catch false) auto_cfg_path else return null,
     };
 
-    const raw = try dir.readFileAlloc(alloc, path, 1024 * 1024);
+    const raw = try dir.readFileAlloc(io, path, alloc, .limited(1024 * 1024));
     defer alloc.free(raw);
 
     const parsed = try std.json.parseFromSlice(FileCfg, alloc, raw, .{
@@ -420,7 +432,11 @@ fn loadFile(
     return parsed;
 }
 
-fn loadGlobalSettings(alloc: std.mem.Allocator, home: ?[]const u8) !?std.json.Parsed(SettingsCfg) {
+fn loadGlobalSettings(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    home: ?[]const u8,
+) !?std.json.Parsed(SettingsCfg) {
     const home_path = home orelse return null;
     if (home_path.len == 0) return null;
     if (std.mem.indexOfScalar(u8, home_path, 0) != null) return null;
@@ -428,13 +444,15 @@ fn loadGlobalSettings(alloc: std.mem.Allocator, home: ?[]const u8) !?std.json.Pa
     defer alloc.free(path);
     if (!std.fs.path.isAbsolute(path)) return error.InvalidHomePath;
 
-    var file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer file.close();
+    defer file.close(io);
 
-    const raw = try file.readToEndAlloc(alloc, 1024 * 1024);
+    var buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(io, &buf);
+    const raw = try reader.interface.allocRemaining(alloc, .limited(1024 * 1024));
     defer alloc.free(raw);
 
     const parsed = try std.json.parseFromSlice(SettingsCfg, alloc, raw, .{
@@ -444,13 +462,13 @@ fn loadGlobalSettings(alloc: std.mem.Allocator, home: ?[]const u8) !?std.json.Pa
     return parsed;
 }
 
-fn hasGlobalSettings(alloc: std.mem.Allocator, home: ?[]const u8) !bool {
+fn hasGlobalSettings(alloc: std.mem.Allocator, io: std.Io, home: ?[]const u8) !bool {
     const home_path = home orelse return false;
     const path = try std.fs.path.join(alloc, &.{ home_path, auto_cfg_path });
     defer alloc.free(path);
     if (!std.fs.path.isAbsolute(path)) return error.InvalidHomePath;
 
-    std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -554,8 +572,8 @@ fn pick(primary: ?[]const u8, fallback: ?[]const u8) ?[]const u8 {
     return fallback;
 }
 
-fn hasFile(dir: std.fs.Dir, path: []const u8) !bool {
-    dir.access(path, .{}) catch |err| switch (err) {
+fn hasFile(dir: std.Io.Dir, io: std.Io, path: []const u8) !bool {
+    dir.access(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -586,11 +604,13 @@ fn replaceOptStr(
     dst.* = next;
 }
 
-fn dupEnv(alloc: std.mem.Allocator, key: []const u8) error{OutOfMemory}!?[]const u8 {
-    return std.process.getEnvVarOwned(alloc, key) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound, error.InvalidWtf8 => return null,
-        error.OutOfMemory => return error.OutOfMemory,
-    };
+fn dupEnvMap(
+    alloc: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    key: []const u8,
+) error{OutOfMemory}!?[]const u8 {
+    const value = environ_map.get(key) orelse return null;
+    return try alloc.dupe(u8, value);
 }
 
 test "config uses defaults when no sources are present" {
@@ -598,7 +618,7 @@ test "config uses defaults when no sources are present" {
     defer tmp.cleanup();
 
     const parsed = try args.parse(&.{});
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{});
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.mode == .tui);
@@ -617,7 +637,7 @@ test "config precedence is file then env then flags" {
     try writeAutoCfg(tmp.dir, "{\"mode\":\"print\",\"model\":\"file-model\",\"session_dir\":\"file-sessions\",\"theme\":\"light\",\"provider_cmd\":\"file-cmd\"}");
 
     const parsed = try args.parse(&.{ "--tui", "--model", "flag-model", "--provider-cmd", "flag-cmd" });
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{
         .model = "env-model",
         .provider = "env-provider",
         .session_dir = "env-sessions",
@@ -644,7 +664,7 @@ test "config no-config bypasses file source" {
     try writeAutoCfg(tmp.dir, "{\"mode\":\"print\",\"model\":\"file-model\"}");
 
     const parsed = try args.parse(&.{"--no-config"});
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{});
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.mode == .tui);
@@ -658,17 +678,17 @@ test "config no-config suppresses global settings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "home/.pz/settings.json",
         .data = "{\"defaultModel\":\"home-model\",\"theme\":\"dark\"}",
     });
 
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     const parsed = try args.parse(&.{"--no-config"});
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{ .home = home_abs });
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{ .home = home_abs });
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings(model_default, cfg.model);
@@ -679,13 +699,13 @@ test "config explicit path loads file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "custom.json",
         .data = "{\"mode\":\"print\",\"model\":\"m\",\"session_dir\":\"s\",\"theme\":\"light\",\"provider_cmd\":\"cmd\",\"ca_file\":\"/etc/pz/custom.pem\"}",
     });
 
     const parsed = try args.parse(&.{ "--config", "custom.json" });
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{});
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.mode == .print);
@@ -707,6 +727,7 @@ test "config rejects invalid env mode and invalid file mode" {
     const parsed = try args.parse(&.{});
     try std.testing.expectError(error.InvalidEnvMode, discover(
         std.testing.allocator,
+        std.testing.io,
         tmp.dir,
         parsed,
         .{
@@ -717,6 +738,7 @@ test "config rejects invalid env mode and invalid file mode" {
     try writeAutoCfg(tmp.dir, "{\"mode\":\"bad\"}");
     try std.testing.expectError(error.InvalidFileMode, discover(
         std.testing.allocator,
+        std.testing.io,
         tmp.dir,
         parsed,
         .{},
@@ -728,7 +750,7 @@ test "config accepts interactive alias for mode" {
     defer tmp.cleanup();
 
     const parsed = try args.parse(&.{});
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{
         .mode = "interactive",
     });
     defer cfg.deinit(std.testing.allocator);
@@ -739,8 +761,8 @@ test "config auto imports global settings from home" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "home/.pz/settings.json",
         .data =
         \\{
@@ -755,11 +777,11 @@ test "config auto imports global settings from home" {
         ,
     });
 
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     const parsed = try args.parse(&.{});
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{
         .home = home_abs,
     });
     defer cfg.deinit(std.testing.allocator);
@@ -780,8 +802,8 @@ test "config local auto file overrides global settings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "home/.pz/settings.json",
         .data =
         \\{
@@ -797,11 +819,11 @@ test "config local auto file overrides global settings" {
     });
     try writeAutoCfg(tmp.dir, "{\"mode\":\"print\",\"model\":\"local-model\",\"provider\":\"local-provider\",\"session_dir\":\"local-sessions\",\"theme\":\"light\",\"provider_cmd\":\"local-cmd\",\"ca_file\":\"local-ca.pem\"}");
 
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     const parsed = try args.parse(&.{});
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{
         .home = home_abs,
     });
     defer cfg.deinit(std.testing.allocator);
@@ -823,17 +845,17 @@ test "config policy ca_file overrides local config" {
     defer tmp.cleanup();
 
     try writeAutoCfg(tmp.dir, "{\"ca_file\":\"local-ca.pem\"}");
-    try tmp.dir.makePath(".pz");
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
     const kp = try testPolicyKeyPair();
     const raw = try core.policy.encodeSignedDoc(std.testing.allocator, .{
         .rules = &.{},
         .ca_file = "policy-ca.pem",
     }, kp);
     defer std.testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = policy_rel_path, .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = policy_rel_path, .data = raw });
 
     const parsed = try args.parse(&.{});
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{});
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.ca_file != null);
@@ -852,52 +874,52 @@ test "config rejects ca_file config under policy lock" {
         .lock = .{ .cfg = true },
     }, kp);
     defer std.testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = policy_rel_path, .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = policy_rel_path, .data = raw });
 
     const parsed = try args.parse(&.{});
-    try std.testing.expectError(error.PolicyLockedConfig, discover(std.testing.allocator, tmp.dir, parsed, .{}));
+    try std.testing.expectError(error.PolicyLockedConfig, discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{}));
 }
 
 test "config rejects explicit file override under policy lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
     const kp = try testPolicyKeyPair();
     const raw = try core.policy.encodeSignedDoc(std.testing.allocator, .{
         .rules = &.{},
         .lock = .{ .cfg = true },
     }, kp);
     defer std.testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = policy_rel_path, .data = raw });
-    try tmp.dir.writeFile(.{ .sub_path = "custom.json", .data = "{\"model\":\"x\"}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = policy_rel_path, .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "custom.json", .data = "{\"model\":\"x\"}" });
 
     const parsed = try args.parse(&.{ "--config", "custom.json" });
-    try std.testing.expectError(error.PolicyLockedConfig, discover(std.testing.allocator, tmp.dir, parsed, .{}));
+    try std.testing.expectError(error.PolicyLockedConfig, discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{}));
 }
 
 test "config rejects no-config under policy lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
     const kp = try testPolicyKeyPair();
     const raw = try core.policy.encodeSignedDoc(std.testing.allocator, .{
         .rules = &.{},
         .lock = .{ .cfg = true },
     }, kp);
     defer std.testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = policy_rel_path, .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = policy_rel_path, .data = raw });
 
     const parsed = try args.parse(&.{"--no-config"});
-    try std.testing.expectError(error.PolicyLockedConfig, discover(std.testing.allocator, tmp.dir, parsed, .{}));
+    try std.testing.expectError(error.PolicyLockedConfig, discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{}));
 }
 
 test "config rejects auto settings files under policy lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
     try writeAutoCfg(tmp.dir, "{\"model\":\"local\"}");
     const kp = try testPolicyKeyPair();
     const raw = try core.policy.encodeSignedDoc(std.testing.allocator, .{
@@ -905,27 +927,27 @@ test "config rejects auto settings files under policy lock" {
         .lock = .{ .cfg = true },
     }, kp);
     defer std.testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = policy_rel_path, .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = policy_rel_path, .data = raw });
 
     const parsed = try args.parse(&.{});
-    try std.testing.expectError(error.PolicyLockedConfig, discover(std.testing.allocator, tmp.dir, parsed, .{}));
+    try std.testing.expectError(error.PolicyLockedConfig, discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{}));
 }
 
 test "config rejects env overrides under policy lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
     const kp = try testPolicyKeyPair();
     const raw = try core.policy.encodeSignedDoc(std.testing.allocator, .{
         .rules = &.{},
         .lock = .{ .env = true },
     }, kp);
     defer std.testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = policy_rel_path, .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = policy_rel_path, .data = raw });
 
     const parsed = try args.parse(&.{});
-    try std.testing.expectError(error.PolicyLockedEnv, discover(std.testing.allocator, tmp.dir, parsed, .{
+    try std.testing.expectError(error.PolicyLockedEnv, discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{
         .model = "env-model",
     }));
 }
@@ -934,34 +956,34 @@ test "config rejects cli overrides under policy lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
     const kp = try testPolicyKeyPair();
     const raw = try core.policy.encodeSignedDoc(std.testing.allocator, .{
         .rules = &.{},
         .lock = .{ .cli = true },
     }, kp);
     defer std.testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = policy_rel_path, .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = policy_rel_path, .data = raw });
 
     const parsed = try args.parse(&.{ "--model", "cli-model" });
-    try std.testing.expectError(error.PolicyLockedCli, discover(std.testing.allocator, tmp.dir, parsed, .{}));
+    try std.testing.expectError(error.PolicyLockedCli, discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{}));
 }
 
 test "config rejects system prompt override under policy lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
     const kp = try testPolicyKeyPair();
     const raw = try core.policy.encodeSignedDoc(std.testing.allocator, .{
         .rules = &.{},
         .lock = .{ .system_prompt = true },
     }, kp);
     defer std.testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = policy_rel_path, .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = policy_rel_path, .data = raw });
 
     const parsed = try args.parse(&.{ "--system-prompt", "sys" });
-    try std.testing.expectError(error.PolicyLockedSystemPrompt, discover(std.testing.allocator, tmp.dir, parsed, .{}));
+    try std.testing.expectError(error.PolicyLockedSystemPrompt, discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{}));
 }
 
 test "config loads enabled_models from --models flag" {
@@ -969,7 +991,7 @@ test "config loads enabled_models from --models flag" {
     defer tmp.cleanup();
 
     const parsed = try args.parse(&.{ "--models", "claude-opus-4-6,claude-haiku-4-5" });
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{});
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.enabled_models != null);
@@ -986,7 +1008,7 @@ test "config loads enabled_models from file" {
     try writeAutoCfg(tmp.dir, "{\"models\":\"model-a, model-b, model-c\"}");
 
     const parsed = try args.parse(&.{});
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{});
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.enabled_models != null);
@@ -1004,7 +1026,7 @@ test "config cli --models overrides file models" {
     try writeAutoCfg(tmp.dir, "{\"models\":\"file-model\"}");
 
     const parsed = try args.parse(&.{ "--models", "cli-model" });
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{});
     defer cfg.deinit(std.testing.allocator);
 
     try std.testing.expect(cfg.enabled_models != null);
@@ -1018,7 +1040,7 @@ test "config works with null HOME (env isolation)" {
 
     const parsed = try args.parse(&.{});
     // Explicitly pass null home to prove no $HOME dependency
-    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{ .home = null });
+    var cfg = try discover(std.testing.allocator, std.testing.io, tmp.dir, parsed, .{ .home = null });
     defer cfg.deinit(std.testing.allocator);
 
     // Should produce valid defaults without touching filesystem HOME

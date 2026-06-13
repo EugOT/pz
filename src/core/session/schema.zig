@@ -634,7 +634,9 @@ test "schema property: event encode/decode roundtrip across tags" {
 
 test "fuzz decodeSlice survives arbitrary bytes" {
     try std.testing.fuzz({}, struct {
-        fn f(_: void, input: []const u8) anyerror!void {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            var input_buf: [512]u8 = undefined;
+            const input = input_buf[0..smith.slice(&input_buf)];
             const alloc = std.testing.allocator;
             var parsed = decodeSlice(alloc, input) catch return;
             parsed.deinit();

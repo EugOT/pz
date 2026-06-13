@@ -4,20 +4,25 @@ const std = @import("std");
 pub fn applyCaFile(client: *std.http.Client, alloc: std.mem.Allocator, ca_file: ?[]const u8) !void {
     if (std.http.Client.disable_tls) return;
 
-    client.ca_bundle_mutex.lock();
-    defer client.ca_bundle_mutex.unlock();
+    const now = std.Io.Clock.real.now(client.io);
+    client.ca_bundle_lock.lockUncancelable(client.io);
+    defer client.ca_bundle_lock.unlock(client.io);
 
     if (ca_file) |path| {
-        var bundle: std.crypto.Certificate.Bundle = .{};
+        var bundle: std.crypto.Certificate.Bundle = .empty;
         errdefer bundle.deinit(alloc);
-        try bundle.addCertsFromFilePathAbsolute(alloc, path);
+        const file = try std.Io.Dir.openFileAbsolute(client.io, path, .{});
+        defer file.close(client.io);
+        var buf: [4096]u8 = undefined;
+        var reader = file.readerStreaming(client.io, &buf);
+        try bundle.addCertsFromFile(alloc, &reader, now.toSeconds());
 
         client.ca_bundle.deinit(alloc);
         client.ca_bundle = bundle;
-        bundle = .{};
+        bundle = .empty;
     } else if (client.ca_bundle.bytes.items.len == 0) {
-        try client.ca_bundle.rescan(alloc);
+        try client.ca_bundle.rescan(alloc, client.io, now);
     }
 
-    @atomicStore(bool, &client.next_https_rescan_certs, false, .release);
+    client.now = now;
 }

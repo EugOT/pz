@@ -14,3 +14,4 @@ pub const syslog = @import("core/syslog.zig");
 pub const signing = @import("core/signing.zig");
 pub const agent = @import("core/agent.zig");
 pub const watcher = @import("core/watcher.zig");
+pub const time = @import("core/time.zig");

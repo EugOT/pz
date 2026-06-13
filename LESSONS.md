@@ -4,6 +4,17 @@ Hard-won patterns and anti-patterns from building pz. **Update this file at the 
 
 ---
 
+## Session Notes (2026-06-13)
+
+### Worked Well
+- For Zig 0.16 migrations, compile against the installed stdlib source and treat `std.Io` API changes as hard cutovers: pass explicit `Io` handles, use `std.process.spawn`, and update `std.process.Environ.Map` callers instead of adding compatibility helpers.
+- Keep dependency compatibility shims in `src/vendor/` and import the upstream module through the build graph; do not patch generated `zig-pkg/` package contents.
+- For PTY tests on Darwin, map wait statuses to typed `std.posix.SIG` values at the boundary and compare enum tags, not integer signal macros.
+
+### Do Not Do
+- Do not rely on a parent-process alarm wrapper as a test timeout. `zig build test` can leave child test processes running; use a process-group timeout or the project-provided `timeout` command when it exists.
+- Do not diagnose Zig cache `PermissionDenied` at source level until sandbox and disk pressure are ruled out; generated caches can hide real compile errors.
+
 ## Session Notes (2026-03-24)
 
 ### Worked Well

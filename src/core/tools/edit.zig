@@ -6,6 +6,10 @@ const shared = @import("shared.zig");
 const tool_snap = @import("../../test/tool_snap.zig");
 const noop = @import("../../test/noop_sink.zig");
 
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const Err = error{
     KindMismatch,
     InvalidArgs,
@@ -46,11 +50,8 @@ pub const Handler = struct {
         var src = path_guard.openFile(args.path, .{ .mode = .read_only }) catch |read_err| {
             return shared.mapFsErr(read_err);
         };
-        defer src.close();
-        const full = src.readToEndAlloc(self.alloc, self.max_bytes) catch |read_err| switch (read_err) {
-            error.FileTooBig => return error.TooLarge,
-            else => return shared.mapFsErr(read_err),
-        };
+        defer src.close(defaultIo());
+        const full = try readAllAlloc(src, self.alloc, self.max_bytes);
         defer self.alloc.free(full);
 
         const updated = if (args.all)
@@ -62,15 +63,11 @@ pub const Handler = struct {
         var file = path_guard.openFile(args.path, .{ .mode = .write_only }) catch |open_err| {
             return shared.mapFsErr(open_err);
         };
-        defer file.close();
+        defer file.close(defaultIo());
 
-        file.setEndPos(0) catch |truncate_err| {
-            return shared.mapFsErr(truncate_err);
-        };
-        file.seekTo(0) catch |seek_err| {
-            return shared.mapFsErr(seek_err);
-        };
-        file.writeAll(updated) catch |write_err| {
+        try truncateFile(file);
+        try seekStart(file);
+        file.writeStreamingAll(defaultIo(), updated) catch |write_err| {
             return shared.mapFsErr(write_err);
         };
 
@@ -85,6 +82,31 @@ pub const Handler = struct {
         };
     }
 };
+
+fn readAllAlloc(file: std.Io.File, alloc: std.mem.Allocator, max_bytes: usize) Err![]u8 {
+    var file_buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(defaultIo(), &file_buf);
+    return reader.interface.allocRemaining(alloc, .limited(max_bytes)) catch |read_err| switch (read_err) {
+        error.StreamTooLong => error.TooLarge,
+        error.OutOfMemory => error.OutOfMemory,
+        else => shared.mapFsErr(read_err),
+    };
+}
+
+fn truncateFile(file: std.Io.File) Err!void {
+    switch (std.posix.errno(std.c.ftruncate(file.handle, 0))) {
+        .SUCCESS => {},
+        else => |err| return shared.mapFsErr(std.posix.unexpectedErrno(err)),
+    }
+}
+
+fn seekStart(file: std.Io.File) Err!void {
+    const rc = std.c.lseek(file.handle, 0, std.c.SEEK.SET);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| return shared.mapFsErr(std.posix.unexpectedErrno(err)),
+    }
+}
 
 fn replaceFirstAlloc(
     alloc: std.mem.Allocator,
@@ -119,8 +141,6 @@ fn replaceAllAlloc(
     };
 }
 
-
-
 test "edit handler replaces first match with deterministic timestamps" {
     const OhSnap = @import("ohsnap");
     const oh = OhSnap{};
@@ -129,8 +149,8 @@ test "edit handler replaces first match with deterministic timestamps" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "in.txt", .data = "a x a x" });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "in.txt");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "in.txt", .data = "a x a x" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "in.txt", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const sink = noop.sink();
@@ -168,7 +188,7 @@ test "edit handler replaces first match with deterministic timestamps" {
         \\"
     ).expectEqual(snap);
 
-    const got = try tmp.dir.readFileAlloc(std.testing.allocator, "in.txt", 64);
+    const got = try tmp.dir.readFileAlloc(std.testing.io, "in.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("a y a x", got);
 }
@@ -179,8 +199,8 @@ test "edit handler replaces all matches when all is true" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "in.txt", .data = "ab ab ab" });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "in.txt");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "in.txt", .data = "ab ab ab" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "in.txt", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const sink = noop.sink();
@@ -206,7 +226,7 @@ test "edit handler replaces all matches when all is true" {
 
     _ = try handler.run(call, sink);
 
-    const got = try tmp.dir.readFileAlloc(std.testing.allocator, "in.txt", 64);
+    const got = try tmp.dir.readFileAlloc(std.testing.io, "in.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("cd cd cd", got);
 }
@@ -217,8 +237,8 @@ test "edit handler returns not found when old text is absent" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "in.txt", .data = "abc" });
-    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "in.txt");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "in.txt", .data = "abc" });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "in.txt", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
     const sink = noop.sink();
@@ -323,8 +343,8 @@ test "edit handler denies hardlinked file" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "base.txt", .data = "alpha\n" });
-    try std.posix.linkat(tmp.dir.fd, "base.txt", tmp.dir.fd, "alias.txt", 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "base.txt", .data = "alpha\n" });
+    try tmp.dir.hardLink("base.txt", tmp.dir, "alias.txt", std.testing.io, .{});
 
     const sink = noop.sink();
 

@@ -15,12 +15,9 @@ const Mode = enum {
     oversize,
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-
-    const alloc = arena.allocator();
-    const argv = try std.process.argsAlloc(alloc);
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.arena.allocator();
+    const argv = try init.minimal.args.toSlice(alloc);
     if (argv.len != 5) return error.InvalidArgs;
 
     const mode = std.meta.stringToEnum(Mode, argv[1]) orelse return error.InvalidArgs;
@@ -29,9 +26,12 @@ pub fn main() !void {
     const rpc_fd = try std.fmt.parseInt(std.posix.fd_t, argv[4], 10);
     try agent.closeInheritedFds(rpc_fd);
 
-    const rpc_file: std.fs.File = .{ .handle = rpc_fd };
+    const rpc_file: std.Io.File = .{
+        .handle = rpc_fd,
+        .flags = .{ .nonblocking = false },
+    };
     var rpc_buf: [4096]u8 = undefined;
-    var rpc = rpc_file.writerStreaming(&rpc_buf);
+    var rpc = rpc_file.writerStreaming(init.io, &rpc_buf);
 
     try writeHello(alloc, &rpc.interface, 1, agent_id, switch (mode) {
         .mismatch => try mutateHashAlloc(alloc, pol_hash),
@@ -42,9 +42,12 @@ pub fn main() !void {
     if (mode == .hello or mode == .mismatch or mode == .empty_hash or mode == .invalid_hash) return;
 
     var seq: u32 = 2;
-    const stdin_file = std.fs.File.stdin();
+    const stdin_file = std.Io.File.stdin();
     var stdin_buf: [4096]u8 = undefined;
-    var stdin = stdin_file.readerStreaming(&stdin_buf);
+    var stdin = stdin_file.readerStreaming(init.io, &stdin_buf);
+    var stdout_buf: [256]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buf);
+    defer stdout.interface.flush() catch {};
     while (try readFrameAlloc(alloc, &stdin.interface)) |frame| {
         switch (frame.msg) {
             .hello => {},
@@ -52,9 +55,9 @@ pub fn main() !void {
                 switch (mode) {
                     .stdout_noise => {
                         // Write tool output to stdout (should not corrupt RPC).
-                        const stdout_file = std.fs.File.stdout();
-                        try stdout_file.writeAll("TOOL_OUTPUT_NOISE\n");
-                        try stdout_file.writeAll("{\"garbage\":true}\n");
+                        try stdout.interface.writeAll("TOOL_OUTPUT_NOISE\n");
+                        try stdout.interface.writeAll("{\"garbage\":true}\n");
+                        try stdout.interface.flush();
 
                         // RPC response goes through dedicated fd.
                         const txt = try std.fmt.allocPrint(alloc, "rpc:{s}", .{run.prompt});
@@ -185,7 +188,7 @@ fn listOpenFdsAlloc(alloc: std.mem.Allocator) ![]u8 {
         }
         if (!first) try out.append(alloc, ',');
         first = false;
-        try out.writer(alloc).print("{d}", .{fd});
+        try out.print(alloc, "{d}", .{fd});
     }
     return out.toOwnedSlice(alloc);
 }

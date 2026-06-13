@@ -187,18 +187,18 @@ pub fn init(name: ?[]const u8) void {
         return;
     }
 
-    if (std.posix.getenv("PZ_THEME")) |val| {
+    if (getenv("PZ_THEME")) |val| {
         active.store(themeByName(val) orelse &dark, .release);
         return;
     }
-    if (std.posix.getenv("PI_THEME")) |val| {
+    if (getenv("PI_THEME")) |val| {
         active.store(themeByName(val) orelse &dark, .release);
         return;
     }
 
     var theme: *const Theme = &dark;
     // Auto-detect from COLORFGBG: "fg;bg" — high bg number means light bg
-    if (std.posix.getenv("COLORFGBG")) |val| {
+    if (getenv("COLORFGBG")) |val| {
         if (std.mem.lastIndexOfScalar(u8, val, ';')) |sep| {
             const bg_str = val[sep + 1 ..];
             if (std.fmt.parseInt(u8, bg_str, 10)) |bg| {
@@ -210,6 +210,10 @@ pub fn init(name: ?[]const u8) void {
         }
     }
     active.store(theme, .release);
+}
+
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    return if (std.c.getenv(name)) |value| std.mem.span(value) else null;
 }
 
 pub fn get() *const Theme {

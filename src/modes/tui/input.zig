@@ -3,6 +3,51 @@ const std = @import("std");
 const editor = @import("editor.zig");
 const mouse = @import("mouse.zig");
 
+fn closeFd(fd: std.posix.fd_t) void {
+    _ = std.c.close(fd);
+}
+
+fn setPipeFlags(fd: std.posix.fd_t) !void {
+    if (std.c.fcntl(fd, @as(c_int, std.posix.F.SETFD), @as(c_int, std.posix.FD_CLOEXEC)) == -1) {
+        return std.posix.unexpectedErrno(std.posix.errno(-1));
+    }
+    const flags = std.c.fcntl(fd, @as(c_int, std.posix.F.GETFL), @as(c_int, 0));
+    if (flags == -1) return std.posix.unexpectedErrno(std.posix.errno(-1));
+    const raw: c_int = @bitCast(@as(std.posix.O, .{ .NONBLOCK = true }));
+    if (std.c.fcntl(fd, @as(c_int, std.posix.F.SETFL), flags | raw) == -1) {
+        return std.posix.unexpectedErrno(std.posix.errno(-1));
+    }
+}
+
+fn makePipe() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return std.posix.unexpectedErrno(std.posix.errno(-1));
+    errdefer {
+        closeFd(fds[0]);
+        closeFd(fds[1]);
+    }
+    try setPipeFlags(fds[0]);
+    try setPipeFlags(fds[1]);
+    return fds;
+}
+
+fn fdWrite(fd: std.posix.fd_t, bytes: []const u8) !usize {
+    while (true) {
+        const rc = std.c.write(fd, bytes.ptr, bytes.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn fdWriteAll(fd: std.posix.fd_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) off += try fdWrite(fd, bytes[off..]);
+}
+
 pub const Event = union(enum) {
     key: editor.Key,
     mouse: mouse.Event,
@@ -900,23 +945,17 @@ test "parse ctrl-close-bracket" {
 }
 
 test "reader emits notify event from notify fd" {
-    const in_pipe = try std.posix.pipe2(.{
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-    });
-    defer std.posix.close(in_pipe[0]);
-    defer std.posix.close(in_pipe[1]);
+    const in_pipe = try makePipe();
+    defer closeFd(in_pipe[0]);
+    defer closeFd(in_pipe[1]);
 
-    const notify_pipe = try std.posix.pipe2(.{
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-    });
-    defer std.posix.close(notify_pipe[0]);
-    defer std.posix.close(notify_pipe[1]);
+    const notify_pipe = try makePipe();
+    defer closeFd(notify_pipe[0]);
+    defer closeFd(notify_pipe[1]);
 
     var r = Reader.initWithNotify(in_pipe[0], notify_pipe[0]);
     const b = [_]u8{1};
-    _ = try std.posix.write(notify_pipe[1], &b);
+    try fdWriteAll(notify_pipe[1], &b);
 
     const ev = r.next();
     switch (ev) {
@@ -926,25 +965,19 @@ test "reader emits notify event from notify fd" {
 }
 
 test "reader notify does not drop stdin bytes" {
-    const in_pipe = try std.posix.pipe2(.{
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-    });
-    defer std.posix.close(in_pipe[0]);
-    defer std.posix.close(in_pipe[1]);
+    const in_pipe = try makePipe();
+    defer closeFd(in_pipe[0]);
+    defer closeFd(in_pipe[1]);
 
-    const notify_pipe = try std.posix.pipe2(.{
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-    });
-    defer std.posix.close(notify_pipe[0]);
-    defer std.posix.close(notify_pipe[1]);
+    const notify_pipe = try makePipe();
+    defer closeFd(notify_pipe[0]);
+    defer closeFd(notify_pipe[1]);
 
     var r = Reader.initWithNotify(in_pipe[0], notify_pipe[0]);
 
     const n = [_]u8{1};
-    _ = try std.posix.write(notify_pipe[1], &n);
-    _ = try std.posix.write(in_pipe[1], "x");
+    try fdWriteAll(notify_pipe[1], &n);
+    try fdWriteAll(in_pipe[1], "x");
 
     const ev1 = r.next();
     switch (ev1) {
@@ -955,37 +988,28 @@ test "reader notify does not drop stdin bytes" {
 }
 
 test "reader emits notify from either notify fd" {
-    const in_pipe = try std.posix.pipe2(.{
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-    });
-    defer std.posix.close(in_pipe[0]);
-    defer std.posix.close(in_pipe[1]);
+    const in_pipe = try makePipe();
+    defer closeFd(in_pipe[0]);
+    defer closeFd(in_pipe[1]);
 
-    const notify_a = try std.posix.pipe2(.{
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-    });
-    defer std.posix.close(notify_a[0]);
-    defer std.posix.close(notify_a[1]);
+    const notify_a = try makePipe();
+    defer closeFd(notify_a[0]);
+    defer closeFd(notify_a[1]);
 
-    const notify_b = try std.posix.pipe2(.{
-        .NONBLOCK = true,
-        .CLOEXEC = true,
-    });
-    defer std.posix.close(notify_b[0]);
-    defer std.posix.close(notify_b[1]);
+    const notify_b = try makePipe();
+    defer closeFd(notify_b[0]);
+    defer closeFd(notify_b[1]);
 
     var r = Reader.initWithNotify2(in_pipe[0], notify_a[0], notify_b[0]);
     const b = [_]u8{1};
 
-    _ = try std.posix.write(notify_a[1], &b);
+    try fdWriteAll(notify_a[1], &b);
     switch (r.next()) {
         .notify => {},
         else => return error.TestUnexpectedResult,
     }
 
-    _ = try std.posix.write(notify_b[1], &b);
+    try fdWriteAll(notify_b[1], &b);
     switch (r.next()) {
         .notify => {},
         else => return error.TestUnexpectedResult,

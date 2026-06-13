@@ -323,13 +323,13 @@ test "runtime emits start and finish when handler has no output" {
     }, &sink_impl.sink);
 
     var buf: [128]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const w = &fbs;
     for (sink_impl.evs[0..sink_impl.ct]) |ev| {
         try w.print("{s}\n", .{@tagName(ev)});
     }
 
-    const snap = fbs.getWritten();
+    const snap = fbs.buffered();
     try oh.snap(@src(),
         \\[]u8
         \\  "start
@@ -390,13 +390,13 @@ test "runtime preserves handler error type and does not emit finish" {
     }, &sink_impl.sink));
 
     var buf: [128]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    const w = &fbs;
     for (sink_impl.evs[0..sink_impl.ct]) |ev| {
         try w.print("{s}\n", .{@tagName(ev)});
     }
 
-    const snap = fbs.getWritten();
+    const snap = fbs.buffered();
     try oh.snap(@src(),
         \\[]u8
         \\  "start

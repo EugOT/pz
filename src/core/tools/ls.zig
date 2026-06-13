@@ -6,6 +6,12 @@ const shared = @import("shared.zig");
 const noop = @import("../../test/noop_sink.zig");
 const Acc = shared.Acc;
 
+const Dir = std.Io.Dir;
+
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const Err = error{
     KindMismatch,
     InvalidArgs,
@@ -45,7 +51,7 @@ pub const Handler = struct {
         var dir = path_guard.openDir(args.path, .{ .iterate = true }) catch |open_err| {
             return shared.mapFsErr(open_err);
         };
-        defer dir.close();
+        defer dir.close(defaultIo());
 
         var items = std.ArrayList(Item).empty;
         defer {
@@ -54,7 +60,7 @@ pub const Handler = struct {
         }
 
         var it = dir.iterate();
-        while (it.next() catch |next_err| return shared.mapFsErr(next_err)) |ent| {
+        while (it.next(defaultIo()) catch |next_err| return shared.mapFsErr(next_err)) |ent| {
             if (!args.all and ent.name.len > 0 and ent.name[0] == '.') continue;
 
             const name = self.alloc.dupe(u8, ent.name) catch return error.OutOfMemory;
@@ -89,14 +95,12 @@ pub const Handler = struct {
 
 const Item = struct {
     name: []u8,
-    kind: std.fs.Dir.Entry.Kind,
+    kind: std.Io.File.Kind,
 };
 
 fn lessItem(_: void, a: Item, b: Item) bool {
     return std.mem.order(u8, a.name, b.name) == .lt;
 }
-
-
 
 test "ls handler lists entries in deterministic order and marks directories" {
     const OhSnap = @import("ohsnap");
@@ -106,11 +110,11 @@ test "ls handler lists entries in deterministic order and marks directories" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.makePath("d");
-    try tmp.dir.writeFile(.{ .sub_path = "b.txt", .data = "b" });
-    try tmp.dir.writeFile(.{ .sub_path = "a.txt", .data = "a" });
+    try tmp.dir.createDirPath(std.testing.io, "d");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.txt", .data = "b" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "a" });
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     const sink = noop.sink();
@@ -192,11 +196,11 @@ test "ls handler emits truncation metadata when output exceeds limit" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "one", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "two", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "three", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "one", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "two", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "three", .data = "" });
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     const sink = noop.sink();

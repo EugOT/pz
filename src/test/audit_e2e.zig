@@ -57,7 +57,7 @@ fn e2eFrameOpts() audit.FrameOpts {
 }
 
 pub fn shipAuditRows(alloc: std.mem.Allocator, sender: *syslog.Sender, rows: []const []const u8) !void {
-    var tracker = audit_integrity.SeqTracker.init(alloc, null);
+    var tracker = audit_integrity.SeqTracker.init(alloc, std.Io.failing, null);
     return shipAuditRowsWithTracker(alloc, sender, rows, &tracker);
 }
 
@@ -300,7 +300,7 @@ fn addAuthRows(rows: *Rows) !void {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const home = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
     defer testing.allocator.free(home);
 
     try auth.saveApiKeyWithHooks(testing.allocator, .openai, "sk-openai-secret", .{
@@ -407,6 +407,7 @@ test "audit e2e ships mixed privileged control rows over udp" {
     const t = try collector.spawnCount(rows.rows.items.len);
 
     var sender = try syslog.Sender.init(testing.allocator, .{
+        .io = testing.io,
         .transport = .udp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -429,6 +430,7 @@ test "audit e2e ships mixed privileged control rows over tcp" {
     const t = try collector.spawnCount(rows.rows.items.len);
 
     var sender = try syslog.Sender.init(testing.allocator, .{
+        .io = testing.io,
         .transport = .tcp,
         .host = "127.0.0.1",
         .port = collector.port(),

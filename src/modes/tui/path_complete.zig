@@ -4,6 +4,10 @@ const std = @import("std");
 
 const max_results: usize = 32;
 
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// List files matching a path prefix. Returns full paths relative to cwd.
 /// Caller must free with `freeList`.
 pub fn list(alloc: std.mem.Allocator, prefix: []const u8) std.mem.Allocator.Error!?[][]u8 {
@@ -12,13 +16,13 @@ pub fn list(alloc: std.mem.Allocator, prefix: []const u8) std.mem.Allocator.Erro
     const partial = if (last_sep) |s| prefix[s + 1 ..] else prefix;
     const dir_prefix = if (last_sep) |s| prefix[0 .. s + 1] else "";
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return null;
-    defer dir.close();
+    const dir = std.Io.Dir.cwd().openDir(defaultIo(), dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(defaultIo());
 
     var names = std.ArrayList([]u8).empty;
 
     var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(defaultIo()) catch null) |entry| {
         if (names.items.len >= max_results) break;
         if (entry.name.len > 0 and entry.name[0] == '.' and (partial.len == 0 or partial[0] != '.')) continue;
         if (partial.len > 0 and !std.mem.startsWith(u8, entry.name, partial)) continue;

@@ -36,7 +36,35 @@ const PtyStep = struct {
 };
 
 fn pzBinAlloc(alloc: std.mem.Allocator) ![]u8 {
-    return try std.fs.cwd().realpathAlloc(alloc, build_options.pz_bin_path);
+    return try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, build_options.pz_bin_path, alloc);
+}
+
+fn currentEnvMap(alloc: std.mem.Allocator) !std.process.Environ.Map {
+    var env_len: usize = 0;
+    while (std.c.environ[env_len] != null) : (env_len += 1) {}
+    return std.process.Environ.createMap(.{
+        .block = .{ .slice = std.c.environ[0..env_len :null] },
+    }, alloc);
+}
+
+fn getenv(name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry_z| : (i += 1) {
+        const entry = std.mem.span(entry_z);
+        if (entry.len <= name.len or entry[name.len] != '=') continue;
+        if (std.mem.eql(u8, entry[0..name.len], name)) return entry[name.len + 1 ..];
+    }
+    return null;
+}
+
+fn sleepMs(ms: u64) void {
+    std.Io.sleep(std.testing.io, .fromMilliseconds(@intCast(ms)), .awake) catch {};
+}
+
+fn readPipeAlloc(alloc: std.mem.Allocator, file: std.Io.File, limit: usize) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(std.testing.io, &buf);
+    return reader.interface.allocRemaining(alloc, .limited(limit));
 }
 
 fn testPolicyKeyPair() !core.signing.KeyPair {
@@ -44,25 +72,25 @@ fn testPolicyKeyPair() !core.signing.KeyPair {
     return core.signing.KeyPair.fromSeed(seed);
 }
 
-fn writePolicy(dir: std.fs.Dir, doc: core.policy.Doc) !void {
-    try dir.makePath(".pz");
+fn writePolicy(dir: std.Io.Dir, doc: core.policy.Doc) !void {
+    try dir.createDirPath(std.testing.io, ".pz");
     const kp = try testPolicyKeyPair();
     const raw = try core.policy.encodeSignedDoc(std.testing.allocator, doc, kp);
     defer std.testing.allocator.free(raw);
-    try dir.writeFile(.{ .sub_path = app_config.policy_rel_path, .data = raw });
+    try dir.writeFile(std.testing.io, .{ .sub_path = app_config.policy_rel_path, .data = raw });
 }
 
-fn baseEnv(alloc: std.mem.Allocator, home_abs: []const u8) !std.process.EnvMap {
-    var env = try std.process.getEnvMap(alloc);
+fn baseEnv(alloc: std.mem.Allocator, home_abs: []const u8) !std.process.Environ.Map {
+    var env = try currentEnvMap(alloc);
     errdefer env.deinit();
-    _ = env.remove("HTTP_PROXY");
-    _ = env.remove("http_proxy");
-    _ = env.remove("HTTPS_PROXY");
-    _ = env.remove("https_proxy");
-    _ = env.remove("ALL_PROXY");
-    _ = env.remove("all_proxy");
-    _ = env.remove("NO_PROXY");
-    _ = env.remove("no_proxy");
+    _ = env.swapRemove("HTTP_PROXY");
+    _ = env.swapRemove("http_proxy");
+    _ = env.swapRemove("HTTPS_PROXY");
+    _ = env.swapRemove("https_proxy");
+    _ = env.swapRemove("ALL_PROXY");
+    _ = env.swapRemove("all_proxy");
+    _ = env.swapRemove("NO_PROXY");
+    _ = env.swapRemove("no_proxy");
     try env.put("HOME", home_abs);
     try env.put("TERM", "xterm-256color");
     try env.put("COLUMNS", "100");
@@ -74,31 +102,38 @@ fn baseEnv(alloc: std.mem.Allocator, home_abs: []const u8) !std.process.EnvMap {
 fn runProc(
     alloc: std.mem.Allocator,
     cwd: []const u8,
-    env: *const std.process.EnvMap,
+    env: *const std.process.Environ.Map,
     argv: []const []const u8,
     input: []const u8,
 ) !RunOut {
-    var child = std.process.Child.init(argv, alloc);
-    child.cwd = cwd;
-    child.env_map = env;
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .environ_map = env,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
 
     if (child.stdin) |*stdin| {
-        try stdin.writeAll(input);
-        stdin.close();
+        try stdin.writeStreamingAll(std.testing.io, input);
+        stdin.close(std.testing.io);
         child.stdin = null;
     }
 
-    const stdout = try (child.stdout orelse return error.TestUnexpectedResult).readToEndAlloc(alloc, 1024 * 1024);
+    const stdout_file = child.stdout orelse return error.TestUnexpectedResult;
+    child.stdout = null;
+    defer stdout_file.close(std.testing.io);
+    const stdout = try readPipeAlloc(alloc, stdout_file, 1024 * 1024);
     errdefer alloc.free(stdout);
-    const stderr = try (child.stderr orelse return error.TestUnexpectedResult).readToEndAlloc(alloc, 256 * 1024);
+    const stderr_file = child.stderr orelse return error.TestUnexpectedResult;
+    child.stderr = null;
+    defer stderr_file.close(std.testing.io);
+    const stderr = try readPipeAlloc(alloc, stderr_file, 256 * 1024);
     errdefer alloc.free(stderr);
 
     return .{
-        .term = try child.wait(),
+        .term = try child.wait(std.testing.io),
         .stdout = stdout,
         .stderr = stderr,
     };
@@ -131,32 +166,44 @@ fn ttyInputAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     return buf;
 }
 
-fn writeSessionEventsFile(dir: std.fs.Dir, sub_path: []const u8, events: []const core.session.Event) !void {
-    var file = try dir.createFile(sub_path, .{ .truncate = true });
-    defer file.close();
+fn writeSessionEventsFile(dir: std.Io.Dir, sub_path: []const u8, events: []const core.session.Event) !void {
+    var file = try dir.createFile(std.testing.io, sub_path, .{ .truncate = true });
+    defer file.close(std.testing.io);
 
     for (events) |ev| {
         const raw = try core.session.encodeEventAlloc(std.testing.allocator, ev);
         defer std.testing.allocator.free(raw);
-        try file.writeAll(raw);
-        try file.writeAll("\n");
+        try file.writeStreamingAll(std.testing.io, raw);
+        try file.writeStreamingAll(std.testing.io, "\n");
+    }
+}
+
+fn fdWrite(fd: std.posix.fd_t, data: []const u8) !usize {
+    while (true) {
+        const rc = std.c.write(fd, data.ptr, data.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
     }
 }
 
 fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
     var off: usize = 0;
-    while (off < data.len) off += try std.posix.write(fd, data[off..]);
+    while (off < data.len) off += try fdWrite(fd, data[off..]);
 }
 
 fn mapWaitStatus(status: c_int) std.process.Child.Term {
     return if (c.WIFEXITED(status))
-        .{ .Exited = @intCast(c.WEXITSTATUS(status)) }
+        .{ .exited = @intCast(c.WEXITSTATUS(status)) }
     else if (c.WIFSIGNALED(status))
-        .{ .Signal = @intCast(c.WTERMSIG(status)) }
+        .{ .signal = @enumFromInt(c.WTERMSIG(status)) }
     else if (c.WIFSTOPPED(status))
-        .{ .Stopped = @intCast(c.WSTOPSIG(status)) }
+        .{ .stopped = @intCast(c.WSTOPSIG(status)) }
     else
-        .{ .Unknown = @intCast(status) };
+        .{ .unknown = @intCast(status) };
 }
 
 fn readReady(fd: std.posix.fd_t, out: *std.ArrayList(u8), alloc: std.mem.Allocator) !bool {
@@ -165,9 +212,7 @@ fn readReady(fd: std.posix.fd_t, out: *std.ArrayList(u8), alloc: std.mem.Allocat
     while (true) {
         const n = std.posix.read(fd, &buf) catch |err| switch (err) {
             error.WouldBlock => return read_any,
-            error.InputOutput,
-            error.BrokenPipe,
-            => return read_any,
+            error.InputOutput => return read_any,
             else => return err,
         };
         if (n == 0) return read_any;
@@ -180,7 +225,7 @@ fn readReady(fd: std.posix.fd_t, out: *std.ArrayList(u8), alloc: std.mem.Allocat
 fn runPzPty(
     alloc: std.mem.Allocator,
     cwd: []const u8,
-    env: *const std.process.EnvMap,
+    env: *const std.process.Environ.Map,
     pz_args: []const []const u8,
     input: []const u8,
     pre_ms: u64,
@@ -194,21 +239,21 @@ fn runPzPty(
 
 fn appendShellArgRef(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, idx: usize) !void {
     if (idx < 10) {
-        try buf.writer(alloc).print("${d}", .{idx});
+        try buf.print(alloc, "${d}", .{idx});
         return;
     }
-    try buf.writer(alloc).print("${{{d}}}", .{idx});
+    try buf.print(alloc, "${{{d}}}", .{idx});
 }
 
 fn appendSleepMs(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, ms: u64) !void {
     if (ms == 0) return;
-    try buf.writer(alloc).print("sleep {d}.{d:0>3}; ", .{ ms / 1000, ms % 1000 });
+    try buf.print(alloc, "sleep {d}.{d:0>3}; ", .{ ms / 1000, ms % 1000 });
 }
 
 fn runPzPtySteps(
     alloc: std.mem.Allocator,
     cwd: []const u8,
-    env: *const std.process.EnvMap,
+    env: *const std.process.Environ.Map,
     pz_args: []const []const u8,
     steps: []const PtyStep,
     settle_ms: u64,
@@ -229,8 +274,8 @@ fn runPzPtySteps(
         defer alloc.free(rel);
         const tty_input = try ttyInputAlloc(alloc, step.input);
         defer alloc.free(tty_input);
-        try tmp.dir.writeFile(.{ .sub_path = rel, .data = tty_input });
-        step_paths[i] = try tmp.dir.realpathAlloc(alloc, rel);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = rel, .data = tty_input });
+        step_paths[i] = try tmp.dir.realPathFileAlloc(std.testing.io, rel, alloc);
     }
 
     var script = std.ArrayList(u8).empty;
@@ -301,10 +346,10 @@ test "real pz PTY startup renders tui frame and quits cleanly" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(alloc, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home_abs);
 
     var env = try baseEnv(alloc, home_abs);
@@ -331,15 +376,15 @@ test "real pz PTY startup survives live version check" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(alloc, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home_abs);
 
     var env = try baseEnv(alloc, home_abs);
     defer env.deinit();
-    _ = env.remove("PZ_SKIP_VERSION_CHECK");
+    _ = env.swapRemove("PZ_SKIP_VERSION_CHECK");
     try env.put("PZ_FORCE_VERSION_CHECK", "1");
 
     var server = try http_mock.Server.initSeq(alloc, &.{.{
@@ -381,10 +426,10 @@ test "real pz binary print mode works without tui" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -414,7 +459,7 @@ test "real pz binary print mode works without tui" {
     defer out.deinit(std.testing.allocator);
 
     switch (out.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "pong") != null);
@@ -424,11 +469,11 @@ test "real pz binary print mode uses config model and provider" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath(".pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     const provider_cmd =
@@ -444,7 +489,7 @@ test "real pz binary print mode uses config model and provider" {
         .{provider_cmd_json},
     );
     defer std.testing.allocator.free(cfg);
-    try tmp.dir.writeFile(.{ .sub_path = ".pz/settings.json", .data = cfg });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".pz/settings.json", .data = cfg });
 
     var env = try baseEnv(std.testing.allocator, home_abs);
     defer env.deinit();
@@ -468,8 +513,8 @@ test "real pz binary print mode uses config model and provider" {
     );
     defer out.deinit(std.testing.allocator);
 
-    try std.testing.expect(out.term == .Exited);
-    try std.testing.expectEqual(@as(u8, 0), out.term.Exited);
+    try std.testing.expect(out.term == .exited);
+    try std.testing.expectEqual(@as(u8, 0), out.term.exited);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "model=cfg-print-model provider=cfg-print-provider") != null);
 }
 
@@ -477,10 +522,10 @@ test "real pz binary json mode consumes stdin prompts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -515,8 +560,8 @@ test "real pz binary json mode consumes stdin prompts" {
     );
     defer out.deinit(std.testing.allocator);
 
-    try std.testing.expect(out.term == .Exited);
-    try std.testing.expectEqual(@as(u8, 0), out.term.Exited);
+    try std.testing.expect(out.term == .exited);
+    try std.testing.expectEqual(@as(u8, 0), out.term.exited);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "\"type\":\"provider\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "model=cfg-json-model provider=cfg-json-provider") != null);
 }
@@ -525,10 +570,10 @@ test "real pz binary json mode rejects empty stdin without prompt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -554,8 +599,8 @@ test "real pz binary json mode rejects empty stdin without prompt" {
     );
     defer out.deinit(std.testing.allocator);
 
-    try std.testing.expect(out.term == .Exited);
-    try std.testing.expectEqual(@as(u8, 1), out.term.Exited);
+    try std.testing.expect(out.term == .exited);
+    try std.testing.expectEqual(@as(u8, 1), out.term.exited);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "reason: EmptyPrompt") != null);
 }
 
@@ -563,16 +608,16 @@ test "real pz binary upgrade honors verified policy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
     try writePolicy(tmp.dir, .{
         .rules = &.{
             .{ .pattern = "runtime/update", .effect = .deny, .tool = "web" },
         },
     });
 
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -593,8 +638,8 @@ test "real pz binary upgrade honors verified policy" {
     );
     defer out.deinit(std.testing.allocator);
 
-    try std.testing.expect(out.term == .Exited);
-    try std.testing.expectEqual(@as(u8, 0), out.term.Exited);
+    try std.testing.expect(out.term == .exited);
+    try std.testing.expectEqual(@as(u8, 0), out.term.exited);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "upgrade blocked by policy") != null);
 }
 
@@ -602,10 +647,10 @@ test "real pz PTY renders slash help over the live terminal path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -615,19 +660,19 @@ test "real pz PTY renders slash help over the live terminal path" {
     defer std.testing.allocator.free(pz_bin);
     const slash_path = try std.fs.path.join(std.testing.allocator, &.{ cwd_abs, ".pty-slash" });
     defer std.testing.allocator.free(slash_path);
-    defer std.fs.deleteFileAbsolute(slash_path) catch {}; // test: error irrelevant
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, slash_path) catch {}; // test: error irrelevant
     {
-        var f = try std.fs.createFileAbsolute(slash_path, .{ .truncate = true });
-        defer f.close();
-        try f.writeAll("/");
+        var f = try std.Io.Dir.createFileAbsolute(std.testing.io, slash_path, .{ .truncate = true });
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io, "/");
     }
     const quit_path = try std.fs.path.join(std.testing.allocator, &.{ cwd_abs, ".pty-quit" });
     defer std.testing.allocator.free(quit_path);
-    defer std.fs.deleteFileAbsolute(quit_path) catch {}; // test: error irrelevant
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, quit_path) catch {}; // test: error irrelevant
     {
-        var f = try std.fs.createFileAbsolute(quit_path, .{ .truncate = true });
-        defer f.close();
-        try f.writeAll("\x03\x03");
+        var f = try std.Io.Dir.createFileAbsolute(std.testing.io, quit_path, .{ .truncate = true });
+        defer f.close(std.testing.io);
+        try f.writeStreamingAll(std.testing.io, "\x03\x03");
     }
 
     var out = try runProc(
@@ -650,7 +695,7 @@ test "real pz PTY renders slash help over the live terminal path" {
     defer out.deinit(std.testing.allocator);
 
     switch (out.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "/changelog") != null);
@@ -660,10 +705,10 @@ test "real pz PTY walkthrough opens command settings login and resume surfaces" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
 
-    const now = std.time.milliTimestamp();
+    const now = core.time.milliTimestamp();
     const old_events = [_]core.session.Event{
         .{ .at_ms = now - (2 * 60 * 60 * std.time.ms_per_s), .data = .{ .prompt = .{ .text = "Older session" } } },
         .{ .at_ms = now - (2 * 60 * 60 * std.time.ms_per_s), .data = .{ .usage = .{ .tot_tok = 128 } } },
@@ -676,11 +721,11 @@ test "real pz PTY walkthrough opens command settings login and resume surfaces" 
     };
     try writeSessionEventsFile(tmp.dir, "sess/200.jsonl", &new_events);
 
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
     defer std.testing.allocator.free(sess_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -728,14 +773,14 @@ test "real pz PTY walkthrough edits prompt and covers session bg and compaction"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
 
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
     defer std.testing.allocator.free(sess_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -778,8 +823,8 @@ test "real pz PTY walkthrough edits prompt and covers session bg and compaction"
     defer out.deinit(std.testing.allocator);
 
     switch (out.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        .Signal => |sig| try std.testing.expectEqual(@as(u32, @intCast(c.SIGINT)), sig),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.INT, sig),
         else => return error.TestUnexpectedResult,
     }
 
@@ -800,7 +845,7 @@ test "real pz PTY failure walkthrough covers command provider bg compact and pol
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
     try writePolicy(tmp.dir, .{
         .rules = &.{
             .{ .pattern = "runtime/cmd/share", .effect = .deny },
@@ -809,9 +854,9 @@ test "real pz PTY failure walkthrough covers command provider bg compact and pol
         },
     });
 
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -848,8 +893,8 @@ test "real pz PTY failure walkthrough covers command provider bg compact and pol
     defer out.deinit(std.testing.allocator);
 
     switch (out.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        .Signal => |sig| try std.testing.expectEqual(@as(u32, @intCast(c.SIGINT)), sig),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.INT, sig),
         else => return error.TestUnexpectedResult,
     }
 
@@ -882,10 +927,10 @@ test "real pz PTY failure walkthrough covers command provider bg compact and pol
 test "real pz PTY /login anthropic passes args through picker" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd);
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home);
     var env = try baseEnv(std.testing.allocator, home);
     defer env.deinit();
@@ -916,16 +961,16 @@ test "T7c pipeline denied-policy tool exits with error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
     try writePolicy(tmp.dir, .{
         .rules = &.{
             .{ .pattern = "tool/bash", .effect = .deny },
         },
     });
 
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -965,7 +1010,7 @@ test "T7c pipeline denied-policy tool exits with error" {
     defer out.deinit(std.testing.allocator);
 
     // Should complete — provider gets denial as tool result, then emits text
-    try std.testing.expect(out.term == .Exited);
+    try std.testing.expect(out.term == .exited);
     // Policy denial text from provider's acknowledgment should appear
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "denied") != null or
         std.mem.indexOf(u8, out.stdout, "policy") != null or
@@ -976,10 +1021,10 @@ test "T7c pipeline non-default model propagates to provider" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1014,8 +1059,8 @@ test "T7c pipeline non-default model propagates to provider" {
     );
     defer out.deinit(std.testing.allocator);
 
-    try std.testing.expect(out.term == .Exited);
-    try std.testing.expectEqual(@as(u8, 0), out.term.Exited);
+    try std.testing.expect(out.term == .exited);
+    try std.testing.expectEqual(@as(u8, 0), out.term.exited);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "model=custom-model-7b") != null);
 }
 
@@ -1023,10 +1068,10 @@ test "T7c pipeline json mode missing prompt exits with error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1053,8 +1098,8 @@ test "T7c pipeline json mode missing prompt exits with error" {
     );
     defer out.deinit(std.testing.allocator);
 
-    try std.testing.expect(out.term == .Exited);
-    try std.testing.expectEqual(@as(u8, 1), out.term.Exited);
+    try std.testing.expect(out.term == .exited);
+    try std.testing.expectEqual(@as(u8, 1), out.term.exited);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "EmptyPrompt") != null);
 }
 
@@ -1064,10 +1109,10 @@ test "T7b PTY auth login overlay renders provider list" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1102,10 +1147,10 @@ test "UX1 PTY startup shows version, hints, cwd and quits cleanly" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1137,10 +1182,10 @@ test "UX2 PTY input: type text, ctrl-u kills line, ctrl-c quits" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1173,10 +1218,10 @@ test "UX3 PTY commands: /help and /hotkeys render output" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1209,10 +1254,10 @@ test "UX4 PTY overlays: /settings opens and esc closes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1245,10 +1290,10 @@ test "UX5 PTY settings: toggle item with down+enter" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1285,13 +1330,13 @@ test "UX6 PTY sessions: /new creates and /name sets name" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("sess");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
     defer std.testing.allocator.free(sess_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1322,8 +1367,8 @@ test "UX6 PTY sessions: /new creates and /name sets name" {
     defer out.deinit(std.testing.allocator);
 
     switch (out.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        .Signal => |sig| try std.testing.expectEqual(@as(u32, @intCast(c.SIGINT)), sig),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.INT, sig),
         else => return error.TestUnexpectedResult,
     }
 
@@ -1338,10 +1383,10 @@ test "UX7 PTY auth login and model overlays" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1380,10 +1425,10 @@ test "UX8 PTY bg list shows status" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1407,8 +1452,8 @@ test "UX8 PTY bg list shows status" {
     defer out.deinit(std.testing.allocator);
 
     switch (out.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        .Signal => |sig| try std.testing.expectEqual(@as(u32, @intCast(c.SIGINT)), sig),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .signal => |sig| try std.testing.expectEqual(std.posix.SIG.INT, sig),
         else => return error.TestUnexpectedResult,
     }
     // wait_for already validated the text was present in the vscreen grid.
@@ -1420,16 +1465,16 @@ test "UX9 PTY policy denies bash tool" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
     try writePolicy(tmp.dir, .{
         .rules = &.{
             .{ .pattern = "tool/bash", .effect = .deny },
         },
     });
 
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1476,16 +1521,16 @@ test "UX10 PTY version update notice renders in TUI" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(alloc, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home_abs);
 
     var env = try baseEnv(alloc, home_abs);
     defer env.deinit();
     // Enable version check: unset skip, force check.
-    _ = env.remove("PZ_SKIP_VERSION_CHECK");
+    _ = env.swapRemove("PZ_SKIP_VERSION_CHECK");
     try env.put("PZ_FORCE_VERSION_CHECK", "1");
 
     // Mock HTTP server returning a newer version.
@@ -1532,10 +1577,10 @@ test "UX11 PTY compact with no session shows disabled notice" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1566,14 +1611,14 @@ test "UX11 PTY compact with active session shows compaction result" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
 
-    const cwd_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
     defer std.testing.allocator.free(home_abs);
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
     defer std.testing.allocator.free(sess_abs);
 
     var env = try baseEnv(std.testing.allocator, home_abs);
@@ -1620,11 +1665,11 @@ test "real-env PTY: pz starts and exits without crash" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
 
     // Use real env, only add TERM/size and skip version check.
-    var env = try std.process.getEnvMap(alloc);
+    var env = try currentEnvMap(alloc);
     defer env.deinit();
     try env.put("TERM", "xterm-256color");
     try env.put("COLUMNS", "100");
@@ -1636,26 +1681,26 @@ test "real-env PTY: pz starts and exits without crash" {
     defer out.deinit(alloc);
 
     switch (out.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        .Signal => |sig| {
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .signal => |sig| {
             // SIGINT (2) is acceptable; SIGABRT (6) is not.
-            if (sig == @as(u32, @intCast(c.SIGABRT))) return error.TestUnexpectedResult;
+            if (sig == std.posix.SIG.ABRT) return error.TestUnexpectedResult;
         },
         else => return error.TestUnexpectedResult,
     }
 }
 
 test "real PTY: hello gets response" {
-    const api_key = std.posix.getenv("ANTHROPIC_API_KEY") orelse return error.SkipZigTest;
+    const api_key = getenv("ANTHROPIC_API_KEY") orelse return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pi/agent");
-    const cwd_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(alloc, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home_abs);
 
     // Write auth.json with the real API key (value is safe — it's our own test env).
@@ -1663,7 +1708,7 @@ test "real PTY: hello gets response" {
         \\{{"anthropic":{{"type":"api_key","key":"{s}"}}}}
     , .{api_key});
     defer alloc.free(auth_json);
-    try tmp.dir.writeFile(.{ .sub_path = "home/.pi/agent/auth.json", .data = auth_json });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/auth.json", .data = auth_json });
 
     var env = try baseEnv(alloc, home_abs);
     defer env.deinit();
@@ -1692,7 +1737,7 @@ test "real PTY: hello gets response" {
     defer out.deinit(alloc);
 
     switch (out.term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => {
             if (out.stderr.len > 0) {
                 std.debug.print("stderr: {s}\n", .{out.stderr});
@@ -1708,20 +1753,20 @@ test "real PTY TUI: type prompt, get response in transcript" {
     const alloc = std.testing.allocator;
 
     // Need real auth — try to copy from user's home
-    const real_home = std.posix.getenv("HOME") orelse return error.SkipZigTest;
+    const real_home = getenv("HOME") orelse return error.SkipZigTest;
     const auth_src = std.fs.path.join(alloc, &.{ real_home, ".pz/auth.json" }) catch return error.SkipZigTest;
     defer alloc.free(auth_src);
-    const auth_data = std.fs.cwd().readFileAlloc(alloc, auth_src, 64 * 1024) catch return error.SkipZigTest;
+    const auth_data = std.Io.Dir.cwd().readFileAlloc(std.testing.io, auth_src, alloc, .limited(64 * 1024)) catch return error.SkipZigTest;
     defer alloc.free(auth_data);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.writeFile(.{ .sub_path = "home/.pz/auth.json", .data = auth_data });
-    const cwd_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pz/auth.json", .data = auth_data });
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(alloc, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home_abs);
 
     var env = try baseEnv(alloc, home_abs);
@@ -1752,7 +1797,7 @@ test "real PTY TUI: type prompt, get response in transcript" {
 test "real PTY TUI: cached anthropic oauth token gets response in transcript" {
     const alloc = std.testing.allocator;
 
-    const real_home = std.posix.getenv("HOME") orelse return error.SkipZigTest;
+    const real_home = getenv("HOME") orelse return error.SkipZigTest;
     var auth_res = core.providers.auth.loadForProviderWithHooks(alloc, .anthropic, .{
         .home_override = real_home,
     }) catch return error.SkipZigTest;
@@ -1761,17 +1806,17 @@ test "real PTY TUI: cached anthropic oauth token gets response in transcript" {
 
     const auth_src = std.fs.path.join(alloc, &.{ real_home, ".pz/auth.json" }) catch return error.SkipZigTest;
     defer alloc.free(auth_src);
-    const auth_data = std.fs.cwd().readFileAlloc(alloc, auth_src, 64 * 1024) catch return error.SkipZigTest;
+    const auth_data = std.Io.Dir.cwd().readFileAlloc(std.testing.io, auth_src, alloc, .limited(64 * 1024)) catch return error.SkipZigTest;
     defer alloc.free(auth_data);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.writeFile(.{ .sub_path = "home/.pz/auth.json", .data = auth_data });
-    const cwd_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pz/auth.json", .data = auth_data });
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(alloc, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home_abs);
 
     var env = try baseEnv(alloc, home_abs);
@@ -1981,7 +2026,7 @@ fn killChild(pid: c.pid_t) void {
 fn runPtyInteractive(
     alloc: std.mem.Allocator,
     cwd: []const u8,
-    env: *const std.process.EnvMap,
+    env: *const std.process.Environ.Map,
     pz_args: []const []const u8,
     steps: []const InteractiveStep,
 ) !InteractiveOut {
@@ -2072,7 +2117,7 @@ fn runPtyInteractive(
                     var dbuf: [4096]u8 = undefined;
                     const dn = std.posix.read(master_fd, &dbuf) catch |err| switch (err) {
                         error.WouldBlock => break,
-                        error.InputOutput, error.BrokenPipe => break,
+                        error.InputOutput => break,
                         else => return err,
                     };
                     if (dn == 0) break;
@@ -2081,12 +2126,12 @@ fn runPtyInteractive(
                 const tty = try ttyInputAlloc(alloc, data);
                 defer alloc.free(tty);
                 writeAllFd(master_fd, tty) catch |err| switch (err) {
-                    error.BrokenPipe, error.InputOutput => break,
+                    error.WouldBlock => break,
                     else => return err,
                 };
             },
             .wait_for => |wf| {
-                const deadline = std.time.milliTimestamp() + @as(i64, @intCast(wf.timeout_ms));
+                const deadline = core.time.milliTimestamp() + @as(i64, @intCast(wf.timeout_ms));
                 // Check accumulated buffer FIRST — previous steps may have
                 // already read the data we're looking for.
                 // Drain available output to prevent PTY buffer deadlock.
@@ -2094,7 +2139,7 @@ fn runPtyInteractive(
                     var dbuf: [4096]u8 = undefined;
                     const dn = std.posix.read(master_fd, &dbuf) catch |err| switch (err) {
                         error.WouldBlock => break,
-                        error.InputOutput, error.BrokenPipe => break,
+                        error.InputOutput => break,
                         else => return err,
                     };
                     if (dn == 0) break;
@@ -2107,18 +2152,18 @@ fn runPtyInteractive(
                         var buf: [4096]u8 = undefined;
                         const n = std.posix.read(master_fd, &buf) catch |err| switch (err) {
                             error.WouldBlock => {
-                                if (std.time.milliTimestamp() >= deadline) {
+                                if (core.time.milliTimestamp() >= deadline) {
                                     const grid = screen.textGrid() catch "";
                                     const plain_tail = if (screen.plain.items.len > 500) screen.plain.items[screen.plain.items.len - 500 ..] else screen.plain.items;
                                     const has_partial = std.mem.indexOf(u8, screen.plain.items, wf.text[0..@min(3, wf.text.len)]);
-                                    std.debug.print("wait_for timeout: needle=\"{s}\" plain_len={d} partial_at={?d}\nplain_tail:\n{s}\ngrid:\n{s}\n", .{ wf.text, screen.plain.items.len, has_partial, plain_tail, grid });
+                                    std.debug.print("wait_for timeout: needle=\"{s}\" plain_len={d} partial_at={?}\nplain_tail:\n{s}\ngrid:\n{s}\n", .{ wf.text, screen.plain.items.len, has_partial, plain_tail, grid });
                                     if (grid.len > 0) alloc.free(grid);
                                     return error.WaitForTimeout;
                                 }
-                                std.Thread.sleep(10 * std.time.ns_per_ms);
+                                sleepMs(10);
                                 continue;
                             },
-                            error.InputOutput, error.BrokenPipe => break,
+                            error.InputOutput => break,
                             else => return err,
                         };
                         if (n == 0) break;
@@ -2145,15 +2190,15 @@ fn runPtyInteractive(
             .sleep => |ms| {
                 // Active sleep: drain PTY output while waiting to prevent
                 // buffer deadlock during timed pauses.
-                const sleep_deadline = std.time.milliTimestamp() + @as(i64, @intCast(ms));
-                while (std.time.milliTimestamp() < sleep_deadline) {
+                const sleep_deadline = core.time.milliTimestamp() + @as(i64, @intCast(ms));
+                while (core.time.milliTimestamp() < sleep_deadline) {
                     var sbuf: [4096]u8 = undefined;
                     const sn = std.posix.read(master_fd, &sbuf) catch |err| switch (err) {
                         error.WouldBlock => {
-                            std.Thread.sleep(1 * std.time.ns_per_ms);
+                            sleepMs(1);
                             continue;
                         },
-                        error.InputOutput, error.BrokenPipe => break,
+                        error.InputOutput => break,
                         else => return err,
                     };
                     if (sn == 0) break;
@@ -2176,15 +2221,15 @@ fn runPtyInteractive(
 
     // Drain remaining output.
     {
-        const drain_deadline = std.time.milliTimestamp() + 2000;
-        while (std.time.milliTimestamp() < drain_deadline) {
+        const drain_deadline = core.time.milliTimestamp() + 2000;
+        while (core.time.milliTimestamp() < drain_deadline) {
             var buf: [4096]u8 = undefined;
             const n = std.posix.read(master_fd, &buf) catch |err| switch (err) {
                 error.WouldBlock => {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    sleepMs(10);
                     continue;
                 },
-                error.InputOutput, error.BrokenPipe => break,
+                error.InputOutput => break,
                 else => return err,
             };
             if (n == 0) break;
@@ -2224,7 +2269,7 @@ const InteractiveEnv = struct {
     tmp: std.testing.TmpDir,
     cwd_abs: []u8,
     home_abs: []u8,
-    env: std.process.EnvMap,
+    env: std.process.Environ.Map,
     alloc: std.mem.Allocator,
 
     fn deinit(self: *InteractiveEnv) void {
@@ -2239,10 +2284,10 @@ fn setupInteractiveEnv(alloc: std.mem.Allocator) !InteractiveEnv {
     var tmp = std.testing.tmpDir(.{});
     errdefer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     errdefer alloc.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(alloc, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     errdefer alloc.free(home_abs);
 
     const env = try baseEnv(alloc, home_abs);
@@ -2261,10 +2306,10 @@ test "runPtyInteractive: fake provider round-trip with wait_for and snapshot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    const cwd_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd_abs);
-    const home_abs = try tmp.dir.realpathAlloc(alloc, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home_abs);
 
     var env = try baseEnv(alloc, home_abs);
@@ -2390,10 +2435,10 @@ test "pty: resize during stream does not crash" {
     try std.testing.expect(out.snapshots[0].grid.len > 0);
     // Process exited or was killed cleanly (not a crash signal like SEGV/ABRT).
     switch (out.term) {
-        .Exited => {},
-        .Signal => |sig| {
+        .exited => {},
+        .signal => |sig| {
             // SIGKILL (9) is our cleanup; anything else is a crash.
-            try std.testing.expect(sig == 9);
+            try std.testing.expect(sig == std.posix.SIG.KILL);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2425,10 +2470,10 @@ test "pty: double ctrl-c clean exit" {
 
     // Verify clean exit: either exited with a code or killed (no zombie).
     switch (out.term) {
-        .Exited => {},
-        .Signal => |sig| {
+        .exited => {},
+        .signal => |sig| {
             // SIGKILL from our cleanup or SIGINT propagation are acceptable.
-            try std.testing.expect(sig == 9 or sig == 2);
+            try std.testing.expect(sig == std.posix.SIG.KILL or sig == std.posix.SIG.INT);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2512,10 +2557,10 @@ test "PTY walkthrough: full prompt to response" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2543,10 +2588,10 @@ test "PTY walkthrough: streaming renders incrementally" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2586,10 +2631,10 @@ test "UX1 walkthrough: startup renders all sections" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2629,10 +2674,10 @@ test "UX2 walkthrough: prompt gets response in transcript" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2667,10 +2712,10 @@ test "UX3 walkthrough: help and clear" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2706,10 +2751,10 @@ test "UX4 walkthrough: settings overlay opens and closes" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2742,10 +2787,10 @@ test "PTY walkthrough: cancel mid-stream" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2772,10 +2817,10 @@ test "PTY walkthrough: tool call renders" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2816,13 +2861,13 @@ test "PTY walkthrough: compaction after response" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("sess");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
-    const sess = try tmp.dir.realpathAlloc(alloc, "sess");
+    const sess = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
     defer alloc.free(sess);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2850,10 +2895,10 @@ test "PTY walkthrough: multi-turn conversation" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2893,17 +2938,17 @@ test "UX5 walkthrough: tool output hidden when toggled off" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
 
     // Create a file for the read tool to return as tool output.
-    try tmp.dir.writeFile(.{ .sub_path = "secret.txt", .data = "TOOLSECRETCONTENT" });
-    const secret_path = try tmp.dir.realpathAlloc(alloc, "secret.txt");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "secret.txt", .data = "TOOLSECRETCONTENT" });
+    const secret_path = try tmp.dir.realPathFileAlloc(std.testing.io, "secret.txt", alloc);
     defer alloc.free(secret_path);
 
     // Two-turn provider: turn 1 requests read of secret.txt (non-destructive, no approval),
@@ -2957,13 +3002,13 @@ test "UX6 walkthrough: new and name" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("sess");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
-    const sess = try tmp.dir.realpathAlloc(alloc, "sess");
+    const sess = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
     defer alloc.free(sess);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -2997,10 +3042,10 @@ test "UX7 walkthrough: missing auth shows guidance" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
@@ -3032,10 +3077,10 @@ test "UX8 walkthrough: bg run and list" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("home/.pz");
-    const cwd = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(cwd);
-    const home = try tmp.dir.realpathAlloc(alloc, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", alloc);
     defer alloc.free(home);
     var env = try baseEnv(alloc, home);
     defer env.deinit();

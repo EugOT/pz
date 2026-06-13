@@ -2,6 +2,30 @@
 const std = @import("std");
 const providers = @import("../core/providers.zig");
 
+fn errnoError(rc: isize) !void {
+    if (rc >= 0) return;
+    return std.posix.unexpectedErrno(std.posix.errno(rc));
+}
+
+fn fdRead(fd: std.posix.fd_t, buf: []u8) !usize {
+    const rc = std.c.read(fd, buf.ptr, buf.len);
+    if (rc < 0) return std.posix.unexpectedErrno(std.posix.errno(rc));
+    return @intCast(rc);
+}
+
+fn fdWrite(fd: std.posix.fd_t, bytes: []const u8) !usize {
+    const rc = std.c.write(fd, bytes.ptr, bytes.len);
+    if (rc < 0) return std.posix.unexpectedErrno(std.posix.errno(rc));
+    return @intCast(rc);
+}
+
+fn setNonblock(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, std.c.F.GETFL, @as(c_int, 0));
+    try errnoError(flags);
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    try errnoError(std.c.fcntl(fd, std.c.F.SETFL, flags | nonblock));
+}
+
 pub const Step = union(enum) {
     ev: providers.Event,
     block: void,
@@ -23,10 +47,12 @@ pub const ScriptedProvider = struct {
     const StreamBind = providers.Stream.BindAbortable(ScriptedProvider, streamNextImpl, streamDeinitImpl, streamAbortImpl);
 
     pub fn init(steps: []const Step) !ScriptedProvider {
-        const pipe = try std.posix.pipe2(.{
-            .CLOEXEC = true,
-            .NONBLOCK = true,
-        });
+        var pipe: [2]std.posix.fd_t = undefined;
+        try errnoError(std.c.pipe(&pipe));
+        errdefer _ = std.c.close(pipe[0]);
+        errdefer _ = std.c.close(pipe[1]);
+        try setNonblock(pipe[0]);
+        try setNonblock(pipe[1]);
         return .{
             .steps = steps,
             .wake_r = pipe[0],
@@ -35,8 +61,8 @@ pub const ScriptedProvider = struct {
     }
 
     pub fn deinit(self: *ScriptedProvider) void {
-        std.posix.close(self.wake_r);
-        std.posix.close(self.wake_w);
+        _ = std.c.close(self.wake_r);
+        _ = std.c.close(self.wake_w);
         self.* = undefined;
     }
 
@@ -60,14 +86,14 @@ pub const ScriptedProvider = struct {
                 }};
                 _ = try std.posix.poll(&fds, -1);
                 var buf: [8]u8 = undefined;
-                _ = std.posix.read(self.wake_r, &buf) catch {}; // test: error irrelevant
+                _ = fdRead(self.wake_r, &buf) catch {}; // test: error irrelevant
                 break :blk null;
             },
         };
     }
 
     pub fn streamAbortImpl(self: *ScriptedProvider) void {
-        _ = std.posix.write(self.wake_w, "\x01") catch {}; // test: error irrelevant
+        _ = fdWrite(self.wake_w, "\x01") catch {}; // test: error irrelevant
     }
 
     fn streamDeinitImpl(_: *ScriptedProvider) void {}
@@ -76,7 +102,7 @@ pub const ScriptedProvider = struct {
         self.idx = 0;
         var buf: [32]u8 = undefined;
         while (true) {
-            _ = std.posix.read(self.wake_r, &buf) catch break;
+            _ = fdRead(self.wake_r, &buf) catch break;
         }
     }
 };

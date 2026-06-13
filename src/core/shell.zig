@@ -43,7 +43,7 @@ pub fn tokenize(alloc: Allocator, input: []const u8) Error![]Token {
     const trimmed = std.mem.trim(u8, input, " \t\n\r");
     if (trimmed.len == 0) return error.EmptyInput;
 
-    var toks: std.ArrayListUnmanaged(Token) = .{};
+    var toks: std.ArrayListUnmanaged(Token) = .empty;
     errdefer {
         for (toks.items) |t| alloc.free(t.cmd);
         toks.deinit(alloc);
@@ -232,7 +232,7 @@ fn scanCmd(input: []const u8, start: usize) Error!usize {
 /// Remove outer quotes and process backslash escapes.
 /// Returns a newly allocated string.
 fn unquote(alloc: Allocator, input: []const u8) Error![]const u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(alloc);
 
     var i: usize = 0;
@@ -315,7 +315,7 @@ const WordList = struct {
 };
 
 fn splitWordsAlloc(alloc: Allocator, input: []const u8) Error!WordList {
-    var out: std.ArrayListUnmanaged([]u8) = .{};
+    var out: std.ArrayListUnmanaged([]u8) = .empty;
     errdefer {
         for (out.items) |word| alloc.free(word);
         out.deinit(alloc);
@@ -425,7 +425,7 @@ const testing = std.testing;
 const talloc = testing.allocator;
 
 fn appendTokSnap(out: *std.ArrayList(u8), tok: Token) !void {
-    try out.writer(talloc).print("{s}|{s}\n", .{ @tagName(tok.sep), tok.cmd });
+    try out.print(talloc, "{s}|{s}\n", .{ @tagName(tok.sep), tok.cmd });
 }
 
 fn renderToks(alloc: std.mem.Allocator, toks: []const Token) ![]u8 {

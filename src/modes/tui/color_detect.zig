@@ -10,10 +10,14 @@ pub const ColorDepth = enum {
     truecolor,
 };
 
-pub fn detect() ColorDepth {
-    if (std.posix.getenv("NO_COLOR") != null) return .none;
+fn getenv(comptime name: []const u8) ?[:0]const u8 {
+    return std.Io.Threaded.global_single_threaded.environString(name);
+}
 
-    if (std.posix.getenv("COLORTERM")) |ct| {
+pub fn detect() ColorDepth {
+    if (getenv("NO_COLOR") != null) return .none;
+
+    if (getenv("COLORTERM")) |ct| {
         const ct_map = std.StaticStringMap(ColorDepth).initComptime(.{
             .{ "truecolor", .truecolor },
             .{ "24bit", .truecolor },
@@ -21,7 +25,7 @@ pub fn detect() ColorDepth {
         if (ct_map.get(ct)) |cap| return cap;
     }
 
-    if (std.posix.getenv("TERM")) |term| {
+    if (getenv("TERM")) |term| {
         const term_map = std.StaticStringMap(ColorDepth).initComptime(.{
             .{ "dumb", .none },
             .{ "linux", .basic },
