@@ -3,6 +3,8 @@ const std = @import("std");
 const policy = @import("policy.zig");
 const providers = @import("providers.zig");
 const prov_api = @import("providers/api.zig");
+const prov_types = @import("providers/types.zig");
+const retry = @import("providers/retry.zig");
 const session = @import("session.zig");
 const tools = @import("tools.zig");
 const cancel_mock = @import("../test/cancel_mock.zig");
@@ -40,6 +42,34 @@ pub const ModeEv = union(enum) {
     tool: tools.Event,
     session_write_err: []const u8,
     agent_status: AgentStatusEv,
+    /// A retryable failure is about to be retried after `backoff_ms`.
+    retry_attempt: RetryAttemptEv,
+    /// A context-overflow condition was detected on the provider stream.
+    overflow_detected: void,
+    /// Auto-compaction was triggered (e.g. in response to overflow).
+    compaction_triggered: void,
+    /// The provider stream stalled past the idle timeout and will reconnect.
+    stream_timeout: StreamTimeoutEv,
+};
+
+/// Identifies which reliability stage emitted a retry.
+pub const RetryStage = enum {
+    provider_start,
+    stream_next,
+    session_write,
+};
+
+pub const RetryAttemptEv = struct {
+    stage: RetryStage,
+    /// 1-based count of the attempt that just failed (and is being retried).
+    attempt: u16,
+    /// Delay before the next attempt, in milliseconds.
+    backoff_ms: u64,
+};
+
+pub const StreamTimeoutEv = struct {
+    /// Milliseconds elapsed without a stream event before the stall fired.
+    idle_ms: i64,
 };
 
 pub const ModeSink = struct {
@@ -138,6 +168,32 @@ pub const Compactor = struct {
     }
 };
 
+/// Injectable sleep so backoff delays do not block real time under test.
+/// The default (when `Opts.sleeper == null`) is a real `std.Io.sleep`.
+pub const Sleeper = struct {
+    vt: *const Vt,
+
+    pub const Vt = struct {
+        sleep_ms: *const fn (self: *Sleeper, ms: u64) void,
+    };
+
+    pub fn sleepMs(self: *Sleeper, ms: u64) void {
+        return self.vt.sleep_ms(self, ms);
+    }
+
+    pub fn Bind(comptime T: type, comptime method: fn (*T, u64) void) type {
+        return struct {
+            pub const vt = Vt{
+                .sleep_ms = sleepMsFn,
+            };
+            fn sleepMsFn(s: *Sleeper, ms: u64) void {
+                const self: *T = @fieldParentPtr("sleeper", s);
+                return method(self, ms);
+            }
+        };
+    }
+};
+
 const Stage = enum {
     replay_open,
     replay_next,
@@ -147,6 +203,7 @@ const Stage = enum {
     stream_next,
     tool_run,
     compact,
+    overflow,
 };
 
 pub const CmdCache = struct {
@@ -394,6 +451,43 @@ pub const Opts = struct {
     /// Skip <untrusted-input> wrapping on user prompts and prompt_guard
     /// system injection. Required for OAuth API compatibility.
     skip_prompt_guard: bool = false,
+    /// Reliability tuning for provider / stream / session-write retries and
+    /// the streaming idle-timeout. See `Reliability` for the defaults.
+    reliability: Reliability = .{},
+    /// Injectable sleep for backoff. Null = real `std.Io.sleep`.
+    sleeper: ?*Sleeper = null,
+};
+
+/// Retry / backoff / timeout tuning for the agent loop. Each knob is
+/// independently configurable; the defaults match the RELIABILITY spec
+/// (provider/stream: 3 tries, 250ms→10s; session writes: 3 tries,
+/// 50ms→5s; streaming idle timeout 90s).
+pub const Reliability = struct {
+    /// Max attempts for `provider.start()` and `stream.next()` transport
+    /// failures (1 == no retry).
+    transport_max_tries: u16 = 3,
+    transport_base_ms: u64 = 250,
+    transport_max_ms: u64 = 10_000,
+    /// Max attempts for `store.append()` (1 == no retry). On exhaustion the
+    /// loop WARNs and continues in-memory rather than dropping data silently.
+    session_max_tries: u16 = 3,
+    session_base_ms: u64 = 50,
+    session_max_ms: u64 = 5_000,
+    /// Max wall-clock gap between provider stream events before the stream is
+    /// torn down and `provider.start()` is retried. 0 disables the timeout.
+    idle_timeout_ms: i64 = 90_000,
+
+    fn transportPolicy(self: Reliability) retry.InitErr!retry.Policy(prov_types.Err) {
+        return retry.Policy(prov_types.Err).init(.{
+            .max_tries = self.transport_max_tries,
+            .backoff = .{ .base_ms = self.transport_base_ms, .max_ms = self.transport_max_ms },
+            .retryable = prov_types.retryable,
+        });
+    }
+
+    fn sessionBackoff(self: Reliability) retry.InitErr!retry.Backoff {
+        return retry.Backoff.init(.{ .base_ms = self.session_base_ms, .max_ms = self.session_max_ms });
+    }
 };
 
 pub const ApprovalCtx = struct {
@@ -601,12 +695,19 @@ pub const LoopCtx = struct {
     saw_tool_call: bool,
     pending_tc: ?providers.ToolCall,
     turn_state: TurnState,
+    /// Wall-clock (ms) of the last provider stream event; seeds the idle
+    /// timeout each time a fresh stream opens.
+    last_event_ms: i64,
 
     pub fn init(opts: Opts) (Err || anyerror)!LoopCtx {
         if (opts.sid.len == 0) return error.EmptySessionId;
         if (opts.prompt.len == 0) return error.EmptyPrompt;
         if (opts.model.len == 0) return error.EmptyModel;
         if (opts.compactor != null and opts.compact_every == 0) return error.InvalidCompactEvery;
+        // Fail fast on misconfigured reliability knobs rather than degrading
+        // silently at runtime (no silent fallback).
+        _ = try opts.reliability.transportPolicy();
+        _ = try opts.reliability.sessionBackoff();
 
         var hist = Hist{
             .alloc = opts.alloc,
@@ -641,12 +742,8 @@ pub const LoopCtx = struct {
         hist.pushTextDup(.user, opts.prompt) catch |hist_err| {
             return failWithReport(opts, .store_append, hist_err);
         };
-        const prompt_stored = blk: {
-            opts.store.append(opts.sid, prompt_ev) catch |append_err| {
-                try opts.mode.push(.{ .session_write_err = @errorName(append_err) });
-                break :blk false;
-            };
-            break :blk true;
+        const prompt_stored = appendWithRetry(opts, opts.sid, prompt_ev) catch |write_err| {
+            return failWithReport(opts, .mode_push, write_err);
         };
         onSessionAppend(opts, &append_ct, &hist, prompt_stored) catch |compact_err| {
             return failWithReport(opts, .compact, compact_err);
@@ -676,6 +773,7 @@ pub const LoopCtx = struct {
             .saw_tool_call = false,
             .pending_tc = null,
             .turn_state = .idle,
+            .last_event_ms = 0,
         };
     }
 
@@ -709,17 +807,13 @@ pub const LoopCtx = struct {
                 };
 
                 if (self.stream) |s| s.deinit();
-                self.stream = self.opts.provider.start(.{
-                    .model = self.opts.model,
-                    .provider = self.opts.provider_label,
-                    .msgs = req_msgs,
-                    .tools = self.req_tools,
-                    .opts = self.opts.provider_opts,
-                }) catch |start_err| {
+                self.stream = null;
+                self.stream = self.startWithRetry(req_msgs) catch |start_err| {
                     return failWithReport(self.opts, .provider_start, start_err);
                 };
                 if (self.opts.abort_slot) |slot| slot.set(self.stream.?.aborter());
                 self.saw_tool_call = false;
+                self.last_event_ms = nowMs(self.opts);
                 continue :state .streaming;
             },
             .streaming => {
@@ -731,21 +825,38 @@ pub const LoopCtx = struct {
                     continue :state .done;
                 }
 
-                const ev = (self.stream.?.next() catch |next_err| return failWithReport(self.opts, .stream_next, next_err)) orelse {
-                    // Stream exhausted — end of turn
-                    if (self.opts.abort_slot) |slot| slot.set(null);
-                    if (isCanceled(self.opts)) {
-                        emitCanceled(self.opts, &self.append_ct, &self.hist) catch |cancel_err| {
-                            return failWithReport(self.opts, .mode_push, cancel_err);
-                        };
-                        continue :state .done;
-                    }
-                    if (!self.saw_tool_call) {
+                const step = self.nextWithReliability() catch |next_err| {
+                    return failWithReport(self.opts, .stream_next, next_err);
+                };
+                const ev = switch (step) {
+                    .timed_out => {
+                        // Stream stalled. The reliability path already tore the
+                        // stream down and emitted a stream_timeout event; rebuild
+                        // a fresh request and reconnect.
+                        continue :state .idle;
+                    },
+                    .compacted => {
+                        // Overflow → compaction → reload happened; restart the
+                        // turn against the compacted history.
+                        continue :state .idle;
+                    },
+                    .exhausted => {
+                        // Stream exhausted — end of turn
+                        if (self.opts.abort_slot) |slot| slot.set(null);
+                        if (isCanceled(self.opts)) {
+                            emitCanceled(self.opts, &self.append_ct, &self.hist) catch |cancel_err| {
+                                return failWithReport(self.opts, .mode_push, cancel_err);
+                            };
+                            continue :state .done;
+                        }
+                        if (!self.saw_tool_call) {
+                            self.turns +|= 1;
+                            continue :state .done;
+                        }
                         self.turns +|= 1;
-                        continue :state .done;
-                    }
-                    self.turns +|= 1;
-                    continue :state .idle;
+                        continue :state .idle;
+                    },
+                    .event => |e| e,
                 };
 
                 self.opts.mode.push(.{ .provider = ev }) catch |mode_err| {
@@ -756,12 +867,8 @@ pub const LoopCtx = struct {
                 self.hist.appendFromProvider(ev) catch |hist_err| {
                     return failWithReport(self.opts, .stream_next, hist_err);
                 };
-                const sess_stored = blk: {
-                    self.opts.store.append(self.opts.sid, sess_ev) catch |append_err| {
-                        try self.opts.mode.push(.{ .session_write_err = @errorName(append_err) });
-                        break :blk false;
-                    };
-                    break :blk true;
+                const sess_stored = appendWithRetry(self.opts, self.opts.sid, sess_ev) catch |write_err| {
+                    return failWithReport(self.opts, .mode_push, write_err);
                 };
                 onSessionAppend(self.opts, &self.append_ct, &self.hist, sess_stored) catch |compact_err| {
                     return failWithReport(self.opts, .compact, compact_err);
@@ -799,12 +906,8 @@ pub const LoopCtx = struct {
                 };
 
                 const tr_sess_ev = mapProviderEv(tr_ev, nowMs(self.opts));
-                const tr_stored = blk: {
-                    self.opts.store.append(self.opts.sid, tr_sess_ev) catch |append_err| {
-                        try self.opts.mode.push(.{ .session_write_err = @errorName(append_err) });
-                        break :blk false;
-                    };
-                    break :blk true;
+                const tr_stored = appendWithRetry(self.opts, self.opts.sid, tr_sess_ev) catch |write_err| {
+                    return failWithReport(self.opts, .mode_push, write_err);
                 };
                 onSessionAppend(self.opts, &self.append_ct, &self.hist, tr_stored) catch |compact_err| {
                     return failWithReport(self.opts, .compact, compact_err);
@@ -828,6 +931,140 @@ pub const LoopCtx = struct {
             },
         };
     }
+
+    /// Outcome of one reliability-aware stream pull.
+    const NextStep = union(enum) {
+        /// A provider event to process normally.
+        event: providers.Event,
+        /// Stream ended cleanly (`next()` returned null).
+        exhausted: void,
+        /// The stream stalled past the idle timeout and was torn down; the
+        /// caller should reconnect.
+        timed_out: void,
+        /// A context-overflow was detected and the session was compacted +
+        /// reloaded; the caller should restart the turn.
+        compacted: void,
+    };
+
+    /// Open a provider stream, retrying transient transport failures with
+    /// exponential backoff per the reliability policy. Fatal/parse failures
+    /// propagate immediately (no silent retry-forever).
+    fn startWithRetry(self: *LoopCtx, req_msgs: []providers.Msg) anyerror!*providers.Stream {
+        const pol = try self.opts.reliability.transportPolicy();
+        var attempt: u16 = 1;
+        while (true) : (attempt += 1) {
+            const stream = self.opts.provider.start(.{
+                .model = self.opts.model,
+                .provider = self.opts.provider_label,
+                .msgs = req_msgs,
+                .tools = self.req_tools,
+                .opts = self.opts.provider_opts,
+            }) catch |start_err| {
+                const cls = classifyTransport(start_err);
+                const step = pol.next(cls, attempt) catch return start_err;
+                switch (step) {
+                    .fail => return start_err,
+                    .retry_after_ms => |delay| {
+                        try self.opts.mode.push(.{ .retry_attempt = .{
+                            .stage = .provider_start,
+                            .attempt = attempt,
+                            .backoff_ms = delay,
+                        } });
+                        sleepMs(self.opts, delay);
+                        if (isCanceled(self.opts)) return error.Canceled;
+                        continue;
+                    },
+                }
+            };
+            return stream;
+        }
+    }
+
+    /// Pull the next stream event, applying: streaming idle-timeout (tear down
+    /// + signal reconnect), transient-failure retry of the underlying
+    /// `provider.start()`, and context-overflow auto-compaction.
+    fn nextWithReliability(self: *LoopCtx) anyerror!NextStep {
+        const pol = try self.opts.reliability.transportPolicy();
+        var attempt: u16 = 1;
+        while (true) {
+            const maybe_ev = self.stream.?.next() catch |next_err| {
+                const cls = classifyTransport(next_err);
+                const step = pol.next(cls, attempt) catch return next_err;
+                switch (step) {
+                    .fail => return next_err,
+                    .retry_after_ms => |delay| {
+                        try self.opts.mode.push(.{ .retry_attempt = .{
+                            .stage = .stream_next,
+                            .attempt = attempt,
+                            .backoff_ms = delay,
+                        } });
+                        sleepMs(self.opts, delay);
+                        if (isCanceled(self.opts)) return error.Canceled;
+                        try self.reopenStream();
+                        attempt += 1;
+                        continue;
+                    },
+                }
+            };
+
+            const after = nowMs(self.opts);
+            const timeout = self.opts.reliability.idle_timeout_ms;
+            if (maybe_ev) |ev| {
+                self.last_event_ms = after;
+                // An error event carrying overflow text triggers compaction
+                // rather than a hard failure.
+                if (ev == .err and self.opts.compactor != null) {
+                    if (prov_types.isOverflowError(self.opts.alloc, ev.err)) {
+                        try self.opts.mode.push(.{ .overflow_detected = {} });
+                        try self.compactAndReload();
+                        return .{ .compacted = {} };
+                    }
+                }
+                return .{ .event = ev };
+            }
+
+            // next() returned null. Distinguish a clean end-of-stream from an
+            // idle stall: if the gap since the last event exceeds the timeout
+            // we treat it as a stall, tear the stream down, and reconnect.
+            if (timeout > 0 and (after - self.last_event_ms) >= timeout) {
+                try self.opts.mode.push(.{ .stream_timeout = .{
+                    .idle_ms = after - self.last_event_ms,
+                } });
+                if (self.opts.abort_slot) |slot| slot.set(null);
+                if (self.stream) |s| s.deinit();
+                self.stream = null;
+                return .{ .timed_out = {} };
+            }
+
+            return .{ .exhausted = {} };
+        }
+    }
+
+    /// Tear down and re-open the provider stream against the current history
+    /// (used after a transient stream.next failure).
+    fn reopenStream(self: *LoopCtx) anyerror!void {
+        if (self.opts.abort_slot) |slot| slot.set(null);
+        if (self.stream) |s| s.deinit();
+        self.stream = null;
+        _ = self.turn_arena.reset(.retain_capacity);
+        const turn_alloc = self.turn_arena.allocator();
+        const req_msgs = try buildReqMsgs(turn_alloc, self.hist.items.items, self.opts.system_prompt, self.opts.skip_prompt_guard);
+        self.stream = try self.startWithRetry(req_msgs);
+        if (self.opts.abort_slot) |slot| slot.set(self.stream.?.aborter());
+        self.last_event_ms = nowMs(self.opts);
+    }
+
+    /// Run the compactor against the live session, then rebuild history from
+    /// the compacted store. Tears down the current stream first.
+    fn compactAndReload(self: *LoopCtx) anyerror!void {
+        const compactor = self.opts.compactor orelse return error.MissingStop;
+        if (self.opts.abort_slot) |slot| slot.set(null);
+        if (self.stream) |s| s.deinit();
+        self.stream = null;
+        try compactor.run(self.opts.sid, nowMs(self.opts));
+        try reloadHist(self.opts, &self.hist);
+        try self.opts.mode.push(.{ .compaction_triggered = {} });
+    }
 };
 
 pub fn run(opts: Opts) (Err || anyerror)!RunOut {
@@ -850,13 +1087,7 @@ fn emitCanceled(opts: Opts, append_ct: *u64, hist: *Hist) !void {
     try opts.mode.push(.{ .provider = pev });
 
     const sev = mapProviderEv(pev, nowMs(opts));
-    const stored = blk: {
-        opts.store.append(opts.sid, sev) catch |append_err| {
-            try opts.mode.push(.{ .session_write_err = @errorName(append_err) });
-            break :blk false;
-        };
-        break :blk true;
-    };
+    const stored = try appendWithRetry(opts, opts.sid, sev);
     try onSessionAppend(opts, append_ct, hist, stored);
     if (stored) try opts.mode.push(.{ .session = sev });
 }
@@ -900,6 +1131,95 @@ fn reportRuntimeErr(opts: Opts, stage: Stage, cause: anyerror) !void {
 fn nowMs(opts: Opts) i64 {
     if (opts.time) |t| return t.nowMs();
     return core_time.milliTimestamp();
+}
+
+fn sleepMs(opts: Opts, ms: u64) void {
+    if (ms == 0) return;
+    if (opts.sleeper) |s| {
+        s.sleepMs(ms);
+        return;
+    }
+    // Best-effort real sleep; a cancellation only shortens the backoff, which
+    // is benign — the retry loop re-checks cancellation on its next pass.
+    const ms_i64: i64 = std.math.cast(i64, ms) orelse std.math.maxInt(i64);
+    std.Io.sleep(
+        std.Io.Threaded.global_single_threaded.io(),
+        .fromMilliseconds(ms_i64),
+        .awake,
+    ) catch {};
+}
+
+/// Map an arbitrary provider/transport error into the canonical taxonomy so
+/// the retry policy can decide retryable-vs-fatal. Allocation failures and
+/// already-canonical errors pass through unchanged; everything else is treated
+/// as a fatal transport error (no silent "retry forever").
+fn classifyTransport(err: anyerror) prov_types.Err {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.TransportTransient => error.TransportTransient,
+        error.TransportFatal => error.TransportFatal,
+        error.BadFrame => error.BadFrame,
+        error.UnknownTag => error.UnknownTag,
+        error.InvalidUsage => error.InvalidUsage,
+        error.UnknownStop => error.UnknownStop,
+        error.MissingStop => error.MissingStop,
+        // Common stdlib transport-ish errors that are worth retrying.
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.ConnectionRefused,
+        error.BrokenPipe,
+        error.NetworkUnreachable,
+        error.TemporaryNameServerFailure,
+        error.WouldBlock,
+        error.Timeout,
+        error.Canceled,
+        => error.TransportTransient,
+        else => error.TransportFatal,
+    };
+}
+
+/// Append a session event, retrying transient write failures with exponential
+/// backoff. On exhaustion (or a non-retryable error) the loop does NOT lose
+/// data silently: it emits a `session_write_err` WARN so the caller knows the
+/// durable write failed, and returns `false` so the loop continues in-memory.
+/// Returns `true` when the event was durably stored. Mode-sink failures (a
+/// genuine downstream fault, not a write fault) propagate so they are never
+/// silently swallowed.
+fn appendWithRetry(opts: Opts, sid: []const u8, ev: session.Event) anyerror!bool {
+    const backoff = opts.reliability.sessionBackoff() catch {
+        // Misconfigured backoff must not silently skip the write: try once.
+        return appendOnce(opts, sid, ev);
+    };
+    const max_tries = if (opts.reliability.session_max_tries == 0) 1 else opts.reliability.session_max_tries;
+
+    var attempt: u16 = 1;
+    while (true) : (attempt += 1) {
+        opts.store.append(sid, ev) catch |append_err| {
+            const last = attempt >= max_tries;
+            if (!last and prov_types.retryable(classifyTransport(append_err))) {
+                const delay = backoff.delayMs(attempt) catch opts.reliability.session_base_ms;
+                try opts.mode.push(.{ .retry_attempt = .{
+                    .stage = .session_write,
+                    .attempt = attempt,
+                    .backoff_ms = delay,
+                } });
+                sleepMs(opts, delay);
+                continue;
+            }
+            // Exhausted or fatal: WARN and continue in-memory (no silent loss).
+            try opts.mode.push(.{ .session_write_err = @errorName(append_err) });
+            return false;
+        };
+        return true;
+    }
+}
+
+fn appendOnce(opts: Opts, sid: []const u8, ev: session.Event) anyerror!bool {
+    opts.store.append(sid, ev) catch |append_err| {
+        try opts.mode.push(.{ .session_write_err = @errorName(append_err) });
+        return false;
+    };
+    return true;
 }
 
 fn freePart(alloc: std.mem.Allocator, part: providers.Part) void {
@@ -1722,6 +2042,10 @@ test "loop smoke composes replay provider tool and mode" {
                 },
                 .session_write_err => {},
                 .agent_status => {},
+                .retry_attempt => {},
+                .overflow_detected => {},
+                .compaction_triggered => {},
+                .stream_timeout => {},
             }
         }
     };
@@ -1944,6 +2268,10 @@ test "loop smoke finishes single turn with no tools" {
                 .tool => self.tool_ct += 1,
                 .session_write_err => {},
                 .agent_status => {},
+                .retry_attempt => {},
+                .overflow_detected => {},
+                .compaction_triggered => {},
+                .stream_timeout => {},
             }
         }
     };
@@ -5553,4 +5881,519 @@ test "CmdCache TTL checked on lookup rejects expired entries" {
     try std.testing.expect(!cache.containsAt(key, 1001));
     // Entry was removed
     try std.testing.expectEqual(@as(usize, 0), cache.count());
+}
+
+// ===========================================================================
+// RELIABILITY: retry / backoff / overflow-compaction / idle-timeout tests
+// ===========================================================================
+
+/// Sleeper that records every requested backoff without blocking real time.
+const RecordingSleeper = struct {
+    sleeper: Sleeper = .{ .vt = &Bind.vt },
+    total_ms: u64 = 0,
+    calls: usize = 0,
+    const Bind = Sleeper.Bind(@This(), record);
+    fn record(self: *@This(), ms: u64) void {
+        self.total_ms += ms;
+        self.calls += 1;
+    }
+};
+
+/// Reader over a fixed slice of session events.
+const RelReader = struct {
+    reader: session.Reader = .{ .vt = &session.Reader.Bind(@This(), next, deinit).vt },
+    evs: []const session.Event = &.{},
+    idx: usize = 0,
+    fn next(self: *@This()) !?session.Event {
+        if (self.idx >= self.evs.len) return null;
+        const ev = self.evs[self.idx];
+        self.idx += 1;
+        return ev;
+    }
+    fn deinit(_: *@This()) void {}
+};
+
+/// Stream that yields a scripted list of provider events, then null.
+const RelStream = struct {
+    stream: providers.Stream = .{ .vt = &providers.Stream.Bind(@This(), next, deinit).vt },
+    evs: []const providers.Event = &.{},
+    idx: usize = 0,
+    next_err: ?anyerror = null,
+    fail_remaining: usize = 0,
+    deinit_ct: usize = 0,
+    fn next(self: *@This()) !?providers.Event {
+        if (self.fail_remaining > 0) {
+            self.fail_remaining -= 1;
+            return self.next_err.?;
+        }
+        if (self.idx >= self.evs.len) return null;
+        const ev = self.evs[self.idx];
+        self.idx += 1;
+        return ev;
+    }
+    fn deinit(self: *@This()) void {
+        self.deinit_ct += 1;
+    }
+};
+
+/// Counts session_write_err WARNs and the reliability ModeEv variants so the
+/// tests can assert on the emitted event stream.
+const RelModeSink = struct {
+    mode_sink: ModeSink = .{ .vt = &ModeSink.Bind(@This(), push).vt },
+    write_err_ct: usize = 0,
+    retry_provider_ct: usize = 0,
+    retry_stream_ct: usize = 0,
+    retry_session_ct: usize = 0,
+    overflow_ct: usize = 0,
+    compaction_ct: usize = 0,
+    timeout_ct: usize = 0,
+    last_backoff_ms: u64 = 0,
+    fn push(self: *@This(), ev: ModeEv) !void {
+        switch (ev) {
+            .session_write_err => self.write_err_ct += 1,
+            .retry_attempt => |ra| {
+                self.last_backoff_ms = ra.backoff_ms;
+                switch (ra.stage) {
+                    .provider_start => self.retry_provider_ct += 1,
+                    .stream_next => self.retry_stream_ct += 1,
+                    .session_write => self.retry_session_ct += 1,
+                }
+            },
+            .overflow_detected => self.overflow_ct += 1,
+            .compaction_triggered => self.compaction_ct += 1,
+            .stream_timeout => self.timeout_ct += 1,
+            else => {},
+        }
+    }
+};
+
+test "reliability: provider.start retries transient until success" {
+    // Provider start fails transiently twice, then succeeds; the loop must
+    // retry (emitting two provider_start retry events) and complete the turn.
+    const StoreImpl = struct {
+        session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), append, replay, deinit).vt },
+        rdr: RelReader = .{},
+        fn append(_: *@This(), _: []const u8, _: session.Event) !void {}
+        fn replay(self: *@This(), _: []const u8) !*session.Reader {
+            self.rdr = .{};
+            return &self.rdr.reader;
+        }
+        fn deinit(_: *@This()) void {}
+    };
+    const ProviderImpl = struct {
+        provider: providers.Provider = .{ .vt = &providers.Provider.Bind(@This(), start).vt },
+        stream_impl: RelStream = .{},
+        start_ct: usize = 0,
+        fail_starts: usize,
+        fn start(self: *@This(), _: providers.Request) !*providers.Stream {
+            self.start_ct += 1;
+            if (self.start_ct <= self.fail_starts) return error.TransportTransient;
+            self.stream_impl.idx = 0;
+            return &self.stream_impl.stream;
+        }
+    };
+
+    const evs = [_]providers.Event{
+        .{ .text = "ok" },
+        .{ .stop = .{ .reason = .done } },
+    };
+    var provider_impl = ProviderImpl{
+        .fail_starts = 2,
+        .stream_impl = .{ .evs = evs[0..] },
+    };
+    var store_impl = StoreImpl{};
+    var mode = RelModeSink{};
+    var sleeper = RecordingSleeper{};
+    var clock = time_mock.FixedMs{ .now_ms = 100 };
+
+    const out = try run(.{
+        .alloc = std.testing.allocator,
+        .sid = "sid",
+        .prompt = "go",
+        .model = "m",
+        .provider = &provider_impl.provider,
+        .store = &store_impl.session_store,
+        .reg = tools.Registry.init(&.{}),
+        .mode = &mode.mode_sink,
+        .max_turns = 2,
+        .time = &clock.time_src,
+        .sleeper = &sleeper.sleeper,
+    });
+
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+    const Snap = struct {
+        turns: u16,
+        start_ct: usize,
+        retry_provider_ct: usize,
+        sleeper_calls: usize,
+        first_backoff_ms: u64,
+    };
+    try oh.snap(@src(),
+        \\core.loop.test.reliability: provider.start retries transient until success.Snap
+        \\  .turns: u16 = 1
+        \\  .start_ct: usize = 3
+        \\  .retry_provider_ct: usize = 2
+        \\  .sleeper_calls: usize = 2
+        \\  .first_backoff_ms: u64 = 500
+    ).expectEqual(Snap{
+        .turns = out.turns,
+        .start_ct = provider_impl.start_ct,
+        .retry_provider_ct = mode.retry_provider_ct,
+        .sleeper_calls = sleeper.calls,
+        // base 250 * 2 (second attempt) = 500ms on the last recorded backoff.
+        .first_backoff_ms = mode.last_backoff_ms,
+    });
+}
+
+test "reliability: provider.start fails immediately on fatal transport" {
+    // A fatal transport error must NOT be retried: start is called exactly once
+    // and the run propagates the error (recorded as runtime err in session).
+    const StoreImpl = struct {
+        session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), append, replay, deinit).vt },
+        rdr: RelReader = .{},
+        err_ct: usize = 0,
+        fn append(self: *@This(), _: []const u8, ev: session.Event) !void {
+            if (ev.data == .err) self.err_ct += 1;
+        }
+        fn replay(self: *@This(), _: []const u8) !*session.Reader {
+            self.rdr = .{};
+            return &self.rdr.reader;
+        }
+        fn deinit(_: *@This()) void {}
+    };
+    const ProviderImpl = struct {
+        provider: providers.Provider = .{ .vt = &providers.Provider.Bind(@This(), start).vt },
+        start_ct: usize = 0,
+        fn start(self: *@This(), _: providers.Request) !*providers.Stream {
+            self.start_ct += 1;
+            return error.TransportFatal;
+        }
+    };
+
+    var provider_impl = ProviderImpl{};
+    var store_impl = StoreImpl{};
+    var mode = RelModeSink{};
+    var sleeper = RecordingSleeper{};
+    var clock = time_mock.FixedMs{ .now_ms = 1 };
+
+    const res = run(.{
+        .alloc = std.testing.allocator,
+        .sid = "sid",
+        .prompt = "go",
+        .model = "m",
+        .provider = &provider_impl.provider,
+        .store = &store_impl.session_store,
+        .reg = tools.Registry.init(&.{}),
+        .mode = &mode.mode_sink,
+        .max_turns = 1,
+        .time = &clock.time_src,
+        .sleeper = &sleeper.sleeper,
+    });
+    try std.testing.expectError(error.TransportFatal, res);
+    try std.testing.expectEqual(@as(usize, 1), provider_impl.start_ct);
+    try std.testing.expectEqual(@as(usize, 0), mode.retry_provider_ct);
+    try std.testing.expectEqual(@as(usize, 0), sleeper.calls);
+    try std.testing.expectEqual(@as(usize, 1), store_impl.err_ct);
+}
+
+test "reliability: overflow detected triggers compaction and retry" {
+    // First stream yields an overflow error event; with a compactor present the
+    // loop must compact, reload history, and restart the turn against a second
+    // stream that completes normally.
+    const StoreImpl = struct {
+        session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), append, replay, deinit).vt },
+        // After compaction, replay returns this (empty) compacted history.
+        rdr: RelReader = .{},
+        replay_ct: usize = 0,
+        fn append(_: *@This(), _: []const u8, _: session.Event) !void {}
+        fn replay(self: *@This(), _: []const u8) !*session.Reader {
+            self.replay_ct += 1;
+            self.rdr = .{};
+            return &self.rdr.reader;
+        }
+        fn deinit(_: *@This()) void {}
+    };
+    const CompactorImpl = struct {
+        compactor: Compactor = .{ .vt = &Compactor.Bind(@This(), runImpl).vt },
+        run_ct: usize = 0,
+        fn runImpl(self: *@This(), _: []const u8, _: i64) !void {
+            self.run_ct += 1;
+        }
+    };
+    const ProviderImpl = struct {
+        provider: providers.Provider = .{ .vt = &providers.Provider.Bind(@This(), start).vt },
+        s1: RelStream,
+        s2: RelStream,
+        start_ct: usize = 0,
+        fn start(self: *@This(), _: providers.Request) !*providers.Stream {
+            self.start_ct += 1;
+            if (self.start_ct == 1) {
+                self.s1.idx = 0;
+                return &self.s1.stream;
+            }
+            self.s2.idx = 0;
+            return &self.s2.stream;
+        }
+    };
+
+    const overflow_evs = [_]providers.Event{
+        .{ .err = "{\"error\":{\"type\":\"request_too_large\",\"message\":\"too big\"}}" },
+    };
+    const ok_evs = [_]providers.Event{
+        .{ .text = "after-compact" },
+        .{ .stop = .{ .reason = .done } },
+    };
+    var provider_impl = ProviderImpl{
+        .s1 = .{ .evs = overflow_evs[0..] },
+        .s2 = .{ .evs = ok_evs[0..] },
+    };
+    var store_impl = StoreImpl{};
+    var compactor_impl = CompactorImpl{};
+    var mode = RelModeSink{};
+    var sleeper = RecordingSleeper{};
+    var clock = time_mock.FixedMs{ .now_ms = 10 };
+
+    const out = try run(.{
+        .alloc = std.testing.allocator,
+        .sid = "sid",
+        .prompt = "go",
+        .model = "m",
+        .provider = &provider_impl.provider,
+        .store = &store_impl.session_store,
+        .reg = tools.Registry.init(&.{}),
+        .mode = &mode.mode_sink,
+        .max_turns = 3,
+        .time = &clock.time_src,
+        .sleeper = &sleeper.sleeper,
+        .compactor = &compactor_impl.compactor,
+        .compact_every = 1000, // large so periodic compaction never fires here
+    });
+
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+    const Snap = struct {
+        turns: u16,
+        start_ct: usize,
+        compactor_run_ct: usize,
+        overflow_ct: usize,
+        compaction_ct: usize,
+    };
+    try oh.snap(@src(),
+        \\core.loop.test.reliability: overflow detected triggers compaction and retry.Snap
+        \\  .turns: u16 = 1
+        \\  .start_ct: usize = 2
+        \\  .compactor_run_ct: usize = 1
+        \\  .overflow_ct: usize = 1
+        \\  .compaction_ct: usize = 1
+    ).expectEqual(Snap{
+        .turns = out.turns,
+        .start_ct = provider_impl.start_ct,
+        .compactor_run_ct = compactor_impl.run_ct,
+        .overflow_ct = mode.overflow_ct,
+        .compaction_ct = mode.compaction_ct,
+    });
+}
+
+test "reliability: stream idle timeout reconnects provider" {
+    // First stream stalls (returns null after a long time gap); the loop must
+    // emit a stream_timeout, tear it down, and reconnect to a second stream
+    // that completes. Time advances past the 5ms idle timeout via SeqMs.
+    const StoreImpl = struct {
+        session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), append, replay, deinit).vt },
+        rdr: RelReader = .{},
+        fn append(_: *@This(), _: []const u8, _: session.Event) !void {}
+        fn replay(self: *@This(), _: []const u8) !*session.Reader {
+            self.rdr = .{};
+            return &self.rdr.reader;
+        }
+        fn deinit(_: *@This()) void {}
+    };
+    const ProviderImpl = struct {
+        provider: providers.Provider = .{ .vt = &providers.Provider.Bind(@This(), start).vt },
+        s1: RelStream,
+        s2: RelStream,
+        start_ct: usize = 0,
+        fn start(self: *@This(), _: providers.Request) !*providers.Stream {
+            self.start_ct += 1;
+            if (self.start_ct == 1) {
+                self.s1.idx = 0;
+                return &self.s1.stream;
+            }
+            self.s2.idx = 0;
+            return &self.s2.stream;
+        }
+    };
+
+    // s1 returns null immediately (empty evs). The clock jumps from the
+    // start-seed (0) to 100ms on the next() boundary, exceeding the 5ms timeout.
+    const ok_evs = [_]providers.Event{
+        .{ .text = "reconnected" },
+        .{ .stop = .{ .reason = .done } },
+    };
+    var provider_impl = ProviderImpl{
+        .s1 = .{ .evs = &.{} },
+        .s2 = .{ .evs = ok_evs[0..] },
+    };
+    var store_impl = StoreImpl{};
+    var mode = RelModeSink{};
+    var sleeper = RecordingSleeper{};
+    // Sequence: init prompt(0), start1 last_event(0), next1->after(100 stall),
+    // timeout emit(100), start2 last_event(100), events at 100... clamps.
+    var clock = time_mock.SeqMs{ .vals = &.{ 0, 0, 100, 100, 100, 100, 100, 100, 100, 100 } };
+
+    const out = try run(.{
+        .alloc = std.testing.allocator,
+        .sid = "sid",
+        .prompt = "go",
+        .model = "m",
+        .provider = &provider_impl.provider,
+        .store = &store_impl.session_store,
+        .reg = tools.Registry.init(&.{}),
+        .mode = &mode.mode_sink,
+        .max_turns = 3,
+        .time = &clock.time_src,
+        .sleeper = &sleeper.sleeper,
+        .reliability = .{ .idle_timeout_ms = 5 },
+    });
+
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+    const Snap = struct {
+        turns: u16,
+        start_ct: usize,
+        timeout_ct: usize,
+        s1_deinit_ct: usize,
+    };
+    try oh.snap(@src(),
+        \\core.loop.test.reliability: stream idle timeout reconnects provider.Snap
+        \\  .turns: u16 = 1
+        \\  .start_ct: usize = 2
+        \\  .timeout_ct: usize = 1
+        \\  .s1_deinit_ct: usize = 1
+    ).expectEqual(Snap{
+        .turns = out.turns,
+        .start_ct = provider_impl.start_ct,
+        .timeout_ct = mode.timeout_ct,
+        .s1_deinit_ct = provider_impl.s1.deinit_ct,
+    });
+}
+
+test "reliability: session append retries transient then succeeds" {
+    // store.append fails transiently on its first call, then succeeds. The loop
+    // retries (one session_write retry event), emits NO session_write_err, and
+    // the prompt write lands durably.
+    const StoreImpl = struct {
+        session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), append, replay, deinit).vt },
+        rdr: RelReader = .{},
+        append_ct: usize = 0,
+        fail_remaining: usize,
+        fn append(self: *@This(), _: []const u8, _: session.Event) !void {
+            self.append_ct += 1;
+            if (self.fail_remaining > 0) {
+                self.fail_remaining -= 1;
+                return error.TransportTransient;
+            }
+        }
+        fn replay(self: *@This(), _: []const u8) !*session.Reader {
+            self.rdr = .{};
+            return &self.rdr.reader;
+        }
+        fn deinit(_: *@This()) void {}
+    };
+    const ProviderImpl = struct {
+        provider: providers.Provider = .{ .vt = &providers.Provider.Bind(@This(), start).vt },
+        stream_impl: RelStream,
+        fn start(self: *@This(), _: providers.Request) !*providers.Stream {
+            self.stream_impl.idx = 0;
+            return &self.stream_impl.stream;
+        }
+    };
+
+    const evs = [_]providers.Event{
+        .{ .stop = .{ .reason = .done } },
+    };
+    var provider_impl = ProviderImpl{ .stream_impl = .{ .evs = evs[0..] } };
+    var store_impl = StoreImpl{ .fail_remaining = 1 };
+    var mode = RelModeSink{};
+    var sleeper = RecordingSleeper{};
+    var clock = time_mock.FixedMs{ .now_ms = 7 };
+
+    _ = try run(.{
+        .alloc = std.testing.allocator,
+        .sid = "sid",
+        .prompt = "go",
+        .model = "m",
+        .provider = &provider_impl.provider,
+        .store = &store_impl.session_store,
+        .reg = tools.Registry.init(&.{}),
+        .mode = &mode.mode_sink,
+        .max_turns = 1,
+        .time = &clock.time_src,
+        .sleeper = &sleeper.sleeper,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), mode.retry_session_ct);
+    try std.testing.expectEqual(@as(usize, 0), mode.write_err_ct);
+    try std.testing.expectEqual(@as(u64, 50), mode.last_backoff_ms); // session base
+}
+
+test "reliability: session append fallback warns and continues on exhaustion" {
+    // store.append always fails: after exhausting retries the loop must WARN
+    // via session_write_err and continue in-memory (no error propagation, no
+    // silent data loss) so the turn still completes.
+    const StoreImpl = struct {
+        session_store: session.SessionStore = .{ .vt = &session.SessionStore.Bind(@This(), append, replay, deinit).vt },
+        rdr: RelReader = .{},
+        append_ct: usize = 0,
+        fn append(self: *@This(), _: []const u8, _: session.Event) !void {
+            self.append_ct += 1;
+            return error.TransportTransient;
+        }
+        fn replay(self: *@This(), _: []const u8) !*session.Reader {
+            self.rdr = .{};
+            return &self.rdr.reader;
+        }
+        fn deinit(_: *@This()) void {}
+    };
+    const ProviderImpl = struct {
+        provider: providers.Provider = .{ .vt = &providers.Provider.Bind(@This(), start).vt },
+        stream_impl: RelStream,
+        fn start(self: *@This(), _: providers.Request) !*providers.Stream {
+            self.stream_impl.idx = 0;
+            return &self.stream_impl.stream;
+        }
+    };
+
+    const evs = [_]providers.Event{
+        .{ .text = "hi" },
+        .{ .stop = .{ .reason = .done } },
+    };
+    var provider_impl = ProviderImpl{ .stream_impl = .{ .evs = evs[0..] } };
+    var store_impl = StoreImpl{};
+    var mode = RelModeSink{};
+    var sleeper = RecordingSleeper{};
+    var clock = time_mock.FixedMs{ .now_ms = 3 };
+
+    const out = try run(.{
+        .alloc = std.testing.allocator,
+        .sid = "sid",
+        .prompt = "go",
+        .model = "m",
+        .provider = &provider_impl.provider,
+        .store = &store_impl.session_store,
+        .reg = tools.Registry.init(&.{}),
+        .mode = &mode.mode_sink,
+        .max_turns = 1,
+        .time = &clock.time_src,
+        .sleeper = &sleeper.sleeper,
+        // 2 tries keeps the test fast; each append => 1 retry + 1 WARN.
+        .reliability = .{ .session_max_tries = 2 },
+    });
+
+    // Turn still completes despite write failures (in-memory continue).
+    try std.testing.expectEqual(@as(u16, 1), out.turns);
+    // The prompt + text + stop events each warn once after exhausting retries.
+    try std.testing.expect(mode.write_err_ct >= 1);
+    try std.testing.expectEqual(mode.write_err_ct, mode.retry_session_ct);
 }
