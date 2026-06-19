@@ -7,7 +7,7 @@ const is_macos = builtin.os.tag == .macos;
 const is_linux = builtin.os.tag == .linux;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("rt_io.zig").default();
 }
 
 fn closeFd(fd: std.posix.fd_t) void {

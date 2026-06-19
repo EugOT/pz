@@ -3,7 +3,7 @@ const std = @import("std");
 const net = std.Io.net;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 pub const Opts = struct {

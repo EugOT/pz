@@ -3,12 +3,21 @@ const std = @import("std");
 const net = std.Io.net;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../core/rt_io.zig").default();
 }
 
 fn fdRead(fd: std.posix.fd_t, buf: []u8) !usize {
     const rc = std.c.read(fd, buf.ptr, buf.len);
-    if (rc < 0) return std.posix.unexpectedErrno(std.posix.errno(rc));
+    if (rc < 0) {
+        const err = std.posix.errno(rc);
+        // Non-blocking fd with no data returns EAGAIN/EWOULDBLOCK; do NOT route
+        // it through unexpectedErrno, which prints "unexpected errno: 35" and
+        // dumps a stack trace in Debug test builds (flagging the test failed).
+        switch (err) {
+            .AGAIN => return error.WouldBlock,
+            else => return std.posix.unexpectedErrno(err),
+        }
+    }
     return @intCast(rc);
 }
 

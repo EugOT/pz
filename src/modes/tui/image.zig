@@ -21,7 +21,7 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 }
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../../core/rt_io.zig").default();
 }
 
 pub fn detect() Protocol {

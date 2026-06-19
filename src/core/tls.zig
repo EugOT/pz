@@ -14,7 +14,7 @@ pub fn applyCaFile(client: *std.http.Client, alloc: std.mem.Allocator, ca_file: 
         const file = try std.Io.Dir.openFileAbsolute(client.io, path, .{});
         defer file.close(client.io);
         var buf: [4096]u8 = undefined;
-        var reader = file.readerStreaming(client.io, &buf);
+        var reader = file.reader(client.io, &buf);
         try bundle.addCertsFromFile(alloc, &reader, now.toSeconds());
 
         client.ca_bundle.deinit(alloc);

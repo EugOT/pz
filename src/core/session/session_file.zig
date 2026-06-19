@@ -7,7 +7,7 @@ const sid_path = @import("path.zig");
 const Dir = std.Io.Dir;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 /// Wraps a session file path with lifecycle tracking.

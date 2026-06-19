@@ -4,7 +4,7 @@ const args = @import("args.zig");
 const core = @import("../core.zig");
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../core/rt_io.zig").default();
 }
 
 pub const model_default = "default";

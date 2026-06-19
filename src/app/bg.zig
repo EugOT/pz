@@ -10,7 +10,7 @@ const shell = @import("../core/shell.zig");
 const syslog_mock = @import("../test/syslog_mock.zig");
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../core/rt_io.zig").default();
 }
 
 fn currentEnvMap(alloc: std.mem.Allocator) !std.process.Environ.Map {
@@ -463,16 +463,22 @@ pub const Manager = struct {
         const sig_target: std.posix.pid_t = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) -pid else pid;
         std.posix.kill(sig_target, std.posix.SIG.TERM) catch |err| switch (err) {
             error.ProcessNotFound => {
-                const done_attrs = [_]core.audit.Attribute{
-                    .{ .key = "job_id", .val = .{ .uint = id } },
-                    .{ .key = "status", .val = .{ .str = "already_done" } },
-                };
+                try self.emitStopAlreadyDone(id);
+                return .already_done;
+            },
+            error.PermissionDenied => {
+                if (self.waitForStopRaceDone(id)) {
+                    try self.emitStopAlreadyDone(id);
+                    return .already_done;
+                }
                 try self.emitControlAudit(.{
                     .op = "stop",
-                    .msg = .{ .text = "bg control success", .vis = .@"pub" },
-                    .attrs = &done_attrs,
+                    .outcome = .fail,
+                    .severity = .err,
+                    .msg = .{ .text = @errorName(err), .vis = .mask },
+                    .attrs = &start_attrs,
                 });
-                return .already_done;
+                return err;
             },
             else => {
                 try self.emitControlAudit(.{
@@ -495,6 +501,34 @@ pub const Manager = struct {
             .attrs = &ok_attrs,
         });
         return .sent;
+    }
+
+    fn emitStopAlreadyDone(self: *Manager, id: u64) !void {
+        const done_attrs = [_]core.audit.Attribute{
+            .{ .key = "job_id", .val = .{ .uint = id } },
+            .{ .key = "status", .val = .{ .str = "already_done" } },
+        };
+        try self.emitControlAudit(.{
+            .op = "stop",
+            .msg = .{ .text = "bg control success", .vis = .@"pub" },
+            .attrs = &done_attrs,
+        });
+    }
+
+    fn waitForStopRaceDone(self: *Manager, id: u64) bool {
+        var i: usize = 0;
+        while (i < 5) : (i += 1) {
+            if (self.isDone(id)) return true;
+            std.Io.sleep(defaultIo(), .fromMilliseconds(10), .awake) catch return false;
+        }
+        return self.isDone(id);
+    }
+
+    fn isDone(self: *Manager, id: u64) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const idx = self.findIdxLocked(id) orelse return true;
+        return self.jobs.items[idx].state != .running;
     }
 
     pub fn list(self: *Manager, alloc: std.mem.Allocator) ![]View {
@@ -1370,6 +1404,22 @@ test "bg manager stop reports already_done after completion" {
     try std.testing.expect(stop == .already_done);
 }
 
+test "bg manager stop tolerates short-lived command race" {
+    var mgr = try Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const id = try mgr.start("printf done", null);
+    const stop = try mgr.stop(id);
+    try std.testing.expect(stop == .sent or stop == .already_done);
+
+    const woke = try waitWake(mgr.wakeFd(), 5000);
+    try std.testing.expect(woke);
+
+    const done = try mgr.drainDone(std.testing.allocator);
+    defer deinitViews(std.testing.allocator, done);
+    try std.testing.expectEqual(@as(usize, 1), done.len);
+}
+
 test "bg manager stop sends termination signal" {
     var mgr = try Manager.init(std.testing.allocator);
     defer mgr.deinit();
@@ -1422,7 +1472,13 @@ test "bg manager audit emits start and success entries for control ops" {
     });
     defer mgr.deinit();
 
-    const id = try mgr.start("printf done", "/tmp/secret");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "tmp/secret");
+    const secret_cwd = try tmp.dir.realPathFileAlloc(std.testing.io, "tmp/secret", std.testing.allocator);
+    defer std.testing.allocator.free(secret_cwd);
+
+    const id = try mgr.start("printf done", secret_cwd);
     const listed = try mgr.list(std.testing.allocator);
     defer deinitViews(std.testing.allocator, listed);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
@@ -1504,7 +1560,13 @@ test "bg manager syslog e2e ships redacted chained success audit over udp" {
     });
     defer mgr.deinit();
 
-    const id = try mgr.start("printf done", "/tmp/secret");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "tmp/secret");
+    const secret_cwd = try tmp.dir.realPathFileAlloc(std.testing.io, "tmp/secret", std.testing.allocator);
+    defer std.testing.allocator.free(secret_cwd);
+
+    const id = try mgr.start("printf done", secret_cwd);
     const listed = try mgr.list(std.testing.allocator);
     defer deinitViews(std.testing.allocator, listed);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
@@ -1524,7 +1586,7 @@ test "bg manager syslog e2e ships redacted chained success audit over udp" {
     const t = try collector.spawnCount(cap.rows.items.len);
 
     var sender = try core.syslog.Sender.init(std.testing.allocator, .{
-        .io = std.testing.io,
+        .io = defaultIo(),
         .transport = .udp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -1554,7 +1616,7 @@ test "bg manager syslog e2e ships redacted chained success audit over udp" {
     for (0..collector.msgCount()) |i| {
         const raw = collector.messageAt(i);
         try std.testing.expect(std.mem.indexOf(u8, raw, "printf done") == null);
-        try std.testing.expect(std.mem.indexOf(u8, raw, "/tmp/secret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, secret_cwd) == null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "[pz@32473 sid=\"bg\" seq=\"") != null);
     }
 
@@ -1596,7 +1658,7 @@ test "bg manager syslog e2e ships redacted chained failure audit over tcp" {
     const t = try collector.spawnCount(cap.rows.items.len);
 
     var sender = try core.syslog.Sender.init(std.testing.allocator, .{
-        .io = std.testing.io,
+        .io = defaultIo(),
         .transport = .tcp,
         .host = "127.0.0.1",
         .port = collector.port(),

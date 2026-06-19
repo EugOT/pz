@@ -17,7 +17,7 @@ const File = std.Io.File;
 pub const checkpoint_version: u16 = 1;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 fn readAllAlloc(file: File, alloc: Allocator, limit: usize) ![]u8 {

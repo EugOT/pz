@@ -9,7 +9,17 @@ fn errnoError(rc: isize) !void {
 
 fn fdRead(fd: std.posix.fd_t, buf: []u8) !usize {
     const rc = std.c.read(fd, buf.ptr, buf.len);
-    if (rc < 0) return std.posix.unexpectedErrno(std.posix.errno(rc));
+    if (rc < 0) {
+        const err = std.posix.errno(rc);
+        // A non-blocking wake pipe with no data returns EAGAIN/EWOULDBLOCK.
+        // The drain loop relies on this to stop; do NOT route it through
+        // unexpectedErrno, which prints "unexpected errno: 35" and dumps a
+        // stack trace in Debug test builds (flagging the test as failed).
+        switch (err) {
+            .AGAIN => return error.WouldBlock,
+            else => return std.posix.unexpectedErrno(err),
+        }
+    }
     return @intCast(rc);
 }
 
@@ -24,6 +34,12 @@ fn setNonblock(fd: std.posix.fd_t) !void {
     try errnoError(flags);
     const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
     try errnoError(std.c.fcntl(fd, std.c.F.SETFL, flags | nonblock));
+}
+
+fn setCloexec(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, std.posix.F.GETFD, @as(c_int, 0));
+    try errnoError(flags);
+    try errnoError(std.c.fcntl(fd, std.posix.F.SETFD, flags | @as(c_int, std.posix.FD_CLOEXEC)));
 }
 
 pub const Step = union(enum) {
@@ -51,6 +67,8 @@ pub const ScriptedProvider = struct {
         try errnoError(std.c.pipe(&pipe));
         errdefer _ = std.c.close(pipe[0]);
         errdefer _ = std.c.close(pipe[1]);
+        try setCloexec(pipe[0]);
+        try setCloexec(pipe[1]);
         try setNonblock(pipe[0]);
         try setNonblock(pipe[1]);
         return .{

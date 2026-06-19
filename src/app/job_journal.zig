@@ -6,7 +6,7 @@ const fs_secure = @import("../core/fs_secure.zig");
 const File = std.Io.File;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../core/rt_io.zig").default();
 }
 
 const Mutex = struct {

@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("rt_io.zig").default();
 }
 
 pub const Err = error{
@@ -87,9 +87,9 @@ pub fn prepareBash(
 fn resolveCwd(alloc: std.mem.Allocator, root: []const u8, path: []const u8) Err![]const u8 {
     const active_io = defaultIo();
     const resolved = std.Io.Dir.cwd().realPathFileAlloc(active_io, path, alloc) catch |err| return mapFsErr(err);
-    errdefer alloc.free(resolved);
+    defer alloc.free(resolved);
     if (!isWithin(root, resolved)) return error.Denied;
-    return resolved;
+    return alloc.dupe(u8, resolved) catch error.OutOfMemory;
 }
 
 fn collectExecRoots(

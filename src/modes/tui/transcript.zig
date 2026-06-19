@@ -18,9 +18,7 @@ fn appendPrint(
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
-    const text = try std.fmt.allocPrint(alloc, fmt, args);
-    defer alloc.free(text);
-    try out.appendSlice(alloc, text);
+    try out.print(alloc, fmt, args);
 }
 
 const Kind = enum { text, user, thinking, tool, err, meta, image, agent };

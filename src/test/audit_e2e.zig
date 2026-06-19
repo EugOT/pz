@@ -8,6 +8,10 @@ const auth = @import("../core/providers/auth.zig");
 const bg = @import("../app/bg.zig");
 const syslog_mock = @import("syslog_mock.zig");
 
+fn defaultIo() std.Io {
+    return @import("../core/rt_io.zig").default();
+}
+
 const Rows = struct {
     emitter: audit.Emitter = .{ .vt = &audit.Emitter.Bind(@This(), emitAudit).vt },
     rows: std.ArrayListUnmanaged([]u8) = .empty,
@@ -315,6 +319,12 @@ fn addAuthRows(rows: *Rows) !void {
 }
 
 fn addBgRows(rows: *Rows) !void {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "tmp/bg-secret");
+    const secret_cwd = try tmp.dir.realPathFileAlloc(testing.io, "tmp/bg-secret", testing.allocator);
+    defer testing.allocator.free(secret_cwd);
+
     var mgr = try bg.Manager.initWithOpts(testing.allocator, .{
         .audit_emitter = &rows.emitter,
         .now_ms = struct {
@@ -325,7 +335,7 @@ fn addBgRows(rows: *Rows) !void {
     });
     defer mgr.deinit();
 
-    const id = try mgr.start("printf done", "/tmp/bg-secret");
+    const id = try mgr.start("printf done", secret_cwd);
 
     const stop = try mgr.stop(id);
     try testing.expect(stop == .sent or stop == .already_done);
@@ -407,7 +417,7 @@ test "audit e2e ships mixed privileged control rows over udp" {
     const t = try collector.spawnCount(rows.rows.items.len);
 
     var sender = try syslog.Sender.init(testing.allocator, .{
-        .io = testing.io,
+        .io = defaultIo(),
         .transport = .udp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -430,7 +440,7 @@ test "audit e2e ships mixed privileged control rows over tcp" {
     const t = try collector.spawnCount(rows.rows.items.len);
 
     var sender = try syslog.Sender.init(testing.allocator, .{
-        .io = testing.io,
+        .io = defaultIo(),
         .transport = .tcp,
         .host = "127.0.0.1",
         .port = collector.port(),

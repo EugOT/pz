@@ -1755,7 +1755,19 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 }
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../core/rt_io.zig").default();
+}
+
+fn testRealPathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
+    const resolved = try dir.realPathFileAlloc(std.testing.io, sub_path, alloc);
+    defer alloc.free(resolved);
+    return try alloc.dupe(u8, resolved);
+}
+
+fn testCwdRealPathAlloc(alloc: std.mem.Allocator, sub_path: []const u8) ![]u8 {
+    const resolved = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, sub_path, alloc);
+    defer alloc.free(resolved);
+    return try alloc.dupe(u8, resolved);
 }
 
 fn isTty(fd: std.posix.fd_t) bool {
@@ -1876,7 +1888,7 @@ fn execWithIoTuiHooks(
     defer if (has_native_rt) native_rt.deinit();
 
     const home = run_cmd.home;
-    var pol = try RuntimePolicy.load(alloc, run_cmd.io, home);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), home);
     defer pol.deinit();
 
     // Durable audit sequence tracker: persists high-water mark so
@@ -1885,7 +1897,7 @@ fn execWithIoTuiHooks(
     const seq_path: ?[]const u8 = if (home) |h| blk: {
         break :blk std.fmt.bufPrint(&seq_path_buf, "{s}/.pz/audit_seq", .{h}) catch unreachable; // max_path_bytes (4096) >> home + 16 chars
     } else null;
-    var seq_tracker = core.audit_integrity.SeqTracker.init(alloc, run_cmd.io, seq_path);
+    var seq_tracker = core.audit_integrity.SeqTracker.init(alloc, defaultIo(), seq_path);
     hooks.seq_tracker = &seq_tracker;
 
     // Durable audit forwarding: when syslog is configured, create a
@@ -1894,7 +1906,7 @@ fn execWithIoTuiHooks(
     var audit_shipper: AuditShipper = undefined;
     var has_audit_shipper = false;
     var spool_dir: ?std.Io.Dir = null;
-    defer if (spool_dir) |d| d.close(run_cmd.io);
+    defer if (spool_dir) |d| d.close(defaultIo());
     defer if (has_audit_shipper) audit_shipper.deinit();
 
     if (hooks.audit_emitter == null) {
@@ -1977,13 +1989,16 @@ fn execWithIoTuiHooks(
     // Init provider
     var needs_login: ?NativeProviderKind = null;
     if (run_cmd.cfg.provider_cmd) |provider_cmd| {
-        try provider_rt.init(alloc, run_cmd.io, provider_cmd);
+        try provider_rt.init(alloc, defaultIo(), provider_cmd);
         has_provider_rt = true;
         provider = &provider_rt.client.provider;
     } else {
         const provider_name = resolveDefaultProvider(run_cmd.cfg.provider);
         if (parseNativeProviderKind(provider_name)) |native_kind| {
-            if (NativeProviderRuntime.init(alloc, native_kind, hooks.auth())) |nr| {
+            if (run_cmd.no_config) {
+                missing_provider.msg = missingProviderMsgForInitErr(native_kind, error.AuthNotFound);
+                provider = &missing_provider.provider;
+            } else if (NativeProviderRuntime.init(alloc, native_kind, hooks.auth())) |nr| {
                 native_rt = nr;
                 has_native_rt = true;
                 if (el) |*e| native_rt.setEventLoop(e);
@@ -2016,8 +2031,8 @@ fn execWithIoTuiHooks(
         session_dir_path = plan.dir_path;
 
         try core.fs_secure.ensureDirPath(plan.dir_path);
-        var session_dir = try std.Io.Dir.cwd().openDir(run_cmd.io, plan.dir_path, .{ .iterate = true });
-        errdefer session_dir.close(run_cmd.io);
+        var session_dir = try std.Io.Dir.cwd().openDir(defaultIo(), plan.dir_path, .{ .iterate = true });
+        errdefer session_dir.close(defaultIo());
         core.session.cleanOrphanTmpFiles(session_dir);
         fs_store_impl = try core.session.fs_store.Store.init(.{
             .alloc = alloc,
@@ -2102,6 +2117,7 @@ fn execWithIoTuiHooks(
         }
     }
 
+    if (out == null) try stdout_writer.interface.flush();
     return sid;
 }
 
@@ -2144,9 +2160,9 @@ fn runPrint(
     };
     var cmd_cache = core.loop.CmdCache.init(alloc);
     defer cmd_cache.deinit();
-    const approval_bind = try loadApprovalBindAlloc(alloc, run_cmd.io, home);
+    const approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
     defer approval_bind.deinit(alloc);
-    const approval_loc = try getApprovalLocAlloc(alloc, run_cmd.io);
+    const approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
     defer freeApprovalLoc(alloc, approval_loc);
 
     _ = try core.loop.run(.{
@@ -2305,9 +2321,9 @@ fn runJson(
     const popts = run_cmd.thinking.toProviderOpts();
     var cmd_cache = core.loop.CmdCache.init(alloc);
     defer cmd_cache.deinit();
-    const approval_bind = try loadApprovalBindAlloc(alloc, run_cmd.io, home);
+    const approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
     defer approval_bind.deinit(alloc);
-    const approval_loc = try getApprovalLocAlloc(alloc, run_cmd.io);
+    const approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
     defer freeApprovalLoc(alloc, approval_loc);
     const tctx = TurnCtx{
         .alloc = alloc,
@@ -2396,7 +2412,7 @@ fn runTui(
         break :blk ptr[0..m.len];
     } else &model_cycle;
 
-    const cwd_path = getProjectPath(alloc, run_cmd.io, home) catch "";
+    const cwd_path = getProjectPath(alloc, defaultIo(), home) catch "";
     defer if (cwd_path.len > 0) alloc.free(cwd_path);
     const branch = getGitBranch(alloc) catch "";
     defer if (branch.len > 0) alloc.free(branch);
@@ -2447,9 +2463,9 @@ fn runTui(
 
     var cmd_cache = core.loop.CmdCache.init(alloc);
     defer cmd_cache.deinit();
-    const approval_bind = try loadApprovalBindAlloc(alloc, run_cmd.io, home);
+    const approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
     defer approval_bind.deinit(alloc);
-    const approval_loc = try getApprovalLocAlloc(alloc, run_cmd.io);
+    const approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
     defer freeApprovalLoc(alloc, approval_loc);
     var bg_mgr = try bg.Manager.initWithOpts(alloc, .{
         .home = home,
@@ -2532,7 +2548,7 @@ fn runTui(
 
     // Auto-login: start OAuth flow on startup if auth is missing or expired.
     // Skip when using --provider-cmd (tests) or --no-config (no real auth expected).
-    if (run_cmd.cfg.provider_cmd == null) {
+    if (run_cmd.cfg.provider_cmd == null and !run_cmd.no_config) {
         const login_prov: ?core.providers.auth.Provider = if (native_rt) |nrt|
             nrt.expiredOAuthProvider()
         else if (needs_login) |kind| switch (kind) {
@@ -2695,9 +2711,9 @@ fn runTui(
 
         var live_cmd_cache = core.loop.CmdCache.init(alloc);
         defer live_cmd_cache.deinit();
-        const live_approval_bind = try loadApprovalBindAlloc(alloc, run_cmd.io, home);
+        const live_approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
         defer live_approval_bind.deinit(alloc);
-        const live_approval_loc = try getApprovalLocAlloc(alloc, run_cmd.io);
+        const live_approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
         defer freeApprovalLoc(alloc, live_approval_loc);
         var live_tctx = TurnCtx{
             .alloc = alloc,
@@ -3550,9 +3566,9 @@ fn runRpc(
     const popts = run_cmd.thinking.toProviderOpts();
     var cmd_cache = core.loop.CmdCache.init(alloc);
     defer cmd_cache.deinit();
-    const approval_bind = try loadApprovalBindAlloc(alloc, run_cmd.io, home);
+    const approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
     defer approval_bind.deinit(alloc);
-    const approval_loc = try getApprovalLocAlloc(alloc, run_cmd.io);
+    const approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
     defer freeApprovalLoc(alloc, approval_loc);
     const tctx = TurnCtx{
         .alloc = alloc,
@@ -5977,7 +5993,10 @@ fn forkSessionFile(session_dir: []const u8, src_sid: []const u8, dst_sid: []cons
 
     var buf: [8192]u8 = undefined;
     while (true) {
-        const n = try src.readStreaming(defaultIo(), &.{buf[0..]});
+        const n = src.readStreaming(defaultIo(), &.{buf[0..]}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
         if (n == 0) break;
         try dst.writeStreamingAll(defaultIo(), buf[0..n]);
     }
@@ -6009,7 +6028,12 @@ fn getApprovalLocAlloc(alloc: std.mem.Allocator, io: std.Io) !core.loop.CmdCache
     if (try runCmdTrimAlloc(alloc, &.{ "git", "rev-parse", "--show-toplevel" }, 4096)) |root| {
         return .{ .repo_root = root };
     }
-    return .{ .cwd = try std.process.currentPathAlloc(io, alloc) };
+    // currentPathAlloc returns a sentinel slice ([:0]u8, n+1 bytes). Loc.cwd is
+    // []const u8, which would erase the sentinel length and make freeApprovalLoc
+    // free n instead of n+1. Copy into an exact-length []u8 so alloc/free match.
+    const abs = try std.process.currentPathAlloc(io, alloc);
+    defer alloc.free(abs);
+    return .{ .cwd = try alloc.dupe(u8, abs) };
 }
 
 fn freeApprovalLoc(alloc: std.mem.Allocator, loc: core.loop.CmdCache.Loc) void {
@@ -6053,7 +6077,7 @@ fn getGitBranch(alloc: std.mem.Allocator) ![]u8 {
         alloc.free(branch);
     }
 
-    const head = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".git/HEAD", alloc, .limited(256)) catch return error.NotFound;
+    const head = std.Io.Dir.cwd().readFileAlloc(defaultIo(), ".git/HEAD", alloc, .limited(256)) catch return error.NotFound;
     defer alloc.free(head);
     const prefix = "ref: refs/heads/";
     if (std.mem.startsWith(u8, head, prefix)) {
@@ -6112,7 +6136,7 @@ fn looksLikeHexCommit(text: []const u8) bool {
 
 // hardcoded argv, no user input -- policy gate not needed
 fn runCmdTrimAlloc(alloc: std.mem.Allocator, argv: []const []const u8, max_bytes: usize) error{OutOfMemory}!?[]u8 {
-    const result = std.process.run(alloc, std.Io.Threaded.global_single_threaded.io(), .{
+    const result = std.process.run(alloc, defaultIo(), .{
         .argv = argv,
         .stdout_limit = .limited(max_bytes),
         .stderr_limit = .limited(max_bytes),
@@ -8008,7 +8032,7 @@ test "showResumeOverlay lists sessions and supports arrow navigation" {
         .data = "",
     });
 
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
@@ -8108,7 +8132,7 @@ test "showResumeOverlay fixed-width snapshot aligns age and token columns" {
     };
     try writeSessionEventsFile(tmp, "sess/200.jsonl", &short_events);
 
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 48, 8, "m", "p");
@@ -8156,7 +8180,7 @@ test "showResumeOverlay returns false when no sessions exist" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
@@ -8206,7 +8230,7 @@ test "restoreSessionIntoUi replays session history and resets stale ui state" {
         try file.writeStreamingAll(std.testing.io, "\n");
     }
 
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
@@ -8286,7 +8310,7 @@ test "restoreSessionIntoUi ignores empty blocks when rendering bottom row" {
         try file.writeStreamingAll(std.testing.io, "\n");
     }
 
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 24, 4, "m", "p");
@@ -8335,7 +8359,7 @@ test "runtime tui non-tty /resume restores session without running provider turn
         try file.writeStreamingAll(std.testing.io, "\n");
     }
 
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -8644,7 +8668,7 @@ test "runtime print mode skips session persistence by default" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -8681,7 +8705,7 @@ test "runtime executes tool calls through loop registry in print mode" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -8733,11 +8757,11 @@ test "runtime blocks tool dispatch under verified policy" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    const root_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const root_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(root_abs);
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
     const provider_cmd =
         "req=$(cat); " ++
@@ -8791,7 +8815,7 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
     const provider_cmd =
         "req=$(cat); " ++
@@ -8845,6 +8869,12 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
             var collector = try syslog_mock.UdpCollector.init();
             defer collector.deinit();
             const t = try collector.spawnCount(rows.rows.items.len);
+            // Join exactly once, before collector.deinit closes the socket: an
+            // early `try` failure below must not leave the collector thread
+            // receiving on a closed fd (BADF). The bool guard prevents a
+            // double-join on the success path.
+            var joined = false;
+            defer if (!joined) t.join();
 
             var sender = try core.syslog.Sender.init(std.testing.allocator, .{
                 .io = std.testing.io,
@@ -8857,12 +8887,19 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
 
             try audit_e2e.shipAuditRows(std.testing.allocator, &sender, rows.rows.items);
             t.join();
+            joined = true;
             try audit_e2e.verifyRoundTrip(&collector, rows.rows.items);
         },
         .tcp, .tls => {
             var collector = try syslog_mock.TcpCollector.init();
             defer collector.deinit();
             const t = try collector.spawnCount(rows.rows.items.len);
+            // Join exactly once, before collector.deinit closes the socket: an
+            // early `try` failure below must not leave the collector thread
+            // accepting/receiving on a closed fd (BADF). The bool guard
+            // prevents a double-join on the success path.
+            var joined = false;
+            defer if (!joined) t.join();
 
             var sender = try core.syslog.Sender.init(std.testing.allocator, .{
                 .io = std.testing.io,
@@ -8875,6 +8912,7 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
 
             try audit_e2e.shipAuditRows(std.testing.allocator, &sender, rows.rows.items);
             t.join();
+            joined = true;
             try audit_e2e.verifyRoundTrip(&collector, rows.rows.items);
         },
     }
@@ -8915,6 +8953,7 @@ test "AuditShipper buffers events during disconnect and flushes on reconnect" {
         .connector = &fail_conn.connector,
         .buf_cap = 8,
         .overflow = .drop_oldest,
+        .io = std.testing.io,
         .spool_dir = tmp.dir,
     });
     defer shipper.deinit();
@@ -8992,10 +9031,10 @@ test "subagent stub inherits effective policy hash" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    const root_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const root_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(root_abs);
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     var stub = try initSubagentStub(&pol, "agent-child");
@@ -9025,7 +9064,7 @@ test "subagent spawn fails closed under verified policy" {
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     try std.testing.expectError(error.PolicyDenied, initSubagentStub(&pol, "blocked"));
@@ -9036,7 +9075,7 @@ test "runtime print requires explicit approval for privileged escalation from un
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9078,7 +9117,7 @@ test "runtime forwards provider label to provider request" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9114,7 +9153,7 @@ test "runtime executes tui mode path with provided prompt" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9160,7 +9199,7 @@ test "runtime tui overflow retries once with injected live stdin" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var root = try tmp.dir.openDir(std.testing.io, ".", .{});
@@ -9230,7 +9269,7 @@ test "runtime tui overflow retries once with injected live stdin" {
     };
     var provider_impl = RetryProvider{ .alloc = std.testing.allocator };
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
     var tools_rt = core.tools.builtin.Runtime.init(.{
         .alloc = std.testing.allocator,
@@ -9325,7 +9364,7 @@ test "runtime tui reports error when no provider available" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9351,12 +9390,61 @@ test "runtime tui reports error when no provider available" {
     try std.testing.expect(std.mem.indexOf(u8, written, "provider unavailable") != null);
 }
 
+test "runtime no-config does not read or migrate legacy auth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/auth.json",
+        .data =
+        \\{
+        \\  "anthropic": {
+        \\    "type": "api_key",
+        \\    "key": "sk-legacy"
+        \\  }
+        \\}
+        ,
+    });
+    const home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_abs);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var cfg = cli.Run{
+        .mode = .tui,
+        .prompt = "ping",
+        .home = home_abs,
+        .no_session = true,
+        .no_config = true,
+        .cfg = .{
+            .mode = .tui,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "anthropic"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = null,
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var out_buf: [16384]u8 = undefined;
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
+    defer std.testing.allocator.free(sid);
+
+    const written = out_fbs.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "ANTHROPIC_API_KEY") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "home/.pz/auth.json", .{}));
+}
+
 test "runtime print reports unsupported native provider without provider_cmd" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9389,7 +9477,7 @@ test "runtime tui consumes multiple prompts from input stream" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9450,7 +9538,7 @@ test "runtime tui rejects blank-only stdin input" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9486,7 +9574,7 @@ fn expectLatestSessionReused(session_sel: anytype) !void {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     {
@@ -9572,7 +9660,7 @@ test "runtime explicit session path resumes that session id" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     {
@@ -9589,7 +9677,7 @@ test "runtime explicit session path resumes that session id" {
         try old_file.writeStreamingAll(std.testing.io, "\n");
     }
 
-    const sid_path = try tmp.dir.realPathFileAlloc(std.testing.io, "sess/sid-1.jsonl", std.testing.allocator);
+    const sid_path = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess/sid-1.jsonl");
     defer std.testing.allocator.free(sid_path);
 
     var cfg = cli.Run{
@@ -9618,7 +9706,7 @@ test "runtime no session mode does not persist jsonl files" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9652,7 +9740,7 @@ test "runtime tool mask filters builtins used by loop registry" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9700,7 +9788,7 @@ test "runtime json mode emits JSON lines for loop events" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9733,7 +9821,7 @@ test "runtime print mode uses configured model and provider" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9770,7 +9858,7 @@ test "runtime json mode uses configured model and stdin prompts" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9813,7 +9901,7 @@ test "runtime json mode errors on empty stdin when no prompt is supplied" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9866,7 +9954,7 @@ test "execWithIo cleans orphan compact temp files on startup" {
         try sf.writeStreamingAll(std.testing.io, ev);
         try sf.writeStreamingAll(std.testing.io, "\n");
     }
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9996,7 +10084,7 @@ test "runtime rpc mode handles session model prompt and quit commands" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10051,7 +10139,7 @@ test "runtime tui slash commands execute without prompt turns" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10113,7 +10201,7 @@ test "discoverSkills returns skill metadata with source" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     const skills = try discoverSkills(std.testing.allocator, null);
@@ -10145,7 +10233,7 @@ test "handleSlashCommand falls through for user-invocable skills" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try std.testing.allocator.dupe(u8, "sid");
@@ -10209,7 +10297,7 @@ test "handleSlashCommand blocks non-user-invocable skills" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try std.testing.allocator.dupe(u8, "sid");
@@ -10260,10 +10348,10 @@ test "TurnCtx.run binds approval context for destructive tools" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
-    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const cwd = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(cwd);
 
     const steps = [_]provider_mock.Step{
@@ -10401,7 +10489,7 @@ test "handleSlashCommand blocks builtins under verified policy" {
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try std.testing.allocator.dupe(u8, "sid");
@@ -10473,12 +10561,12 @@ test "handleSlashCommand export share and upgrade emit audited redacted records"
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, std.testing.io, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
-    const root_abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const root_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(root_abs);
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var sid = try std.testing.allocator.dupe(u8, "100");
@@ -10656,7 +10744,7 @@ test "runtime tui bg command starts and lists background jobs" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10697,7 +10785,7 @@ test "runtime snapshot for slash + bg flow" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10754,7 +10842,7 @@ test "runtime rpc accepts type envelope aliases and echoes ids" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10805,7 +10893,7 @@ test "runtime rpc bg command starts lists and stops jobs" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10861,11 +10949,11 @@ test "runtime rpc auth commands emit audited success and failure records" {
         var bad = try tmp.dir.createFile(std.testing.io, "home-bad", .{});
         bad.close(std.testing.io);
     }
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
-    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
+    const home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_abs);
-    const bad_home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home-bad", std.testing.allocator);
+    const bad_home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home-bad");
     defer std.testing.allocator.free(bad_home_abs);
 
     var cfg = cli.Run{
@@ -11415,7 +11503,7 @@ test "runtime rpc bg commands emit audited redacted control records" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -11930,11 +12018,11 @@ test "runtime tui auth commands emit audited success and failure records" {
         var bad = try tmp.dir.createFile(std.testing.io, "home-bad", .{});
         bad.close(std.testing.io);
     }
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
-    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
+    const home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_abs);
-    const bad_home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home-bad", std.testing.allocator);
+    const bad_home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home-bad");
     defer std.testing.allocator.free(bad_home_abs);
 
     var cfg = cli.Run{
@@ -12476,7 +12564,7 @@ test "runtime tui bg commands emit audited redacted control records" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -13055,7 +13143,7 @@ test "runtime rpc control commands emit audited redacted control records" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
     const events = [_]core.session.Event{
         .{
@@ -13419,7 +13507,7 @@ test "runtime tui tools command updates tool availability per turn" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -13466,7 +13554,7 @@ test "runtime rpc tools command updates tool availability per turn" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -13556,9 +13644,9 @@ test "slash logout without explicit provider frees logged-in list cleanly" {
     try tmp.dir.createDirPath(std.testing.io, "sess");
     try tmp.dir.createDirPath(std.testing.io, "home");
 
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", std.testing.allocator);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
-    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", std.testing.allocator);
+    const home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_abs);
 
     var cfg = cli.Run{
@@ -13716,9 +13804,9 @@ test "buildSystemPrompt rejects context under policy lock" {
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "ctx" });
-    const old = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const old = try testCwdRealPathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(old);
-    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const cwd = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(cwd);
     try chdirPath(cwd);
     defer chdirPath(old) catch {}; // test: error irrelevant
@@ -13835,7 +13923,7 @@ test "autoCompact draws compacting notice before compactor runs" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -13902,7 +13990,7 @@ test "autoCompact reports summary budget stop metadata" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -14076,7 +14164,7 @@ test "UX6: /new creates clean session with new sid" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "old-session");
@@ -14107,14 +14195,14 @@ test "UX6: /name persists session title" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var root = try tmp.dir.openDir(std.testing.io, ".", .{});
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "100");
@@ -14146,7 +14234,7 @@ test "UX6: /name without arg shows usage" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14178,7 +14266,7 @@ test "UX6: /resume with no arg returns select_session" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14206,7 +14294,7 @@ test "UX6: /resume with sid switches to that session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     // Write a minimal session file so resume can find it.
@@ -14220,7 +14308,7 @@ test "UX6: /resume with sid switches to that session" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "100");
@@ -14253,7 +14341,7 @@ test "UX6: /fork with no arg returns select_fork" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14281,7 +14369,7 @@ test "UX6: /fork with sid copies session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     const events = [_]core.session.Event{
@@ -14294,7 +14382,7 @@ test "UX6: /fork with sid copies session" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "100");
@@ -14328,7 +14416,7 @@ test "UX6: /compact on disabled session shows notice" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14361,7 +14449,7 @@ test "UX6: /export on disabled session shows error" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14390,7 +14478,7 @@ test "UX6: /export writes file for valid session" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     const events = [_]core.session.Event{
@@ -14404,7 +14492,7 @@ test "UX6: /export writes file for valid session" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "400");
@@ -14438,7 +14526,7 @@ test "UX7: /login with no arg returns select_login overlay" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14469,7 +14557,7 @@ test "UX7: /login unknown provider shows error" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14501,7 +14589,7 @@ test "UX7: /logout with unknown provider shows error" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14533,7 +14621,7 @@ test "UX7: /model with arg changes active model" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14566,7 +14654,7 @@ test "UX7: /model with no arg returns select_model" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14606,10 +14694,10 @@ test "UX6: /share calls share_gist and prints url" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var sid = try alloc.dupe(u8, "100");
@@ -14651,14 +14739,14 @@ test "UX6: /resume failure leaves prior sid intact" {
         .{ .at_ms = 2, .data = .{ .stop = .{ .reason = .done } } },
     };
     try writeSessionEventsFile(tmp, "sess/100.jsonl", &events);
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var root = try tmp.dir.openDir(std.testing.io, ".", .{});
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "100");
@@ -14691,7 +14779,7 @@ test "UX7: /provider with arg switches active provider" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14787,7 +14875,7 @@ test "UX11: manual /compact shows compacting notice" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -14841,7 +14929,7 @@ test "UX11: compaction preserves history after compact" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -14891,7 +14979,7 @@ test "UX11: compaction failure is non-fatal" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "sess");
-    const sess_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "sess", alloc);
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -15072,7 +15160,7 @@ test "UX3 /session returns session info" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "test-sid");
@@ -15106,7 +15194,7 @@ test "UX3 /changelog returns changelog text" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -15138,7 +15226,7 @@ test "UX3 /copy returns copy action" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -15169,7 +15257,7 @@ test "UX3 /quit returns quit action" {
     defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, std.testing.io, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");

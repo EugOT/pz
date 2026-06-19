@@ -9,7 +9,7 @@ const Acc = shared.Acc;
 const Dir = std.Io.Dir;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 pub const Err = error{

@@ -5,7 +5,7 @@ const max_msgs: usize = 16;
 const max_msg_len: usize = 4096;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../core/rt_io.zig").default();
 }
 
 fn connectLocal(port: u16) !net.Stream {
@@ -139,8 +139,21 @@ fn runTcp(self: *TcpCollector) void {
 }
 
 fn recvUdp(socket: *const net.Socket, buf: []u8) !usize {
-    const msg = try socket.receive(defaultIo(), buf);
-    return msg.data.len;
+    while (true) {
+        const got = std.c.recv(socket.handle, buf.ptr, buf.len, 0);
+        if (got < 0) {
+            switch (std.posix.errno(got)) {
+                // Retry on EINTR to match the codebase-wide pattern (readFd and
+                // every other I/O loop here continue on .INTR); a spurious
+                // signal must not tear down the collector mid-receive.
+                .INTR => continue,
+                .BADF => return error.Closed,
+                .AGAIN => return error.WouldBlock,
+                else => |err| return std.posix.unexpectedErrno(err),
+            }
+        }
+        return @intCast(got);
+    }
 }
 
 fn readOctetFrame(fd: std.posix.socket_t, buf: []u8) !usize {

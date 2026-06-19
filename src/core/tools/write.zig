@@ -6,7 +6,7 @@ const shared = @import("shared.zig");
 const noop = @import("../../test/noop_sink.zig");
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 pub const Err = error{

@@ -10,7 +10,7 @@ pub const Event = schema.Event;
 const Dir = std.Io.Dir;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 fn seekEnd(file: std.Io.File) !void {

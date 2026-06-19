@@ -5,6 +5,10 @@ const syslog_mock = @import("../test/syslog_mock.zig");
 
 const NetAddress = std.Io.net.IpAddress;
 
+fn defaultIo() std.Io {
+    return @import("rt_io.zig").default();
+}
+
 extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
 
 pub const version: u8 = 1;
@@ -521,8 +525,23 @@ fn openSocket(addr: NetAddress, transport: Transport) !std.posix.socket_t {
         .udp => @intFromEnum(std.Io.net.Protocol.udp),
         .tcp, .tls => @intFromEnum(std.Io.net.Protocol.tcp),
     };
-    const fd = socket(@intCast(addrFamily(addr)), kind | std.posix.SOCK.CLOEXEC, proto);
-    if (fd < 0) return error.SocketOpenFailed;
+    const fd = socket(@intCast(addrFamily(addr)), kind, proto);
+    if (fd < 0) return switch (std.posix.errno(fd)) {
+        .ACCES => error.AccessDenied,
+        .AFNOSUPPORT => error.AddressFamilyNotSupported,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .PROTONOSUPPORT => error.ProtocolNotSupported,
+        .PROTOTYPE => error.ProtocolWrongTypeForSocket,
+        else => error.SocketOpenFailed,
+    };
+    errdefer _ = std.c.close(fd);
+
+    const flags = std.c.fcntl(fd, @as(c_int, std.posix.F.GETFD), @as(c_int, 0));
+    if (flags == -1) return error.SocketOpenFailed;
+    if (std.c.fcntl(fd, @as(c_int, std.posix.F.SETFD), flags | @as(c_int, std.posix.FD_CLOEXEC)) == -1) {
+        return error.SocketOpenFailed;
+    }
     return @intCast(fd);
 }
 
@@ -797,7 +816,7 @@ test "udp sender emits datagram to local collector" {
     const t = try collector.spawn();
 
     var sender = try Sender.init(std.testing.allocator, .{
-        .io = std.testing.io,
+        .io = defaultIo(),
         .transport = .udp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -838,7 +857,7 @@ test "tcp sender emits octet-counted frame to local collector" {
     const t = try collector.spawn();
 
     var sender = try Sender.init(std.testing.allocator, .{
-        .io = std.testing.io,
+        .io = defaultIo(),
         .transport = .tcp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -871,7 +890,7 @@ test "udp sender truncates only the payload and annotates metadata" {
     const t = try collector.spawn();
 
     var sender = try Sender.init(std.testing.allocator, .{
-        .io = std.testing.io,
+        .io = defaultIo(),
         .transport = .udp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -917,6 +936,7 @@ test "tcp sender preserves the full payload for large messages" {
     const t = try collector.spawn();
 
     var sender = try Sender.init(std.testing.allocator, .{
+        .io = defaultIo(),
         .transport = .tcp,
         .host = "127.0.0.1",
         .port = collector.port(),

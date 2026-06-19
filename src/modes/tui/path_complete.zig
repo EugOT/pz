@@ -5,7 +5,7 @@ const std = @import("std");
 const max_results: usize = 32;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../../core/rt_io.zig").default();
 }
 
 /// List files matching a path prefix. Returns full paths relative to cwd.

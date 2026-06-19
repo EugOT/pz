@@ -314,10 +314,8 @@ test "exec runs prompt path and persists mapped provider events" {
             .evs = in_evs[0..],
         },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var out_buf: [512]u8 = undefined;
     var out_fbs: std.Io.Writer = .fixed(&out_buf);
@@ -502,10 +500,8 @@ test "exec deinit stream and maps stream next error to typed print error" {
     };
 
     var provider_impl = ProviderImpl{};
-    
 
     var store_impl = StoreImpl{};
-    
 
     var out_buf: [32]u8 = undefined;
     var out_fbs: std.Io.Writer = .fixed(&out_buf);
@@ -609,10 +605,8 @@ test "exec maps max_out stop reason to deterministic typed error" {
             .evs = in_evs[0..],
         },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var out_buf: [128]u8 = undefined;
     var out_fbs: std.Io.Writer = .fixed(&out_buf);

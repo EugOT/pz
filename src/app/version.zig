@@ -12,7 +12,7 @@ const release_uri = std.Uri{
 const version_url_env = "PZ_VERSION_URL";
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../core/rt_io.zig").default();
 }
 
 /// Semver triple for comparison.
@@ -100,6 +100,14 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |value| std.mem.span(value) else null;
 }
 
+fn currentEnvMap(alloc: std.mem.Allocator) !std.process.Environ.Map {
+    var env_len: usize = 0;
+    while (std.c.environ[env_len] != null) : (env_len += 1) {}
+    return std.process.Environ.createMap(.{
+        .block = .{ .slice = std.c.environ[0..env_len :null] },
+    }, alloc);
+}
+
 fn versionUriFromEnv() ?std.Uri {
     const raw = getenv(version_url_env) orelse return null;
     return std.Uri.parse(raw) catch null;
@@ -110,7 +118,13 @@ fn checkLatestWith(alloc: std.mem.Allocator, deps: Deps) !?[]u8 {
     defer http.deinit();
     var proxy_arena = std.heap.ArenaAllocator.init(alloc);
     defer proxy_arena.deinit();
-    if (deps.environ_map) |env| try http.initDefaultProxies(proxy_arena.allocator(), env);
+    if (deps.environ_map) |env| {
+        try http.initDefaultProxies(proxy_arena.allocator(), env);
+    } else {
+        var env = try currentEnvMap(proxy_arena.allocator());
+        defer env.deinit();
+        try http.initDefaultProxies(proxy_arena.allocator(), &env);
+    }
 
     const ua = "pz/" ++ cli.version;
     var req = try http.request(.GET, deps.uri, .{
@@ -194,7 +208,7 @@ const ClientTap = struct {
 
 const writeCfg = fixtures.writeCfg;
 
-fn writeCaPem(tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+fn writeCaPem(tmp: std.testing.TmpDir, name: []const u8) ![:0]u8 {
     return fixtures.writeCert(tmp.dir, name);
 }
 
@@ -338,5 +352,5 @@ test "checkLatest fails closed on invalid runtime CA bundle" {
 
     // initClient with bad CA cert should fail during cert parsing,
     // before any TCP connection is attempted.
-    try testing.expectError(error.MissingEndCertificateMarker, app_tls.initClient(std.testing.allocator, std.testing.io, bad_path));
+    try testing.expectError(error.MissingEndCertificateMarker, app_tls.initClient(std.testing.allocator, defaultIo(), bad_path));
 }

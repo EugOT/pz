@@ -25,7 +25,7 @@ pub const test_ca_pem =
 ;
 
 /// Write test CA PEM to a dir and return the absolute path (caller frees).
-pub fn writeCert(dir: std.Io.Dir, name: []const u8) ![]u8 {
+pub fn writeCert(dir: std.Io.Dir, name: []const u8) ![:0]u8 {
     try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = test_ca_pem });
     return try dir.realPathFileAlloc(std.testing.io, name, std.testing.allocator);
 }

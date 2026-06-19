@@ -4,7 +4,7 @@ const sid_path = @import("path.zig");
 const fs_secure = @import("../fs_secure.zig");
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 pub const version_current: u16 = 1;

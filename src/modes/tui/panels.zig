@@ -719,7 +719,6 @@ fn writePart(
     x.* += try frm.write(x.*, y, fit, st);
 }
 
-
 fn rowAscii(frm: *const frame.Frame, y: usize, out: []u8) ![]const u8 {
     std.debug.assert(out.len >= frm.w);
     var x: usize = 0;

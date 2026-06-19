@@ -549,7 +549,6 @@ pub fn signManifestAlloc(
     url: []const u8,
     kp: *const KeyPair,
 ) (std.mem.Allocator.Error || SignError || error{Overflow})![]u8 {
-
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(archive, &digest, .{});

@@ -4,6 +4,32 @@ Hard-won patterns and anti-patterns from building pz. **Update this file at the 
 
 ---
 
+## Session Notes (2026-06-19)
+
+### Worked Well
+- Use direct test binaries with the same seed when `zig build test --summary failures` is buffered; the direct runner exposes the exact PTY/auth test that is stuck or logging.
+
+### Do More
+- Keep `--no-config` hermetic: it must not initialize native auth, read legacy auth, or migrate `~/.pi/agent/auth.json` into `~/.pz/auth.json`.
+- Suppress expected migration warnings under `builtin.is_test`; Zig's build-runner protocol can report a failed command when tests emit stderr even if the direct test binary exits cleanly.
+- Treat background stop on short-lived commands as an async reap race: only downgrade signal errors to `already_done` after the manager observes the job leaving `running`.
+
+### Do Not Do
+- Do not leave deterministic PTY tests dependent on startup OAuth. Add `--no-config` to fixtures that exercise command/input surfaces, and put real provider/API tests behind an explicit opt-in env var.
+
+## Session Notes (2026-06-18)
+
+### Worked Well
+- Verify Zig package URL/hash review comments with `zig fetch <url>` before editing `build.zig.zon`; the hash prefix can reflect the package's own declared version, not the archive tag.
+
+### Do More
+- Use a real `std.Io` in tests that exercise filesystem metadata, realpath, process spawning, sockets, or TLS certificate bundle loading. `std.testing.io` intentionally fails or stubs many of those operations in Zig 0.16.
+- Confirm the timeout tool exists before relying on the mandated full-suite command on macOS; this host has no `timeout` or `gtimeout` in PATH, so `zig build test` can run past the intended 60-second cap.
+
+### Do Not Do
+- Do not pass `.TRUNC` into `openat` before hardlink/symlink validation. Open first without truncation, validate the fd, then call `ftruncate`.
+- Do not use `std.Io.Reader.take(n)` for provider stdout chunks; it waits for an exact-size buffer and can stall streaming. Use short reads via `File.readStreaming`.
+
 ## Session Notes (2026-06-13)
 
 ### Worked Well

@@ -44,4 +44,3 @@ pub fn mapResult(result: Result) ?Exit {
         },
     };
 }
-

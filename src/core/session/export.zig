@@ -10,7 +10,7 @@ const Dir = std.Io.Dir;
 const File = std.Io.File;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 fn writeAll(file: File, bytes: []const u8) !void {

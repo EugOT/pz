@@ -1083,7 +1083,9 @@ var proc_rkey_init = false;
 fn procKey() RedactKey {
     if (!proc_rkey_init) {
         var seed: [signing.rkey_len]u8 = undefined;
-        std.c.arc4random_buf(&seed, seed.len);
+        @import("rt_io.zig").default().randomSecure(&seed) catch |err| {
+            std.debug.panic("secure randomness unavailable: {s}", .{@errorName(err)});
+        };
         proc_rkey = .{ .bytes = seed };
         proc_rkey_init = true;
     }

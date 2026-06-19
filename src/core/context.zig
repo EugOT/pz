@@ -5,7 +5,7 @@ const prov_api = @import("providers/api.zig");
 const path_guard = @import("tools/path_guard.zig");
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("rt_io.zig").default();
 }
 
 fn chdirPath(path: []const u8) !void {
@@ -206,8 +206,13 @@ fn readAllAlloc(file: std.Io.File, alloc: std.mem.Allocator, max_bytes: usize) !
     return reader.interface.allocRemaining(alloc, .limited(max_bytes));
 }
 
-fn realCwdAlloc(alloc: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
-    return std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), ".", alloc) catch |err| switch (err) {
+fn realCwdAlloc(alloc: std.mem.Allocator) error{OutOfMemory}!?[:0]u8 {
+    // currentPathAlloc is the Zig 0.16 cwd accessor that works under both the
+    // production Io and std.testing.io (via the processCurrentPath vtable);
+    // realPathFileAlloc(cwd(), ".") hits failingDirRealPathFile under testing.io
+    // and returns error.FileNotFound. It returns a sentinel slice ([:0]u8,
+    // n+1 bytes) so the return type preserves the sentinel for correct free.
+    return std.process.currentPathAlloc(defaultIo(), alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => null,
     };

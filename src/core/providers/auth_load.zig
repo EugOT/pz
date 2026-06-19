@@ -45,7 +45,7 @@ fn readEnv(ar: std.mem.Allocator, key: []const u8) error{ OutOfMemory, Unexpecte
 }
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 fn accessPath(path: []const u8) !void {
@@ -148,7 +148,7 @@ fn migrateAuth(ar: std.mem.Allocator, home: []const u8, legacy: []const u8, dest
     var dir = try Dir.openDirAbsolute(defaultIo(), dir_path, .{});
     defer dir.close(defaultIo());
     try fs_secure.atomicWriteAt(dir, "auth.json", data);
-    std.log.warn("migrated auth from ~/.pi/agent/auth.json to ~/.pz/auth.json", .{});
+    if (!builtin.is_test) std.log.warn("migrated auth from ~/.pi/agent/auth.json to ~/.pz/auth.json", .{});
 }
 
 /// Check if a resolved auth file path is a legacy ~/.pi/ path.
@@ -218,7 +218,7 @@ pub fn loadFileAuthForProvider(alloc: std.mem.Allocator, home: []const u8, provi
     // Strict parsing for primary path; allow unknown fields for legacy compat
     const parsed = std.json.parseFromSlice(AuthFile, ar, raw, .{
         .allocate = .alloc_always,
-        .ignore_unknown_fields = true,
+        .ignore_unknown_fields = is_legacy,
     }) catch return error.AuthCorrupt;
     const entry = switch (provider) {
         .anthropic => parsed.value.anthropic,
@@ -242,11 +242,13 @@ pub fn loadFileAuthForProvider(alloc: std.mem.Allocator, home: []const u8, provi
             const refresh_duped = try alloc.dupe(u8, refresh);
             errdefer alloc.free(refresh_duped);
             const expires = entry.expires orelse 0;
-            break :blk .{ .oauth = .{
-                .access = access_duped,
-                .refresh = refresh_duped,
-                .expires = if (expires == 0) 0 else expires, // 0 = always-expired, triggers refresh
-            } };
+            break :blk .{
+                .oauth = .{
+                    .access = access_duped,
+                    .refresh = refresh_duped,
+                    .expires = if (expires == 0) 0 else expires, // 0 = always-expired, triggers refresh
+                },
+            };
         },
         .api_key => blk: {
             const key = entry.key orelse return error.AuthNotFound;

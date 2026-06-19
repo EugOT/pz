@@ -9,7 +9,7 @@ const Dir = std.Io.Dir;
 const File = std.Io.File;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 pub const Opts = struct {
@@ -63,7 +63,10 @@ pub const ReplayReader = struct {
                     return error.TornReplayLine;
                 }
 
-                self.io_len = try self.file.readStreaming(defaultIo(), &.{self.io_buf[0..]});
+                self.io_len = self.file.readStreaming(defaultIo(), &.{self.io_buf[0..]}) catch |err| switch (err) {
+                    error.EndOfStream => 0,
+                    else => return err,
+                };
                 self.io_pos = 0;
                 if (self.io_len == 0) {
                     self.eof = true;

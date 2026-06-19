@@ -93,10 +93,11 @@ pub const ProcChunk = struct {
 
         var stdin = child.stdin orelse return error.Closed;
         child.stdin = null;
-        defer stdin.close(io);
+        errdefer stdin.close(io);
         stdin.writeStreamingAll(io, req_wire) catch |write_err| {
             return mapIoErr(write_err);
         };
+        stdin.close(io);
 
         const stdout = child.stdout orelse return error.Closed;
         child.stdout = null;
@@ -118,12 +119,11 @@ pub const ProcChunk = struct {
     pub fn next(self: *ProcChunk) anyerror!?[]const u8 {
         if (self.done) return null;
 
-        var reader = self.stdout.readerStreaming(self.io, self.buf);
-        const chunk = reader.interface.take(self.buf.len) catch |read_err| switch (read_err) {
-            error.EndOfStream => &.{},
+        const n = self.stdout.readStreaming(self.io, &.{self.buf}) catch |read_err| switch (read_err) {
+            error.EndOfStream => 0,
             else => return mapIoErr(read_err),
         };
-        if (chunk.len != 0) return chunk;
+        if (n != 0) return self.buf[0..n];
 
         self.stdout.close(self.io);
 
@@ -168,9 +168,19 @@ fn killAndWait(io: std.Io, child: *std.process.Child) !void {
         var polls: u32 = 0;
         while (polls < 15) : (polls += 1) {
             const res = std.c.waitpid(pid, null, std.c.W.NOHANG);
-            if (res != 0) {
-                child.id = null;
-                return;
+            switch (std.posix.errno(res)) {
+                .SUCCESS => {
+                    if (res != 0) {
+                        child.id = null;
+                        return;
+                    }
+                },
+                .INTR => continue,
+                .CHILD => {
+                    child.id = null;
+                    return;
+                },
+                else => |err| return std.posix.unexpectedErrno(err),
             }
             // Use poll with empty fd set as a 10ms sleep replacement.
             _ = std.posix.poll(&.{}, 10) catch 0;

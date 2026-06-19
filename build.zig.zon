@@ -2,7 +2,7 @@
     .name = .pz,
     .version = "0.1.8",
     .fingerprint = 0xde36f32b1b6b5635, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.16.0-dev.3142+5ccfeb926",
     .dependencies = .{
         .ohsnap = .{
             .url = "https://github.com/mnemnion/ohsnap/archive/refs/tags/v0.5.2.tar.gz",

@@ -26,7 +26,7 @@ const resolveHome = auth_load.resolveHome;
 const saveOAuthForProviderWithHooks = auth_load.saveOAuthForProviderWithHooks;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 fn hasEnvVar(name: [*:0]const u8) bool {

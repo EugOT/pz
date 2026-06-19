@@ -267,7 +267,7 @@ const wait_poll_ms: u64 = 10;
 const term_grace_ms: u64 = 150;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 fn runChild(
@@ -1072,7 +1072,7 @@ test "bash handler denies file reads outside workspace inside sandbox" {
         \\out=1
         \\0=b-file-deny|0|stderr|false|cat: <repo>/README.md: Operation not permitted
         \\
-        \\final=failed|exec|bash exited non-zero|.{ 1 }
+        \\final=failed|exec|bash exited non-zero|1
         \\"
     ).expectEqual(snap);
 }
@@ -1129,7 +1129,7 @@ test "bash handler denies process exec outside workspace inside sandbox" {
         \\out=1
         \\0=b-proc-deny|0|stderr|false|/bin/bash: <repo>/.zig-cache/p30a-run.sh: Operation not permitted
         \\
-        \\final=failed|exec|bash exited non-zero|.{ 126 }
+        \\final=failed|exec|bash exited non-zero|126
         \\"
     ).expectEqual(snap);
 }
@@ -1213,7 +1213,7 @@ test "bash handler denies network connects inside sandbox" {
         \\start=0
         \\end=0
         \\out=0
-        \\final=failed|exec|bash exited non-zero|.{ 1 }
+        \\final=failed|exec|bash exited non-zero|1
         \\"
     ).expectEqual(snap);
 }
@@ -1340,11 +1340,7 @@ test "bash handler cancels running child and reaps TERM-resistant process" {
                     error.ProcessNotFound => return,
                     else => return kill_err,
                 };
-                std.Io.sleep(
-                    std.Io.Threaded.global_single_threaded.io(),
-                    .fromMilliseconds(10),
-                    .awake,
-                ) catch return error.TestUnexpectedResult;
+                std.Io.sleep(defaultIo(), .fromMilliseconds(10), .awake) catch return error.TestUnexpectedResult;
             }
             return error.TestUnexpectedResult;
         }
@@ -1358,8 +1354,8 @@ test "bash handler cancels running child and reaps TERM-resistant process" {
         const SinkBind = tools.Sink.Bind(@This(), push);
 
         fn push(self: *@This(), ev: tools.Event) !void {
-            self.mu.lockUncancelable(std.testing.io);
-            defer self.mu.unlock(std.testing.io);
+            self.mu.lockUncancelable(defaultIo());
+            defer self.mu.unlock(defaultIo());
             switch (ev) {
                 .output => {
                     self.saw_out = true;
@@ -1420,11 +1416,14 @@ test "bash handler cancels running child and reaps TERM-resistant process" {
     };
 
     const thr = try std.Thread.spawn(.{}, RunCtx.run, .{&ctx});
-    std.Io.sleep(
-        std.Io.Threaded.global_single_threaded.io(),
-        .fromMilliseconds(20),
-        .awake,
-    ) catch return error.TestUnexpectedResult;
+    var ready_polls: usize = 0;
+    while (ready_polls < 50) : (ready_polls += 1) {
+        sink_impl.mu.lockUncancelable(defaultIo());
+        const ready = sink_impl.saw_out;
+        sink_impl.mu.unlock(defaultIo());
+        if (ready) break;
+        std.Io.sleep(defaultIo(), .fromMilliseconds(10), .awake) catch return error.TestUnexpectedResult;
+    }
     cancel_impl.canceled.store(true, .release);
     thr.join();
 
@@ -1432,10 +1431,10 @@ test "bash handler cancels running child and reaps TERM-resistant process" {
     const res = ctx.res orelse return error.TestUnexpectedResult;
     defer handler.deinitResult(res);
 
-    sink_impl.mu.lockUncancelable(std.testing.io);
+    sink_impl.mu.lockUncancelable(defaultIo());
     const saw_out = sink_impl.saw_out;
     const out_before_done = sink_impl.out_before_done;
-    sink_impl.mu.unlock(std.testing.io);
+    sink_impl.mu.unlock(defaultIo());
 
     try std.testing.expectEqual(@as(usize, 1), res.out.len);
     const bg_pid = try std.fmt.parseInt(std.posix.pid_t, res.out[0].chunk, 10);

@@ -8,7 +8,7 @@ const http_mock = @import("../../test/http_mock.zig");
 const NetAddress = std.Io.net.IpAddress;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 fn fdWrite(fd: std.posix.fd_t, bytes: []const u8) !usize {

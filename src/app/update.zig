@@ -34,6 +34,10 @@ const update_policy_tool = "upgrade";
 const update_pk_hex = "2d6f7455d97b4a3a10d7293909d1a4f2058cb9a370e43fa8154bb280db839083";
 const dev_pk_hex = update_pk_hex;
 
+fn defaultIo() std.Io {
+    return @import("../core/rt_io.zig").default();
+}
+
 const HeaderMode = enum {
     full,
     wgetish,
@@ -2357,7 +2361,7 @@ test "UX10: initClient with ca_file loads bundle and disables rescan" {
     const cert_path = try app_tls.writeTestCert(tmp.dir, "ca.pem");
     defer std.testing.allocator.free(cert_path);
 
-    var http = try app_tls.initClient(std.testing.allocator, std.testing.io, cert_path);
+    var http = try app_tls.initClient(std.testing.allocator, defaultIo(), cert_path);
     defer http.deinit();
 
     // CA bundle loaded

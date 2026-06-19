@@ -6,7 +6,7 @@ const Dir = std.Io.Dir;
 const jsonl_ext = ".jsonl";
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 pub const Plan = struct {

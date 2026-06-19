@@ -9,3 +9,5 @@ PLAN.md
 **/*_TTrace*
 **/*.st
 **/.lake/
+.zig-global-cache/
+.agents/

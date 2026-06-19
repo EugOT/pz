@@ -4,6 +4,10 @@ const core_tls = @import("../core/tls.zig");
 
 const fixtures = @import("../test/fixtures.zig");
 
+fn defaultIo() std.Io {
+    return @import("../core/rt_io.zig").default();
+}
+
 pub fn loadCaFileAlloc(alloc: std.mem.Allocator, ca_file: ?[]const u8) !?[]u8 {
     if (ca_file) |path| return try alloc.dupe(u8, path);
     return null;
@@ -24,7 +28,7 @@ pub fn applyCaFile(client: *std.http.Client, alloc: std.mem.Allocator, ca_file: 
     try core_tls.applyCaFile(client, alloc, ca_file);
 }
 
-pub fn writeTestCert(dir: std.Io.Dir, name: []const u8) ![]u8 {
+pub fn writeTestCert(dir: std.Io.Dir, name: []const u8) ![:0]u8 {
     return fixtures.writeCert(dir, name);
 }
 
@@ -47,7 +51,7 @@ test "initClient loads custom ca bundle and disables rescan" {
     const cert_path = try writeTestCert(tmp.dir, "ca.pem");
     defer std.testing.allocator.free(cert_path);
 
-    var http = try initClient(std.testing.allocator, std.testing.io, cert_path);
+    var http = try initClient(std.testing.allocator, defaultIo(), cert_path);
     defer http.deinit();
 
     try std.testing.expect(http.ca_bundle.map.size != 0);
@@ -62,13 +66,13 @@ test "initClient fails closed on invalid custom ca bundle" {
     const bad_path = try tmp.dir.realPathFileAlloc(std.testing.io, "bad.pem", std.testing.allocator);
     defer std.testing.allocator.free(bad_path);
 
-    try std.testing.expectError(error.MissingEndCertificateMarker, initClient(std.testing.allocator, std.testing.io, bad_path));
+    try std.testing.expectError(error.MissingEndCertificateMarker, initClient(std.testing.allocator, defaultIo(), bad_path));
 }
 
 test "initClient preloads default ca bundle and disables rescan" {
     if (std.http.Client.disable_tls) return error.SkipZigTest;
 
-    var http = try initClient(std.testing.allocator, std.testing.io, null);
+    var http = try initClient(std.testing.allocator, defaultIo(), null);
     defer http.deinit();
 
     try std.testing.expect(http.ca_bundle.map.size != 0);

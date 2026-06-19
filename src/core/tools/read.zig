@@ -8,7 +8,7 @@ const noop = @import("../../test/noop_sink.zig");
 const Acc = shared.Acc;
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("../rt_io.zig").default();
 }
 
 pub const Err = error{
@@ -86,8 +86,9 @@ fn readSelected(self: Handler, path: []const u8, from_line: u32, to_line: ?u32) 
 
     var scratch: [4096]u8 = undefined;
     while (true) {
-        const n = file.readStreaming(defaultIo(), &.{scratch[0..]}) catch |read_err| {
-            return shared.mapFsErr(read_err);
+        const n = file.readStreaming(defaultIo(), &.{scratch[0..]}) catch |read_err| switch (read_err) {
+            error.EndOfStream => 0,
+            else => return shared.mapFsErr(read_err),
         };
         if (n == 0) break;
 

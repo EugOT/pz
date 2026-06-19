@@ -11,7 +11,7 @@ pub const dir_mode: File.Permissions = .fromMode(0o700);
 pub const file_mode: File.Permissions = .fromMode(0o600);
 
 fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return @import("rt_io.zig").default();
 }
 
 fn fileFromFd(fd: posix.fd_t) File {
@@ -34,8 +34,11 @@ pub fn ensureDirPath(path: []const u8) !void {
     const active_io = defaultIo();
     if (std.fs.path.isAbsolute(path)) {
         if (builtin.os.tag == .windows) return error.Unsupported;
-        try Dir.cwd().createDirPath(active_io, std.mem.trimStart(u8, path, "/"));
-        var dir = try Dir.openDirAbsolute(active_io, path, .{ .iterate = true });
+        const rel = std.mem.trimStart(u8, path, "/");
+        var root = try Dir.openDirAbsolute(active_io, "/", .{});
+        defer root.close(active_io);
+        try root.createDirPath(active_io, rel);
+        var dir = try root.openDir(active_io, rel, .{ .iterate = true });
         defer dir.close(active_io);
         try dir.setPermissions(active_io, dir_mode);
     } else {
@@ -100,7 +103,6 @@ pub fn createConfined(dir: Dir, name: []const u8, flags: Dir.CreateFileOptions) 
         .ACCMODE = if (flags.read) .RDWR else .WRONLY,
         .CREAT = true,
         .EXCL = flags.exclusive,
-        .TRUNC = flags.truncate,
         .NOFOLLOW = true,
     };
     if (@hasField(posix.O, "CLOEXEC")) os_flags.CLOEXEC = true;
@@ -111,6 +113,12 @@ pub fn createConfined(dir: Dir, name: []const u8, flags: Dir.CreateFileOptions) 
     // Skip hardlink check for newly created exclusive files (nlink is 1
     // by definition and fstat is redundant).
     if (!flags.exclusive) try rejectBadFile(active_io, file);
+    if (flags.truncate) {
+        switch (posix.errno(std.c.ftruncate(file.handle, 0))) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
 
     return file;
 }
@@ -337,6 +345,24 @@ test "openConfined rejects hardlinks" {
     tmp.dir.hardLink("orig.txt", tmp.dir, "hard.txt", std.testing.io, .{}) catch return;
     try std.testing.expectError(error.AccessDenied, openConfined(tmp.dir, "hard.txt", .{}));
     try std.testing.expectError(error.AccessDenied, openConfined(tmp.dir, "orig.txt", .{}));
+}
+
+test "createConfined rejects hardlinks before truncating" {
+    if (builtin.os.tag == .windows) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var f = try tmp.dir.createFile(std.testing.io, "orig.txt", .{});
+    try f.writeStreamingAll(std.testing.io, "data");
+    f.close(std.testing.io);
+
+    tmp.dir.hardLink("orig.txt", tmp.dir, "hard.txt", std.testing.io, .{}) catch return;
+    try std.testing.expectError(error.AccessDenied, createConfined(tmp.dir, "hard.txt", .{ .truncate = true }));
+
+    const content = try tmp.dir.readFileAlloc(std.testing.io, "orig.txt", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("data", content);
 }
 
 test "atomicWriteAt creates file atomically" {

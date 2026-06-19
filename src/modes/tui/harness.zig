@@ -236,6 +236,7 @@ pub const Ui = struct {
         } else {
             try out.writeAll("\x1b[?25l"); // hide cursor
         }
+        try out.flush();
     }
 
     pub fn editorText(self: *const Ui) []const u8 {
