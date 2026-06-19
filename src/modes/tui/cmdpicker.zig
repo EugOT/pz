@@ -1,17 +1,143 @@
 //! Slash-command picker with prefix and fuzzy matching.
+//!
+//! Built-in commands (`cmds`) are mixed with custom slash commands discovered
+//! from `~/.pz/commands/*/COMMAND.md`. Discovery mirrors the skill-discovery
+//! safety pattern (directory-name guard, frontmatter parse, size limits).
 
 const std = @import("std");
 const frame_mod = @import("frame.zig");
 const theme_mod = @import("theme.zig");
 const fuzzy_mod = @import("fuzzy.zig");
+const skill_mod = @import("../../core/skill.zig");
 
 const Frame = frame_mod.Frame;
 const Style = frame_mod.Style;
+
+fn defaultIo() std.Io {
+    return @import("../../core/rt_io.zig").default();
+}
 
 pub const Cmd = struct {
     name: []const u8,
     desc: []const u8,
 };
+
+/// A custom slash command discovered from `~/.pz/commands/<name>/COMMAND.md`.
+/// `body` is the markdown after the frontmatter — the prompt the handler
+/// dispatches when the command is selected.
+pub const CustomCmd = struct {
+    name: []const u8,
+    desc: []const u8,
+    body: []const u8,
+};
+
+const max_custom_file: usize = 64 * 1024;
+
+/// Owns the discovered custom commands. Builtins are static and live in `cmds`.
+pub const Set = struct {
+    custom: []const CustomCmd = &.{},
+
+    pub const empty = Set{ .custom = &.{} };
+
+    pub fn deinit(self: *Set, alloc: std.mem.Allocator) void {
+        freeCustom(alloc, self.custom);
+        self.* = .{ .custom = &.{} };
+    }
+
+    /// Look up a custom command by its name (the directory name).
+    pub fn findCustom(self: *const Set, name: []const u8) ?*const CustomCmd {
+        for (self.custom) |*c| {
+            if (std.mem.eql(u8, c.name, name)) return c;
+        }
+        return null;
+    }
+};
+
+/// Discover custom slash commands from `~/.pz/commands/*/COMMAND.md`. Returns an
+/// owned `Set`. Missing/inaccessible directory yields an empty set (not an
+/// error); only allocation failure propagates.
+pub fn discoverCustom(alloc: std.mem.Allocator, home: ?[]const u8) std.mem.Allocator.Error!Set {
+    var list = std.ArrayList(CustomCmd).empty;
+    errdefer {
+        for (list.items) |c| freeOne(alloc, c);
+        list.deinit(alloc);
+    }
+
+    const h = home orelse return Set{ .custom = try list.toOwnedSlice(alloc) };
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = std.fmt.bufPrint(&path_buf, "{s}/.pz/commands", .{h}) catch
+        return Set{ .custom = try list.toOwnedSlice(alloc) };
+
+    const active_io = defaultIo();
+    var dir = std.Io.Dir.openDirAbsolute(active_io, base, .{ .iterate = true }) catch
+        return Set{ .custom = try list.toOwnedSlice(alloc) }; // dir not found/inaccessible
+    defer dir.close(active_io);
+
+    var iter = dir.iterate();
+    while (iter.next(active_io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!skill_mod.isValidDirName(entry.name)) continue; // path guard (mirror skill.zig)
+
+        var sub = dir.openDir(active_io, entry.name, .{}) catch continue;
+        defer sub.close(active_io);
+        const cmd_file = sub.openFile(active_io, "COMMAND.md", .{}) catch continue;
+        defer cmd_file.close(active_io);
+
+        var file_buf: [4096]u8 = undefined;
+        var reader = cmd_file.readerStreaming(active_io, &file_buf);
+        const content = reader.interface.allocRemaining(alloc, .limited(max_custom_file)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue, // I/O read failed
+        };
+        defer alloc.free(content);
+
+        if (!std.unicode.utf8ValidateSlice(content)) continue;
+
+        const cmd = try parseCommand(alloc, entry.name, content);
+        errdefer freeOne(alloc, cmd);
+        try list.append(alloc, cmd);
+    }
+
+    return Set{ .custom = try list.toOwnedSlice(alloc) };
+}
+
+/// Build a `CustomCmd` from a directory name and file content. Reuses the
+/// shared frontmatter parser; falls back to the whole file as body when there
+/// is no frontmatter. `name` is always the directory name (so selection can
+/// dispatch by dir name).
+///
+/// Ownership: a non-empty `desc`/`body` is heap-owned and freed by `freeOne`;
+/// an empty `desc` is the non-allocated `""` literal (matching the shared
+/// parser's convention), so `freeOne` only frees lengths > 0.
+fn parseCommand(alloc: std.mem.Allocator, dir_name: []const u8, content: []const u8) std.mem.Allocator.Error!CustomCmd {
+    const name = try alloc.dupe(u8, dir_name);
+    errdefer alloc.free(name);
+
+    if (skill_mod.parseFrontmatter(alloc, content) catch null) |fm| {
+        // The shared parser allocates name/description/body. We keep
+        // description + body and free the name (we use the directory name).
+        if (fm.meta.name.len > 0) alloc.free(fm.meta.name);
+        // description: "" literal when absent (not allocated), heap when present.
+        // body: always heap-allocated by the shared parser.
+        return .{ .name = name, .desc = fm.meta.description, .body = fm.meta.body };
+    }
+
+    // No frontmatter: body is the whole file, no description.
+    const body = try alloc.dupe(u8, content);
+    return .{ .name = name, .desc = "", .body = body };
+}
+
+fn freeOne(alloc: std.mem.Allocator, c: CustomCmd) void {
+    alloc.free(c.name);
+    if (c.desc.len > 0) alloc.free(c.desc);
+    if (c.body.len > 0) alloc.free(c.body);
+}
+
+fn freeCustom(alloc: std.mem.Allocator, custom: []const CustomCmd) void {
+    for (custom) |c| freeOne(alloc, c);
+    if (custom.len > 0) alloc.free(custom);
+}
 
 pub const cmds = [_]Cmd{
     .{ .name = "changelog", .desc = "What's new" },
@@ -56,6 +182,9 @@ pub const Picker = struct {
     sel: u8 = 0,
     scroll: u8 = 0,
     arg_src: ?[]const []const u8 = null, // non-null = arg mode
+    /// Custom commands available for matching. Match indices >= `cmds.len`
+    /// address `custom[idx - cmds.len]`; indices < `cmds.len` are builtins.
+    custom: ?[]const CustomCmd = null,
 
     pub fn update(prefix: []const u8) ?Picker {
         var cp = Picker{ .matches = undefined, .n = 0 };
@@ -80,6 +209,72 @@ pub const Picker = struct {
         }
         if (cp.n == 0) return null;
         // Sort by score (lower = better) using insertion sort
+        var j: u8 = 1;
+        while (j < cp.n) : (j += 1) {
+            const key_score = scores[j];
+            const key_match = cp.matches[j];
+            var k: u8 = j;
+            while (k > 0 and scores[k - 1] > key_score) : (k -= 1) {
+                scores[k] = scores[k - 1];
+                cp.matches[k] = cp.matches[k - 1];
+            }
+            scores[k] = key_score;
+            cp.matches[k] = key_match;
+        }
+        return cp;
+    }
+
+    /// Like `update`, but also matches custom commands from `set`. Builtins and
+    /// custom commands share one match list (builtins first, then custom).
+    /// Prefix matches win; if none, both pools fall back to fuzzy together.
+    pub fn updateSet(set: *const Set, prefix: []const u8) ?Picker {
+        if (set.custom.len == 0) {
+            // No custom commands: identical behavior to update().
+            var cp = update(prefix) orelse return null;
+            cp.custom = set.custom;
+            return cp;
+        }
+        // Total index space must fit in u8 (offset scheme). Cap defensively.
+        std.debug.assert(cmds.len + set.custom.len <= std.math.maxInt(u8));
+
+        var cp = Picker{ .matches = undefined, .n = 0, .custom = set.custom };
+
+        // Prefix matching across builtins, then custom.
+        for (cmds, 0..) |cmd, i| {
+            if (cp.n >= max_match) break;
+            if (prefix.len <= cmd.name.len and std.mem.startsWith(u8, cmd.name, prefix)) {
+                cp.matches[cp.n] = @intCast(i);
+                cp.n += 1;
+            }
+        }
+        for (set.custom, 0..) |cmd, i| {
+            if (cp.n >= max_match) break;
+            if (prefix.len <= cmd.name.len and std.mem.startsWith(u8, cmd.name, prefix)) {
+                cp.matches[cp.n] = @intCast(cmds.len + i);
+                cp.n += 1;
+            }
+        }
+        if (cp.n > 0) return cp;
+
+        // Fuzzy fallback across the combined pool, sorted by score.
+        var scores: [max_match]i32 = undefined;
+        for (cmds, 0..) |cmd, i| {
+            if (cp.n >= max_match) break;
+            if (fuzzy_mod.score(prefix, cmd.name)) |s| {
+                scores[cp.n] = s;
+                cp.matches[cp.n] = @intCast(i);
+                cp.n += 1;
+            }
+        }
+        for (set.custom, 0..) |cmd, i| {
+            if (cp.n >= max_match) break;
+            if (fuzzy_mod.score(prefix, cmd.name)) |s| {
+                scores[cp.n] = s;
+                cp.matches[cp.n] = @intCast(cmds.len + i);
+                cp.n += 1;
+            }
+        }
+        if (cp.n == 0) return null;
         var j: u8 = 1;
         while (j < cp.n) : (j += 1) {
             const key_score = scores[j];
@@ -154,8 +349,44 @@ pub const Picker = struct {
         }
     }
 
+    /// Resolve a match-list slot to a displayable `Cmd` (name + desc),
+    /// transparently spanning builtins and custom commands.
+    fn cmdAt(self: *const Picker, slot: usize) Cmd {
+        const idx = self.matches[slot];
+        if (idx < cmds.len) return cmds[idx];
+        const custom = self.custom orelse return cmds[0]; // unreachable in practice
+        const ci = @as(usize, idx) - cmds.len;
+        if (ci >= custom.len) return cmds[0];
+        return .{ .name = custom[ci].name, .desc = custom[ci].desc };
+    }
+
+    /// Resolved display name for match slot `slot` (builtin or custom). Slot
+    /// must be `< n`.
+    pub fn nameAt(self: *const Picker, slot: usize) []const u8 {
+        return self.cmdAt(slot).name;
+    }
+
+    /// True if the currently selected match is a custom command.
+    pub fn selectedIsCustom(self: *const Picker) bool {
+        if (self.sel >= self.n) return false;
+        return self.matches[self.sel] >= cmds.len;
+    }
+
+    /// Return the selected custom command, or null if a builtin (or arg mode)
+    /// is selected. The returned pointer is borrowed from the owning `Set`.
+    pub fn selectedCustom(self: *const Picker) ?*const CustomCmd {
+        if (self.arg_src != null) return null;
+        if (self.sel >= self.n) return null;
+        const idx = self.matches[self.sel];
+        if (idx < cmds.len) return null;
+        const custom = self.custom orelse return null;
+        const ci = @as(usize, idx) - cmds.len;
+        if (ci >= custom.len) return null;
+        return &custom[ci];
+    }
+
     pub fn selected(self: *const Picker) Cmd {
-        return cmds[self.matches[self.sel]];
+        return self.cmdAt(self.sel);
     }
 
     /// Return the selected arg text (arg mode only).
@@ -219,8 +450,8 @@ pub const Picker = struct {
                     }
                 }
             } else {
-                // Cmd mode: "/name" + description
-                const cmd = cmds[self.matches[idx]];
+                // Cmd mode: "/name" + description (builtin or custom)
+                const cmd = self.cmdAt(idx);
                 if (x < w) {
                     try frm.set(x, y, '/', name_st);
                     x += 1;
@@ -269,7 +500,7 @@ fn snapAlloc(alloc: std.mem.Allocator, cp: Picker) ![]u8 {
     try buf.print(alloc, "n={} sel={} scroll={}", .{ cp.n, cp.sel, cp.scroll });
     var i: usize = 0;
     while (i < cp.n) : (i += 1) {
-        const name = if (cp.arg_src) |items| items[cp.matches[i]] else cmds[cp.matches[i]].name;
+        const name = if (cp.arg_src) |items| items[cp.matches[i]] else cp.cmdAt(i).name;
         try buf.print(alloc, "\n[{d}] {s}", .{ i, name });
     }
     return buf.toOwnedSlice(alloc);
@@ -643,6 +874,156 @@ test "updateArgs empty prefix returns all" {
 test "updateArgs no match returns null" {
     const items = [_][]const u8{ "anthropic", "openai", "google" };
     try std.testing.expect(Picker.updateArgs(&items, "zzz") == null);
+}
+
+test "discoverCustom: reads COMMAND.md with frontmatter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, ".pz/commands/deploy");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".pz/commands/deploy/COMMAND.md",
+        .data =
+        \\---
+        \\name: deploy
+        \\description: Ship the build
+        \\---
+        \\Run the deploy playbook.
+        ,
+    });
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    var set = try discoverCustom(std.testing.allocator, home);
+    defer set.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), set.custom.len);
+    try std.testing.expectEqualStrings("deploy", set.custom[0].name);
+    try std.testing.expectEqualStrings("Ship the build", set.custom[0].desc);
+    try std.testing.expectEqualStrings("Run the deploy playbook.", set.custom[0].body);
+}
+
+test "discoverCustom: no frontmatter uses whole file as body" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, ".pz/commands/plain");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".pz/commands/plain/COMMAND.md",
+        .data = "just a prompt body",
+    });
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    var set = try discoverCustom(std.testing.allocator, home);
+    defer set.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), set.custom.len);
+    try std.testing.expectEqualStrings("plain", set.custom[0].name);
+    try std.testing.expectEqualStrings("", set.custom[0].desc);
+    try std.testing.expectEqualStrings("just a prompt body", set.custom[0].body);
+}
+
+test "discoverCustom: missing dir yields empty set" {
+    var set = try discoverCustom(std.testing.allocator, "/nonexistent-pz-home-abc");
+    defer set.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), set.custom.len);
+}
+
+test "discoverCustom: null home yields empty set" {
+    var set = try discoverCustom(std.testing.allocator, null);
+    defer set.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), set.custom.len);
+}
+
+test "discoverCustom: skips entries without COMMAND.md" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, ".pz/commands/empty");
+    try tmp.dir.createDirPath(std.testing.io, ".pz/commands/good");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".pz/commands/good/COMMAND.md",
+        .data = "body",
+    });
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    var set = try discoverCustom(std.testing.allocator, home);
+    defer set.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), set.custom.len);
+    try std.testing.expectEqualStrings("good", set.custom[0].name);
+}
+
+test "updateSet: mixes custom with builtins on prefix" {
+    const custom = [_]CustomCmd{
+        .{ .name = "compose", .desc = "compose stack", .body = "B1" },
+    };
+    var set = Set{ .custom = &custom };
+
+    // Prefix "co" matches builtins compact/copy/cost AND custom "compose".
+    const cp = Picker.updateSet(&set, "co").?;
+    const snap = try snapAlloc(std.testing.allocator, cp);
+    defer std.testing.allocator.free(snap);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "compose") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "compact") != null);
+}
+
+test "updateSet: selecting a custom command resolves it" {
+    const custom = [_]CustomCmd{
+        .{ .name = "zzdeploy", .desc = "deploy", .body = "playbook body" },
+    };
+    var set = Set{ .custom = &custom };
+
+    // Unique prefix so the custom command is the sole match (sel=0).
+    var cp = Picker.updateSet(&set, "zz").?;
+    try std.testing.expectEqual(@as(u8, 1), cp.n);
+    try std.testing.expect(cp.selectedIsCustom());
+    const sc = cp.selectedCustom() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("zzdeploy", sc.name);
+    try std.testing.expectEqualStrings("playbook body", sc.body);
+    // selected() also resolves name/desc for rendering.
+    try std.testing.expectEqualStrings("zzdeploy", cp.selected().name);
+}
+
+test "updateSet: builtin selection is not custom" {
+    var set = Set.empty;
+    var cp = Picker.updateSet(&set, "help").?;
+    try std.testing.expect(!cp.selectedIsCustom());
+    try std.testing.expect(cp.selectedCustom() == null);
+    try std.testing.expectEqualStrings("help", cp.selected().name);
+}
+
+test "updateSet: empty set matches builtins identically to update" {
+    var set = Set.empty;
+    const a = Picker.updateSet(&set, "ex").?;
+    const b = Picker.update("ex").?;
+    try std.testing.expectEqual(b.n, a.n);
+    const sa = try snapAlloc(std.testing.allocator, a);
+    defer std.testing.allocator.free(sa);
+    const sb = try snapAlloc(std.testing.allocator, b);
+    defer std.testing.allocator.free(sb);
+    try std.testing.expectEqualStrings(sb, sa);
+}
+
+test "updateSet: fuzzy fallback spans custom commands" {
+    const custom = [_]CustomCmd{
+        .{ .name = "xylophone", .desc = "", .body = "B" },
+    };
+    var set = Set{ .custom = &custom };
+    // "xlp" is not a prefix of anything but fuzzy-matches "xylophone".
+    const cp = Picker.updateSet(&set, "xlp").?;
+    try std.testing.expect(cp.n > 0);
+    var found = false;
+    var i: usize = 0;
+    while (i < cp.n) : (i += 1) {
+        if (std.mem.eql(u8, cp.cmdAt(i).name, "xylophone")) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "updateArgs renders without slash" {

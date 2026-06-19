@@ -25,6 +25,7 @@ pub const Ui = struct {
     border_fg: frame.Color = .{ .rgb = 0x81a2be },
     ov: ?overlay_mod.Overlay = null,
     picker: ?cmdpicker_mod.Picker = null,
+    cmd_set: cmdpicker_mod.Set = cmdpicker_mod.Set.empty, // discovered custom slash commands
     arg_src: ?[]const []const u8 = null, // runtime-provided arg completion source
     path_items: ?[][]u8 = null, // owned file path completion items
     path_prefix: ?[]u8 = null, // cached prefix for path_items
@@ -80,12 +81,27 @@ pub const Ui = struct {
     pub fn deinit(self: *Ui) void {
         if (self.ov) |*ov| ov.deinit(self.alloc);
         self.clearPathItems();
+        self.cmd_set.deinit(self.alloc);
         self.renderer.deinit();
         self.frm.deinit(self.alloc);
         self.panels.deinit();
         self.tr.deinit();
         self.ed.deinit();
         self.* = undefined;
+    }
+
+    /// Discover custom slash commands from `~/.pz/commands/*/COMMAND.md` and
+    /// install them into the picker's command set. Replaces any prior set.
+    pub fn loadCustomCommands(self: *Ui, home: ?[]const u8) !void {
+        var set = try cmdpicker_mod.discoverCustom(self.alloc, home);
+        errdefer set.deinit(self.alloc);
+        self.cmd_set.deinit(self.alloc);
+        self.cmd_set = set;
+    }
+
+    /// Look up a discovered custom command by name (its directory name).
+    pub fn customCommand(self: *const Ui, name: []const u8) ?*const cmdpicker_mod.CustomCmd {
+        return self.cmd_set.findCustom(name);
     }
 
     pub fn clearPathItems(self: *Ui) void {
@@ -282,7 +298,7 @@ pub const Ui = struct {
                     self.picker = cmdpicker_mod.Picker.updateArgs(src, arg);
                 }
             } else {
-                self.picker = cmdpicker_mod.Picker.update(prefix);
+                self.picker = cmdpicker_mod.Picker.updateSet(&self.cmd_set, prefix);
             }
         } else if (text.len > 0) {
             // Check for @ mention in last word
@@ -985,4 +1001,84 @@ test "lastWordStart finds word boundary" {
     try std.testing.expectEqual(@as(usize, 6), lastWordStart("hello @src/", 11));
     try std.testing.expectEqual(@as(usize, 0), lastWordStart("@src/", 5));
     try std.testing.expectEqual(@as(usize, 4), lastWordStart("foo @", 5));
+}
+
+test "loadCustomCommands populates picker with custom command" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".pz/commands/zdeploy");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".pz/commands/zdeploy/COMMAND.md",
+        .data =
+        \\---
+        \\description: ship it
+        \\---
+        \\Deploy now.
+        ,
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    var ui = try Ui.init(std.testing.allocator, 60, 12, "m", "p");
+    defer ui.deinit();
+
+    try ui.loadCustomCommands(home);
+    try std.testing.expectEqual(@as(usize, 1), ui.cmd_set.custom.len);
+
+    // Typing "/zd" should surface the custom command in the picker.
+    try ui.ed.setText("/zd");
+    try ui.updatePreview();
+    const pk = ui.picker orelse return error.TestUnexpectedResult;
+    try std.testing.expect(pk.selectedIsCustom());
+    const sc = pk.selectedCustom() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("zdeploy", sc.name);
+    try std.testing.expectEqualStrings("Deploy now.", sc.body);
+
+    // Lookup by name resolves the body for dispatch.
+    const found = ui.customCommand("zdeploy") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Deploy now.", found.body);
+}
+
+test "custom command mixes with builtins in picker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".pz/commands/comprehend");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".pz/commands/comprehend/COMMAND.md",
+        .data = "Comprehend the codebase.",
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    var ui = try Ui.init(std.testing.allocator, 60, 12, "m", "p");
+    defer ui.deinit();
+    try ui.loadCustomCommands(home);
+
+    // "co" prefix-matches builtins (compact/copy/cost) AND custom "comprehend".
+    try ui.ed.setText("/co");
+    try ui.updatePreview();
+    const pk = ui.picker orelse return error.TestUnexpectedResult;
+    var saw_builtin = false;
+    var saw_custom = false;
+    var i: usize = 0;
+    while (i < pk.n) : (i += 1) {
+        const name = pk.nameAt(i);
+        if (std.mem.eql(u8, name, "compact")) saw_builtin = true;
+        if (std.mem.eql(u8, name, "comprehend")) saw_custom = true;
+    }
+    try std.testing.expect(saw_builtin);
+    try std.testing.expect(saw_custom);
+}
+
+test "loadCustomCommands with missing home is empty and safe" {
+    var ui = try Ui.init(std.testing.allocator, 40, 8, "m", "p");
+    defer ui.deinit();
+    try ui.loadCustomCommands(null);
+    try std.testing.expectEqual(@as(usize, 0), ui.cmd_set.custom.len);
+
+    // Slash picker still works with only builtins.
+    try ui.ed.setText("/help");
+    try ui.updatePreview();
+    const pk = ui.picker orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!pk.selectedIsCustom());
 }
