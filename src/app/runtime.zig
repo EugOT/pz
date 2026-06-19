@@ -1353,6 +1353,10 @@ const JsonSink = struct {
             .tool => |payload| try self.emit("tool", payload),
             .session_write_err => |msg| try self.emit("session_write_err", msg),
             .agent_status => |as| try self.emit("agent_status", as),
+            .retry_attempt => |ra| try self.emit("retry_attempt", ra),
+            .overflow_detected => try self.emit("overflow_detected", {}),
+            .compaction_triggered => try self.emit("compaction_triggered", {}),
+            .stream_timeout => |st| try self.emit("stream_timeout", st),
         }
     }
 
