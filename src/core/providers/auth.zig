@@ -48,8 +48,34 @@ pub const AuthEntry = struct {
     key: ?[]const u8 = null,
 };
 
-pub const Provider = enum { anthropic, openai, google };
-pub const provider_names = [_][]const u8{ "anthropic", "openai", "google" };
+pub const Provider = enum {
+    anthropic,
+    openai,
+    google,
+    mistral,
+    groq,
+    deepseek,
+    openrouter,
+};
+
+/// Display/lookup names, indexed by `@intFromEnum(Provider)`. Order MUST match
+/// the `Provider` enum declaration order exactly.
+pub const provider_names = [_][]const u8{
+    "anthropic",
+    "openai",
+    "google",
+    "mistral",
+    "groq",
+    "deepseek",
+    "openrouter",
+};
+
+comptime {
+    // Fail the build if a Provider variant is added without a matching name.
+    if (provider_names.len != @typeInfo(Provider).@"enum".fields.len) {
+        @compileError("provider_names must cover every Provider variant");
+    }
+}
 
 pub fn providerName(p: Provider) []const u8 {
     return provider_names[@intFromEnum(p)];
@@ -141,6 +167,10 @@ pub const AuthFile = struct {
     anthropic: ?AuthEntry = null,
     openai: ?AuthEntry = null,
     google: ?AuthEntry = null,
+    mistral: ?AuthEntry = null,
+    groq: ?AuthEntry = null,
+    deepseek: ?AuthEntry = null,
+    openrouter: ?AuthEntry = null,
 };
 
 pub const OAuthLoginInfo = struct {
@@ -178,3 +208,100 @@ pub const openBrowser = oauth_flow.openBrowser;
 pub const refreshOAuth = oauth_flow.refreshOAuth;
 pub const refreshOAuthForProvider = oauth_flow.refreshOAuthForProvider;
 pub const refreshOAuthForProviderWithHooks = oauth_flow.refreshOAuthForProviderWithHooks;
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+/// Providers added in MP4 that authenticate with a static API key only and
+/// have no OAuth flow.
+const api_key_only_providers = [_]Provider{ .mistral, .groq, .deepseek, .openrouter };
+
+test "providerName covers every Provider variant" {
+    // Every enum value resolves to a name, and the name round-trips back to the
+    // same variant via std.meta.stringToEnum. Proves provider_names stays in
+    // lockstep with the enum (the comptime guard above enforces length parity).
+    inline for (@typeInfo(Provider).@"enum".fields) |field| {
+        const p: Provider = @field(Provider, field.name);
+        const name = providerName(p);
+        try testing.expectEqualStrings(field.name, name);
+        const back = std.meta.stringToEnum(Provider, name) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(p, back);
+    }
+
+    // The MP4 additions are present and distinctly named.
+    try testing.expectEqualStrings("mistral", providerName(.mistral));
+    try testing.expectEqualStrings("groq", providerName(.groq));
+    try testing.expectEqualStrings("deepseek", providerName(.deepseek));
+    try testing.expectEqualStrings("openrouter", providerName(.openrouter));
+}
+
+test "api-key-only providers are not OAuth capable" {
+    // None of the new providers expose an OAuth spec, so the login path treats
+    // their credentials as API keys instead of starting an OAuth flow.
+    for (api_key_only_providers) |p| {
+        try testing.expect(!oauthCapable(p));
+        // looksLikeApiKey has no prefix to match, so any non-empty value counts
+        // as a key (and an empty value does not).
+        try testing.expect(looksLikeApiKey(p, "secret-token"));
+        try testing.expect(!looksLikeApiKey(p, ""));
+    }
+}
+
+test "api-key entry loads from disk for an api-key-only provider" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+
+    try auth_load.saveAuthEntry(testing.allocator, home, .openrouter, .{
+        .type = "api_key",
+        .key = "sk-or-test",
+    });
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try auth_load.loadFileAuthForProvider(arena.allocator(), home, .openrouter);
+    try testing.expect(loaded == .api_key);
+    try testing.expectEqualStrings("sk-or-test", loaded.api_key);
+}
+
+test "loadForProviderWithHooks resolves api key without attempting OAuth" {
+    // Drive the full resolution entry point (the same one runtime uses). With a
+    // home override and no env credentials, an api-key-only provider must
+    // resolve straight to its stored key — never the OAuth branch.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+
+    try auth_load.saveAuthEntry(testing.allocator, home, .mistral, .{
+        .type = "api_key",
+        .key = "ml-key-123",
+    });
+
+    // Sentinel hooks: if resolution ever touched the OAuth exchange/refresh
+    // paths it would invoke these and fail the test.
+    const Guard = struct {
+        fn home_fn(alloc: std.mem.Allocator, _: []const u8) anyerror![]u8 {
+            return alloc.dupe(u8, "");
+        }
+        fn exchange(_: std.mem.Allocator, _: *const OAuthSpec, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: Hooks) anyerror!OAuth {
+            return error.OAuthShouldNotRun;
+        }
+        fn refresh(_: std.mem.Allocator, _: Provider, _: OAuth, _: Hooks) anyerror!OAuth {
+            return error.OAuthShouldNotRun;
+        }
+    };
+
+    var result = try loadForProviderWithHooks(testing.allocator, .mistral, .{
+        .home_override = home,
+        .get_home = Guard.home_fn,
+        .exchange_code = Guard.exchange,
+        .refresh_fetch = Guard.refresh,
+    });
+    defer result.deinit();
+
+    try testing.expect(result.auth == .api_key);
+    try testing.expectEqualStrings("ml-key-123", result.auth.api_key);
+}
