@@ -19,6 +19,8 @@ pub const TestBuf = struct {
         self.len += bytes.len;
     }
 
+    pub fn flush(_: *TestBuf) !void {}
+
     pub fn view(self: *const TestBuf) []const u8 {
         return self.buf[0..self.len];
     }

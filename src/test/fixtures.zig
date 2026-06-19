@@ -25,15 +25,15 @@ pub const test_ca_pem =
 ;
 
 /// Write test CA PEM to a dir and return the absolute path (caller frees).
-pub fn writeCert(dir: std.fs.Dir, name: []const u8) ![]u8 {
-    try dir.writeFile(.{ .sub_path = name, .data = test_ca_pem });
-    return try dir.realpathAlloc(std.testing.allocator, name);
+pub fn writeCert(dir: std.Io.Dir, name: []const u8) ![:0]u8 {
+    try dir.writeFile(std.testing.io, .{ .sub_path = name, .data = test_ca_pem });
+    return try dir.realPathFileAlloc(std.testing.io, name, std.testing.allocator);
 }
 
 /// Write a .pz/settings.json with ca_file pointing to the given path.
 pub fn writeCfg(tmp: std.testing.TmpDir, ca_path: []const u8) !void {
-    try tmp.dir.makePath(".pz");
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
     const raw = try std.fmt.allocPrint(std.testing.allocator, "{{\"ca_file\":\"{s}\"}}", .{ca_path});
     defer std.testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = ".pz/settings.json", .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".pz/settings.json", .data = raw });
 }

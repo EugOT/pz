@@ -2,6 +2,10 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
+fn defaultIo() std.Io {
+    return @import("rt_io.zig").default();
+}
+
 pub const Err = error{
     Denied,
     NotFound,
@@ -36,13 +40,14 @@ pub const BashPlan = struct {
 
 pub fn prepareBash(
     alloc: std.mem.Allocator,
-    env: *const std.process.EnvMap,
+    env: *const std.process.Environ.Map,
     raw_cwd: ?[]const u8,
     cmd: []const u8,
 ) Err!BashPlan {
     if (builtin.os.tag != .macos) @compileError("bash sandbox requires macOS");
 
-    const root = std.fs.cwd().realpathAlloc(alloc, ".") catch |err| return mapFsErr(err);
+    const active_io = defaultIo();
+    const root = std.Io.Dir.cwd().realPathFileAlloc(active_io, ".", alloc) catch |err| return mapFsErr(err);
     defer alloc.free(root);
 
     var cwd: ?[]const u8 = try alloc.dupe(u8, root);
@@ -80,15 +85,16 @@ pub fn prepareBash(
 }
 
 fn resolveCwd(alloc: std.mem.Allocator, root: []const u8, path: []const u8) Err![]const u8 {
-    const resolved = std.fs.cwd().realpathAlloc(alloc, path) catch |err| return mapFsErr(err);
-    errdefer alloc.free(resolved);
+    const active_io = defaultIo();
+    const resolved = std.Io.Dir.cwd().realPathFileAlloc(active_io, path, alloc) catch |err| return mapFsErr(err);
+    defer alloc.free(resolved);
     if (!isWithin(root, resolved)) return error.Denied;
-    return resolved;
+    return alloc.dupe(u8, resolved) catch error.OutOfMemory;
 }
 
 fn collectExecRoots(
     alloc: std.mem.Allocator,
-    env: *const std.process.EnvMap,
+    env: *const std.process.Environ.Map,
     root: []const u8,
 ) Err![][]u8 {
     var roots = std.ArrayList([]u8).empty;
@@ -114,7 +120,8 @@ fn collectExecRoots(
 }
 
 fn pushPathRoot(alloc: std.mem.Allocator, roots: *std.ArrayList([]u8), path: []const u8) Err!void {
-    const abs = std.fs.cwd().realpathAlloc(alloc, path) catch |err| switch (err) {
+    const active_io = defaultIo();
+    const abs = std.Io.Dir.cwd().realPathFileAlloc(active_io, path, alloc) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.AccessDenied, error.PermissionDenied => return,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Io,
@@ -126,7 +133,8 @@ fn pushPathRoot(alloc: std.mem.Allocator, roots: *std.ArrayList([]u8), path: []c
 }
 
 fn pushRealOrRawRoot(alloc: std.mem.Allocator, roots: *std.ArrayList([]u8), path: []const u8) Err!void {
-    const abs = std.fs.cwd().realpathAlloc(alloc, path) catch |err| switch (err) {
+    const active_io = defaultIo();
+    const abs = std.Io.Dir.cwd().realPathFileAlloc(active_io, path, alloc) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.AccessDenied, error.PermissionDenied => {
             try pushRoot(alloc, roots, path);
             return;
@@ -161,11 +169,11 @@ fn buildBashProfile(
     exec_roots: []const []const u8,
     home: ?[]const u8,
 ) Err![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+    const w = &buf.writer;
 
-    try w.writeAll(
+    try profileWrite(w,
         \\(version 1)
         \\(deny default)
         \\(import "system.sb")
@@ -175,74 +183,90 @@ fn buildBashProfile(
         \\
     );
     if (home) |home_path| {
-        try w.writeAll(
+        try profileWrite(w,
             \\(deny file-read* file-write* process-exec*
             \\    (require-all
             \\
         );
-        try appendSubpath(&buf, alloc, home_path);
-        try w.writeAll(
+        try appendSubpath(w, home_path);
+        try profileWrite(w,
             \\        (require-not
             \\
         );
-        try appendSubpath(&buf, alloc, root);
-        try w.writeAll(
+        try appendSubpath(w, root);
+        try profileWrite(w,
             \\        )
             \\    )
             \\)
             \\
         );
     }
-    try w.writeAll(
+    try profileWrite(w,
         \\(allow file-read* file-write*
         \\
     );
-    try appendSubpath(&buf, alloc, root);
-    try w.writeAll(
+    try appendSubpath(w, root);
+    try profileWrite(w,
         \\)
         \\
         \\(allow file-read-metadata file-test-existence
         \\
     );
-    try appendPathAncestors(&buf, alloc, root);
-    try w.writeAll(
+    try appendPathAncestors(w, root);
+    try profileWrite(w,
         \\)
         \\
         \\(allow file-read* file-map-executable process-exec*
         \\
     );
     for (exec_roots) |path| {
-        try appendSubpath(&buf, alloc, path);
+        try appendSubpath(w, path);
     }
-    try w.writeAll(
+    try profileWrite(w,
         \\)
         \\
     );
-    return try buf.toOwnedSlice(alloc);
+    return try buf.toOwnedSlice();
 }
 
-fn appendSubpath(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, path: []const u8) Err!void {
-    try buf.writer(alloc).writeAll("    (subpath ");
-    try appendQuoted(buf, alloc, path);
-    try buf.writer(alloc).writeAll(")\n");
+fn profileWrite(w: *std.Io.Writer, bytes: []const u8) Err!void {
+    w.writeAll(bytes) catch |err| return mapWriteErr(err);
 }
 
-fn appendPathAncestors(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, path: []const u8) Err!void {
-    try buf.writer(alloc).writeAll("    (path-ancestors ");
-    try appendQuoted(buf, alloc, path);
-    try buf.writer(alloc).writeAll(")\n");
+fn profileWriteByte(w: *std.Io.Writer, byte: u8) Err!void {
+    const bytes = [_]u8{byte};
+    try profileWrite(w, &bytes);
 }
 
-fn appendQuoted(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, txt: []const u8) Err!void {
-    try buf.append(alloc, '"');
+fn mapWriteErr(err: anyerror) Err {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.Io,
+    };
+}
+
+fn appendSubpath(w: *std.Io.Writer, path: []const u8) Err!void {
+    try profileWrite(w, "    (subpath ");
+    try appendQuoted(w, path);
+    try profileWrite(w, ")\n");
+}
+
+fn appendPathAncestors(w: *std.Io.Writer, path: []const u8) Err!void {
+    try profileWrite(w, "    (path-ancestors ");
+    try appendQuoted(w, path);
+    try profileWrite(w, ")\n");
+}
+
+fn appendQuoted(w: *std.Io.Writer, txt: []const u8) Err!void {
+    try profileWriteByte(w, '"');
     for (txt) |c| switch (c) {
         '\\', '"' => {
-            try buf.append(alloc, '\\');
-            try buf.append(alloc, c);
+            try profileWriteByte(w, '\\');
+            try profileWriteByte(w, c);
         },
-        else => try buf.append(alloc, c),
+        else => try profileWriteByte(w, c),
     };
-    try buf.append(alloc, '"');
+    try profileWriteByte(w, '"');
 }
 
 fn isWithin(root: []const u8, path: []const u8) bool {
@@ -272,9 +296,9 @@ pub const sensitive_env = [_][]const u8{
 };
 
 /// Remove sensitive keys from env map in-place.
-pub fn scrubEnv(env: *std.process.EnvMap) void {
+pub fn scrubEnv(env: *std.process.Environ.Map) void {
     for (sensitive_env) |key| {
-        env.remove(key);
+        _ = env.swapRemove(key);
     }
 }
 
@@ -290,22 +314,22 @@ fn mapFsErr(err: anyerror) Err {
 test "prepareBash wraps bash with sandbox-exec and resolves cwd inside workspace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sub");
+    try tmp.dir.createDirPath(std.testing.io, "sub");
 
     const path_guard = @import("tools/path_guard.zig");
     var cwd_guard = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd_guard.deinit();
 
-    var env = std.process.EnvMap.init(std.testing.allocator);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
     try env.put("PATH", "/opt/homebrew/bin:/usr/bin:/bin");
 
     var plan = try prepareBash(std.testing.allocator, &env, "sub", "printf ok");
     defer plan.deinit(std.testing.allocator);
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
-    const sub = try tmp.dir.realpathAlloc(std.testing.allocator, "sub");
+    const sub = try tmp.dir.realPathFileAlloc(std.testing.io, "sub", std.testing.allocator);
     defer std.testing.allocator.free(sub);
 
     try std.testing.expectEqual(@as(usize, 8), plan.argv.len);
@@ -332,11 +356,11 @@ test "prepareBash denies cwd escapes" {
     var cwd_guard = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd_guard.deinit();
 
-    const outer_root = try outer.dir.realpathAlloc(std.testing.allocator, ".");
+    const outer_root = try outer.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(outer_root);
-    try tmp.dir.symLink(outer_root, "escape", .{ .is_directory = true });
+    try tmp.dir.symLink(std.testing.io, outer_root, "escape", .{ .is_directory = true });
 
-    var env = std.process.EnvMap.init(std.testing.allocator);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
     try env.put("PATH", "/usr/bin:/bin");
 
@@ -344,7 +368,7 @@ test "prepareBash denies cwd escapes" {
 }
 
 test "scrubEnv removes sensitive keys and preserves others" {
-    var env = std.process.EnvMap.init(std.testing.allocator);
+    var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();
     try env.put("PATH", "/usr/bin");
     try env.put("ANTHROPIC_API_KEY", "sk-secret");

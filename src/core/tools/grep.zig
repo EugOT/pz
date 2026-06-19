@@ -6,6 +6,12 @@ const shared = @import("shared.zig");
 const noop = @import("../../test/noop_sink.zig");
 const Acc = shared.Acc;
 
+const Dir = std.Io.Dir;
+
+fn defaultIo() std.Io {
+    return @import("../rt_io.zig").default();
+}
+
 pub const Err = error{
     KindMismatch,
     InvalidArgs,
@@ -27,19 +33,19 @@ pub const PreOpen = struct {
     vt: *const Vt,
 
     pub const Vt = struct {
-        run: *const fn (self: *PreOpen, dir: std.fs.Dir, rel_path: []const u8) anyerror!void,
+        run: *const fn (self: *PreOpen, dir: Dir, rel_path: []const u8) anyerror!void,
     };
 
-    pub fn call(self: *PreOpen, dir: std.fs.Dir, rel_path: []const u8) !void {
+    pub fn call(self: *PreOpen, dir: Dir, rel_path: []const u8) !void {
         return self.vt.run(self, dir, rel_path);
     }
 
-    pub fn Bind(comptime T: type, comptime run_fn: fn (*T, std.fs.Dir, []const u8) anyerror!void) type {
+    pub fn Bind(comptime T: type, comptime run_fn: fn (*T, Dir, []const u8) anyerror!void) type {
         return struct {
             pub const vt = Vt{
                 .run = runFn,
             };
-            fn runFn(po: *PreOpen, dir: std.fs.Dir, rel_path: []const u8) anyerror!void {
+            fn runFn(po: *PreOpen, dir: Dir, rel_path: []const u8) anyerror!void {
                 const self_ptr: *T = @fieldParentPtr("pre_open", po);
                 return run_fn(self_ptr, dir, rel_path);
             }
@@ -74,7 +80,7 @@ pub const Handler = struct {
         var root = path_guard.openDir(args.path, .{ .iterate = true }) catch |open_err| {
             return shared.mapFsErr(open_err);
         };
-        defer root.close();
+        defer root.close(defaultIo());
 
         var acc = Acc.init(self.alloc, self.max_bytes);
         defer acc.deinit();
@@ -97,7 +103,7 @@ pub const Handler = struct {
 
 fn grepDir(
     self: Handler,
-    dir: std.fs.Dir,
+    dir: Dir,
     path: *std.ArrayList(u8),
     args: tools.Call.GrepArgs,
     hit_ct: *u32,
@@ -114,12 +120,12 @@ fn grepDir(
 
         switch (ent.kind) {
             .directory => {
-                var child = dir.openDir(ent.name, .{
+                var child = dir.openDir(defaultIo(), ent.name, .{
                     .iterate = true,
                     .access_sub_paths = true,
-                    .no_follow = true,
+                    .follow_symlinks = false,
                 }) catch |open_err| return shared.mapFsErr(open_err);
-                defer child.close();
+                defer child.close(defaultIo());
                 try grepDir(self, child, path, args, hit_ct, acc);
             },
             .file => try grepFile(self, dir, ent.name, path.items, args, hit_ct, acc),
@@ -130,7 +136,7 @@ fn grepDir(
 
 fn grepFile(
     self: Handler,
-    dir: std.fs.Dir,
+    dir: Dir,
     name: []const u8,
     rel_path: []const u8,
     args: tools.Call.GrepArgs,
@@ -144,12 +150,9 @@ fn grepFile(
     var file = path_guard.openFileInDir(dir, name, .{ .mode = .read_only }) catch |open_err| {
         return shared.mapFsErr(open_err);
     };
-    defer file.close();
+    defer file.close(defaultIo());
 
-    const full = file.readToEndAlloc(self.alloc, self.max_bytes) catch |read_err| switch (read_err) {
-        error.FileTooBig => return error.TooLarge,
-        else => return shared.mapFsErr(read_err),
-    };
+    const full = try readAllAlloc(file, self.alloc, self.max_bytes);
     defer self.alloc.free(full);
 
     var line_no: u32 = 0;
@@ -171,8 +174,18 @@ fn grepFile(
     }
 }
 
-fn nextEnt(it: *std.fs.Dir.Iterator) Err!?std.fs.Dir.Entry {
-    return it.next() catch |next_err| shared.mapFsErr(next_err);
+fn readAllAlloc(file: std.Io.File, alloc: std.mem.Allocator, max_bytes: usize) Err![]u8 {
+    var file_buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(defaultIo(), &file_buf);
+    return reader.interface.allocRemaining(alloc, .limited(max_bytes)) catch |read_err| switch (read_err) {
+        error.StreamTooLong => error.TooLarge,
+        error.OutOfMemory => error.OutOfMemory,
+        else => shared.mapFsErr(read_err),
+    };
+}
+
+fn nextEnt(it: *Dir.Iterator) Err!?Dir.Entry {
+    return it.next(defaultIo()) catch |next_err| shared.mapFsErr(next_err);
 }
 
 fn trimLine(raw: []const u8) []const u8 {
@@ -210,8 +223,6 @@ fn asciiLower(ch: u8) u8 {
     return ch;
 }
 
-
-
 test "grep handler finds matching lines with file and line numbers" {
     const OhSnap = @import("ohsnap");
     const oh = OhSnap{};
@@ -224,11 +235,11 @@ test "grep handler finds matching lines with file and line numbers" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.makePath("src");
-    try tmp.dir.writeFile(.{ .sub_path = "src/a.txt", .data = "alpha\nbeta\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "src/b.txt", .data = "Beta\n" });
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/a.txt", .data = "alpha\nbeta\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/b.txt", .data = "Beta\n" });
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, "src");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "src", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     const sink = noop.sink();
@@ -304,11 +315,11 @@ test "grep handler denies hardlinked leaf" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.makePath("src");
-    try tmp.dir.writeFile(.{ .sub_path = "src/base.txt", .data = "secret\n" });
-    try std.posix.linkat(tmp.dir.fd, "src/base.txt", tmp.dir.fd, "src/alias.txt", 0);
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/base.txt", .data = "secret\n" });
+    try tmp.dir.hardLink("src/base.txt", tmp.dir, "src/alias.txt", std.testing.io, .{});
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, "src");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "src", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     const sink = noop.sink();
@@ -336,15 +347,15 @@ test "grep handler keeps trusted dir after ancestor swap" {
 
     const HookCtx = struct {
         pre_open: PreOpen = .{ .vt = &Bind.vt },
-        root: std.fs.Dir,
+        root: std.Io.Dir,
         done: bool = false,
 
-        fn run(self: *@This(), _: std.fs.Dir, rel_path: []const u8) !void {
+        fn run(self: *@This(), _: std.Io.Dir, rel_path: []const u8) !void {
             if (self.done) return;
             if (!std.mem.eql(u8, rel_path, "sub/victim.txt")) return;
             self.done = true;
-            try self.root.rename("sub", "gone");
-            try self.root.rename("swap", "sub");
+            try self.root.rename("sub", self.root, "gone", std.testing.io);
+            try self.root.rename("swap", self.root, "sub", std.testing.io);
         }
         const Bind = PreOpen.Bind(@This(), run);
     };
@@ -354,18 +365,18 @@ test "grep handler keeps trusted dir after ancestor swap" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.makePath("src/sub");
-    try tmp.dir.makePath("src/swap");
-    try tmp.dir.writeFile(.{ .sub_path = "src/sub/victim.txt", .data = "secret\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "src/swap/victim.txt", .data = "hacked\n" });
+    try tmp.dir.createDirPath(std.testing.io, "src/sub");
+    try tmp.dir.createDirPath(std.testing.io, "src/swap");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/sub/victim.txt", .data = "secret\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/swap/victim.txt", .data = "hacked\n" });
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, "src");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "src", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     const sink = noop.sink();
 
-    var ctx = HookCtx{ .root = try tmp.dir.openDir("src", .{ .access_sub_paths = true }) };
-    defer ctx.root.close();
+    var ctx = HookCtx{ .root = try tmp.dir.openDir(std.testing.io, "src", .{ .access_sub_paths = true }) };
+    defer ctx.root.close(std.testing.io);
 
     const handler = Handler.init(.{
         .alloc = std.testing.allocator,

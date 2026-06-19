@@ -220,7 +220,7 @@ fn streamOnce(comptime Tr: type, alloc: std.mem.Allocator, tr: *Tr, req: provide
     var p = stream_parse.Parser{};
     defer p.deinit(alloc);
 
-    var evs: std.ArrayListUnmanaged(providers.Event) = .{};
+    var evs: std.ArrayListUnmanaged(providers.Event) = .empty;
     errdefer evs.deinit(alloc);
 
     while (try stream.next()) |chunk| {
@@ -292,7 +292,7 @@ const MockRawTr = struct {
     atts: []const Attempt,
     start_ct: usize = 0,
     stream: MockRawChunk = .{},
-    reqs: std.ArrayListUnmanaged([]u8) = .{},
+    reqs: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn init(alloc: std.mem.Allocator, atts: []const Attempt) MockRawTr {
         return .{

@@ -2,6 +2,7 @@
 const std = @import("std");
 const stream_parse = @import("../core/providers/stream_parse.zig");
 const providers = @import("../core/providers/api.zig");
+const core_time = @import("../core/time.zig");
 
 const parse_gate_ns: i128 = 10 * std.time.ns_per_s;
 
@@ -13,7 +14,7 @@ test "performance baseline parser hot path stays under gate" {
     const iters: usize = 2000;
     var total_evs: usize = 0;
 
-    const started = std.time.nanoTimestamp();
+    const started = core_time.nanoTimestamp();
     var i: usize = 0;
     while (i < iters) : (i += 1) {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -23,7 +24,7 @@ test "performance baseline parser hot path stays under gate" {
         var parser = stream_parse.Parser{};
         defer parser.deinit(ar);
 
-        var evs: std.ArrayListUnmanaged(providers.Event) = .{};
+        var evs: std.ArrayListUnmanaged(providers.Event) = .empty;
         defer evs.deinit(ar);
 
         for (chunks) |chunk| {
@@ -32,7 +33,7 @@ test "performance baseline parser hot path stays under gate" {
         try parser.finish(ar, &evs);
         total_evs += evs.items.len;
     }
-    const elapsed = std.time.nanoTimestamp() - started;
+    const elapsed = core_time.nanoTimestamp() - started;
 
     try std.testing.expectEqual(iters * 4, total_evs);
     try std.testing.expect(elapsed < parse_gate_ns);

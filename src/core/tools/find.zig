@@ -7,6 +7,12 @@ const tool_snap = @import("../../test/tool_snap.zig");
 const noop = @import("../../test/noop_sink.zig");
 const Acc = shared.Acc;
 
+const Dir = std.Io.Dir;
+
+fn defaultIo() std.Io {
+    return @import("../rt_io.zig").default();
+}
+
 pub const Err = error{
     KindMismatch,
     InvalidArgs,
@@ -48,7 +54,7 @@ pub const Handler = struct {
         var root = path_guard.openDir(args.path, .{ .iterate = true }) catch |open_err| {
             return shared.mapFsErr(open_err);
         };
-        defer root.close();
+        defer root.close(defaultIo());
 
         var matches = std.ArrayList([]u8).empty;
         defer {
@@ -89,7 +95,7 @@ fn lessPath(_: void, a: []u8, b: []u8) bool {
 
 fn collectMatches(
     self: Handler,
-    dir: std.fs.Dir,
+    dir: Dir,
     path: *std.ArrayList(u8),
     needle: []const u8,
     limit: usize,
@@ -113,21 +119,19 @@ fn collectMatches(
 
         if (ent.kind != .directory) continue;
 
-        var child = dir.openDir(ent.name, .{
+        var child = dir.openDir(defaultIo(), ent.name, .{
             .iterate = true,
             .access_sub_paths = true,
-            .no_follow = true,
+            .follow_symlinks = false,
         }) catch |open_err| return shared.mapFsErr(open_err);
-        defer child.close();
+        defer child.close(defaultIo());
         try collectMatches(self, child, path, needle, limit, matches);
     }
 }
 
-fn nextEnt(it: *std.fs.Dir.Iterator) Err!?std.fs.Dir.Entry {
-    return it.next() catch |next_err| shared.mapFsErr(next_err);
+fn nextEnt(it: *Dir.Iterator) Err!?Dir.Entry {
+    return it.next(defaultIo()) catch |next_err| shared.mapFsErr(next_err);
 }
-
-
 
 test "find handler lists matching paths in sorted order" {
     const OhSnap = @import("ohsnap");
@@ -137,12 +141,12 @@ test "find handler lists matching paths in sorted order" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.makePath("src/lib");
-    try tmp.dir.writeFile(.{ .sub_path = "src/a.zig", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "src/lib/b.zig", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "src/lib/c.txt", .data = "" });
+    try tmp.dir.createDirPath(std.testing.io, "src/lib");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/a.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/lib/b.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/lib/c.txt", .data = "" });
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, "src");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "src", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     const sink = noop.sink();
@@ -221,15 +225,15 @@ test "find handler truncates on high hit count instead of erroring" {
     defer cwd.deinit();
 
     // Create more files than max_results * 8
-    try tmp.dir.makePath("d");
+    try tmp.dir.createDirPath(std.testing.io, "d");
     var i: usize = 0;
     while (i < 20) : (i += 1) {
         var name: [12]u8 = undefined;
         const n = try std.fmt.bufPrint(&name, "d/f{d}.txt", .{i});
-        try tmp.dir.writeFile(.{ .sub_path = n, .data = "" });
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = n, .data = "" });
     }
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, "d");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "d", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     const sink = noop.sink();

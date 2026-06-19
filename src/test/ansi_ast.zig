@@ -173,7 +173,7 @@ pub fn summaryAlloc(alloc: std.mem.Allocator, ops: []const Op, opts: SummaryOpts
         switch (op) {
             .text => |text| {
                 if (!opts.include_text) continue;
-                try out.writer(alloc).print("text {d}\n", .{text.len});
+                try out.print(alloc, "text {d}\n", .{text.len});
             },
             .csi => |csi| {
                 try out.appendSlice(alloc, "csi ");
@@ -182,7 +182,7 @@ pub fn summaryAlloc(alloc: std.mem.Allocator, ops: []const Op, opts: SummaryOpts
                 try out.appendSlice(alloc, " ");
                 for (csi.params, 0..) |param, idx| {
                     if (idx > 0) try out.append(alloc, ',');
-                    try out.writer(alloc).print("{d}", .{param});
+                    try out.print(alloc, "{d}", .{param});
                 }
                 try out.append(alloc, '\n');
             },
@@ -193,7 +193,7 @@ pub fn summaryAlloc(alloc: std.mem.Allocator, ops: []const Op, opts: SummaryOpts
                 try out.append(alloc, '\n');
             },
             .esc => |raw| {
-                try out.writer(alloc).print("esc {d}\n", .{raw.len});
+                try out.print(alloc, "esc {d}\n", .{raw.len});
             },
         }
         kept += 1;

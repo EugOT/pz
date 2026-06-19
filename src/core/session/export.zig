@@ -5,6 +5,17 @@ const utf8 = @import("../utf8.zig");
 const fs_secure = @import("../fs_secure.zig");
 const reader_mod = @import("reader.zig");
 const sid_path = @import("path.zig");
+const core_time = @import("../time.zig");
+const Dir = std.Io.Dir;
+const File = std.Io.File;
+
+fn defaultIo() std.Io {
+    return @import("../rt_io.zig").default();
+}
+
+fn writeAll(file: File, bytes: []const u8) !void {
+    try file.writeStreamingAll(defaultIo(), bytes);
+}
 
 /// Optional callbacks for audit emission during export.
 pub const AuditHooks = struct {
@@ -16,7 +27,7 @@ pub const AuditHooks = struct {
 /// Returns the absolute path to the written file (caller owns).
 pub fn toMarkdown(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: Dir,
     sid: []const u8,
     out_path: ?[]const u8,
 ) ![]u8 {
@@ -25,7 +36,7 @@ pub fn toMarkdown(
 
 pub fn toMarkdownAudited(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: Dir,
     sid: []const u8,
     out_path: ?[]const u8,
     hooks: AuditHooks,
@@ -35,7 +46,7 @@ pub fn toMarkdownAudited(
 
 fn toMarkdownWith(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: Dir,
     sid: []const u8,
     out_path: ?[]const u8,
     hooks: AuditHooks,
@@ -45,14 +56,14 @@ fn toMarkdownWith(
         if (std.fs.path.isAbsolute(p)) {
             break :blk try alloc.dupe(u8, p);
         }
-        const cwd = try std.fs.cwd().realpathAlloc(alloc, ".");
+        const cwd = try Dir.cwd().realPathFileAlloc(defaultIo(), ".", alloc);
         defer alloc.free(cwd);
         break :blk try std.fs.path.join(alloc, &.{ cwd, p });
     } else blk: {
         const fname = try sid_path.sidExtAlloc(alloc, sid, ".md");
         defer alloc.free(fname);
         // Write next to the session directory
-        const real = try dir.realpathAlloc(alloc, ".");
+        const real = try dir.realPathFileAlloc(defaultIo(), ".", alloc);
         defer alloc.free(real);
         break :blk try std.fs.path.join(alloc, &.{ real, fname });
     };
@@ -96,17 +107,17 @@ fn toMarkdownWith(
 
 const StreamCtx = struct {
     alloc: std.mem.Allocator,
-    session_dir: std.fs.Dir,
+    session_dir: Dir,
     sid: []const u8,
 
-    fn write(self: *StreamCtx, file: std.fs.File) anyerror!void {
+    fn write(self: *StreamCtx, file: File) anyerror!void {
         var rdr = try reader_mod.ReplayReader.init(self.alloc, self.session_dir, self.sid, .{});
         defer rdr.deinit();
 
         // Header
-        try file.writeAll("# Session ");
-        try file.writeAll(self.sid);
-        try file.writeAll("\n\n");
+        try writeAll(file, "# Session ");
+        try writeAll(file, self.sid);
+        try writeAll(file, "\n\n");
 
         while (try rdr.next()) |ev| {
             switch (ev.data) {
@@ -117,30 +128,30 @@ const StreamCtx = struct {
                     try writeSection(self.alloc, file, "Assistant", t.text);
                 },
                 .thinking => |t| {
-                    try file.writeAll("<details><summary>Thinking</summary>\n\n");
+                    try writeAll(file, "<details><summary>Thinking</summary>\n\n");
                     try writeFence(self.alloc, file, t.text);
-                    try file.writeAll("\n</details>\n\n");
+                    try writeAll(file, "\n</details>\n\n");
                 },
                 .tool_call => |tc| {
-                    try file.writeAll("### Tool: ");
+                    try writeAll(file, "### Tool: ");
                     const safe_name = try redactLossyAlloc(self.alloc, tc.name, .@"pub");
                     defer self.alloc.free(safe_name);
-                    try file.writeAll(safe_name);
-                    try file.writeAll("\n\n");
+                    try writeAll(file, safe_name);
+                    try writeAll(file, "\n\n");
                     try writeFence(self.alloc, file, tc.args);
-                    try file.writeAll("\n");
+                    try writeAll(file, "\n");
                 },
                 .tool_result => |tr| {
-                    try file.writeAll(if (tr.is_err) "#### Error\n\n" else "#### Result\n\n");
+                    try writeAll(file, if (tr.is_err) "#### Error\n\n" else "#### Result\n\n");
                     const max_out = 2000;
                     const raw_out = if (tr.output.len > max_out) tr.output[0..max_out] else tr.output;
                     try writeFence(self.alloc, file, raw_out);
                     if (tr.output.len > max_out) {
                         const trunc_msg = try std.fmt.allocPrint(self.alloc, "\n... ({d} bytes truncated)", .{tr.output.len - max_out});
                         defer self.alloc.free(trunc_msg);
-                        try file.writeAll(trunc_msg);
+                        try writeAll(file, trunc_msg);
                     }
-                    try file.writeAll("\n");
+                    try writeAll(file, "\n");
                 },
                 .err => |e| {
                     try writeSection(self.alloc, file, "Error", e.text);
@@ -155,47 +166,47 @@ const StreamCtx = struct {
 fn atomicExportStream(
     dest: []const u8,
     ctx: *StreamCtx,
-    writeFn: fn (*StreamCtx, std.fs.File) anyerror!void,
+    writeFn: fn (*StreamCtx, File) anyerror!void,
 ) !void {
     const dir_path = std.fs.path.dirname(dest) orelse return error.FileNotFound;
     const basename = std.fs.path.basename(dest);
 
     var out_dir = if (std.fs.path.isAbsolute(dir_path))
-        try std.fs.openDirAbsolute(dir_path, .{})
+        try Dir.openDirAbsolute(defaultIo(), dir_path, .{})
     else
-        try std.fs.cwd().openDir(dir_path, .{});
-    defer out_dir.close();
+        try Dir.cwd().openDir(defaultIo(), dir_path, .{});
+    defer out_dir.close(defaultIo());
 
     try fs_secure.atomicWriteAtFn(out_dir, basename, ctx, writeFn);
 }
 
-fn writeSection(alloc: std.mem.Allocator, f: std.fs.File, title: []const u8, txt: []const u8) !void {
-    try f.writeAll("## ");
-    try f.writeAll(title);
-    try f.writeAll("\n\n");
+fn writeSection(alloc: std.mem.Allocator, f: File, title: []const u8, txt: []const u8) !void {
+    try writeAll(f, "## ");
+    try writeAll(f, title);
+    try writeAll(f, "\n\n");
     try writeFence(alloc, f, txt);
-    try f.writeAll("\n");
+    try writeAll(f, "\n");
 }
 
-fn writeFence(alloc: std.mem.Allocator, f: std.fs.File, txt: []const u8) !void {
+fn writeFence(alloc: std.mem.Allocator, f: File, txt: []const u8) !void {
     const safe = try redactLossyAlloc(alloc, txt, .@"pub");
     defer alloc.free(safe);
 
     const n = fenceLen(safe);
     try writeTicks(f, n);
-    try f.writeAll("\n");
-    try f.writeAll(safe);
-    if (safe.len == 0 or safe[safe.len - 1] != '\n') try f.writeAll("\n");
+    try writeAll(f, "\n");
+    try writeAll(f, safe);
+    if (safe.len == 0 or safe[safe.len - 1] != '\n') try writeAll(f, "\n");
     try writeTicks(f, n);
-    try f.writeAll("\n\n");
+    try writeAll(f, "\n\n");
 }
 
-fn writeTicks(f: std.fs.File, n: usize) !void {
+fn writeTicks(f: File, n: usize) !void {
     const chunk = "````````````````";
     var rem = n;
     while (rem > 0) {
         const batch = @min(rem, chunk.len);
-        try f.writeAll(chunk[0..batch]);
+        try writeAll(f, chunk[0..batch]);
         rem -= batch;
     }
 }
@@ -248,10 +259,10 @@ fn emitAudit(alloc: std.mem.Allocator, hooks: AuditHooks, ent: audit.Entry) !voi
     if (hooks.audit_emitter) |e| try e.emit(alloc, ent);
 }
 
-const nowMs = std.time.milliTimestamp;
+const nowMs = core_time.milliTimestamp;
 
 fn normalizeMd(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8){};
+    var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     var nl_run: usize = 0;
     for (raw) |c| {
@@ -291,7 +302,7 @@ test "export session to markdown" {
     try wr.append("ex1", .{ .at_ms = 6, .data = .{ .stop = .{ .reason = .done } } });
 
     // Export to a specific path
-    const real = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const real = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(real);
     const dest = try std.fs.path.join(std.testing.allocator, &.{ real, "out.md" });
     defer std.testing.allocator.free(dest);
@@ -302,9 +313,11 @@ test "export session to markdown" {
     try std.testing.expectEqualStrings(dest, path);
 
     // Read back and verify
-    const content = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
-    defer content.close();
-    const md = try content.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    const content = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_only });
+    defer content.close(std.testing.io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = content.readerStreaming(std.testing.io, &read_buf);
+    const md = try reader.interface.allocRemaining(std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(md);
     const snap = try normalizeMd(std.testing.allocator, md);
     defer std.testing.allocator.free(snap);
@@ -371,8 +384,8 @@ test "export default path uses sid.md" {
     try std.testing.expect(std.mem.endsWith(u8, path, "s2.md"));
 
     // File should exist
-    const f = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
-    f.close();
+    const f = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_only });
+    f.close(std.testing.io);
 }
 
 test "export markdown redacts secrets and neutralizes markdown" {
@@ -391,16 +404,18 @@ test "export markdown redacts secrets and neutralizes markdown" {
     try wr.append("sec1", .{ .at_ms = 3, .data = .{ .tool_call = .{ .id = "c1", .name = "bash", .args = "cat ~/.pz/auth.json" } } });
     try wr.append("sec1", .{ .at_ms = 4, .data = .{ .tool_result = .{ .id = "c1", .output = "authorization: bearer sk-test", .is_err = true } } });
 
-    const real = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const real = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(real);
     const dest = try std.fs.path.join(std.testing.allocator, &.{ real, "sec1.md" });
     defer std.testing.allocator.free(dest);
 
     const path = try toMarkdown(std.testing.allocator, tmp.dir, "sec1", dest);
     defer std.testing.allocator.free(path);
-    const content = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
-    defer content.close();
-    const md = try content.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    const content = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_only });
+    defer content.close(std.testing.io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = content.readerStreaming(std.testing.io, &read_buf);
+    const md = try reader.interface.allocRemaining(std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(md);
     const snap = try normalizeMd(std.testing.allocator, md);
     defer std.testing.allocator.free(snap);
@@ -454,12 +469,12 @@ test "export markdown replaces invalid utf8 from persisted tool output" {
         .is_err = false,
     } } });
 
-    const raw = try tmp.dir.readFileAlloc(std.testing.allocator, "utf8.jsonl", 4096);
+    const raw = try tmp.dir.readFileAlloc(std.testing.io, "utf8.jsonl", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(raw);
     try std.testing.expect(std.mem.indexOfScalar(u8, raw, 0xff) == null);
     try std.testing.expect(std.mem.indexOf(u8, raw, utf8_case.lossy_tool_out) != null);
 
-    const real = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const real = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(real);
     const dest = try std.fs.path.join(std.testing.allocator, &.{ real, "utf8.md" });
     defer std.testing.allocator.free(dest);
@@ -467,9 +482,11 @@ test "export markdown replaces invalid utf8 from persisted tool output" {
     const path = try toMarkdown(std.testing.allocator, tmp.dir, "utf8", dest);
     defer std.testing.allocator.free(path);
 
-    const content = try std.fs.openFileAbsolute(path, .{ .mode = .read_only });
-    defer content.close();
-    const md = try content.readToEndAlloc(std.testing.allocator, 64 * 1024);
+    const content = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_only });
+    defer content.close(std.testing.io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = content.readerStreaming(std.testing.io, &read_buf);
+    const md = try reader.interface.allocRemaining(std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(md);
     const snap = try normalizeMd(std.testing.allocator, md);
     defer std.testing.allocator.free(snap);
@@ -523,7 +540,7 @@ test "export audit emits start and success entries" {
 
     var cap = Capture{};
     defer cap.deinit(std.testing.allocator);
-    const real = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const real = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(real);
     const dest = try std.fs.path.join(std.testing.allocator, &.{ real, "audit.md" });
     defer std.testing.allocator.free(dest);
@@ -580,7 +597,7 @@ test "export audit emits failure entry on write failure" {
 
     var cap = Capture{};
     defer cap.deinit(std.testing.allocator);
-    const real = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const real = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(real);
     const bad = try std.fs.path.join(std.testing.allocator, &.{ real, "missing", "audit.md" });
     defer std.testing.allocator.free(bad);

@@ -59,9 +59,10 @@ const ProviderRuntime = struct {
     pol: core.providers.client.Policy = undefined,
     client: ProcClient = undefined,
 
-    fn init(self: *ProviderRuntime, alloc: std.mem.Allocator, provider_cmd: []const u8) !void {
+    fn init(self: *ProviderRuntime, alloc: std.mem.Allocator, io: std.Io, provider_cmd: []const u8) !void {
         self.tr = try ProcTr.init(.{
             .alloc = alloc,
+            .io = io,
             .cmd = provider_cmd,
         });
         self.map_ctx = .{};
@@ -145,7 +146,7 @@ const NativeProviderRuntime = union(enum) {
         };
         switch (auth) {
             .oauth => |oauth| {
-                if (std.time.milliTimestamp() >= oauth.expires) {
+                if (core.time.milliTimestamp() >= oauth.expires) {
                     return switch (self.*) {
                         .anthropic => .anthropic,
                         .openai => .openai,
@@ -222,12 +223,12 @@ const RuntimePolicy = struct {
     alloc: std.mem.Allocator,
     resolved: core.policy.Resolved,
 
-    fn load(alloc: std.mem.Allocator, home: ?[]const u8) !RuntimePolicy {
-        const cwd = try std.process.getCwdAlloc(alloc);
+    fn load(alloc: std.mem.Allocator, io: std.Io, home: ?[]const u8) !RuntimePolicy {
+        const cwd = try std.process.currentPathAlloc(io, alloc);
         defer alloc.free(cwd);
         return .{
             .alloc = alloc,
-            .resolved = try core.policy.loadResolved(alloc, cwd, home),
+            .resolved = try core.policy.loadResolved(alloc, io, cwd, home),
         };
     }
 
@@ -366,7 +367,7 @@ const PolicyToolAuth = struct {
     pol: *const RuntimePolicy,
     sid: []const u8,
     audit_emitter: ?*core.audit.Emitter = null,
-    now_ms: *const fn () i64 = std.time.milliTimestamp,
+    now_ms: *const fn () i64 = core.time.milliTimestamp,
     seq: *u64,
 
     fn check(self: *@This(), call_id: []const u8, name: []const u8, kind: core.tools.Kind, kind_str: []const u8, parsed_args: core.tools.Call.Args) !void {
@@ -487,7 +488,7 @@ const PrintSink = struct {
     fmt: print_fmt.Formatter,
     stop_reason: ?core.providers.StopReason = null,
 
-    fn init(alloc: std.mem.Allocator, out: std.Io.AnyWriter) PrintSink {
+    fn init(alloc: std.mem.Allocator, out: *std.Io.Writer) PrintSink {
         return .{
             .fmt = print_fmt.Formatter.init(alloc, out),
         };
@@ -527,7 +528,7 @@ const PrintSink = struct {
 const TuiSink = struct {
     mode_sink: core.loop.ModeSink = .{ .vt = &core.loop.ModeSink.Bind(@This(), @This().push).vt },
     ui: *tui_harness.Ui,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
 
     fn push(self: *TuiSink, ev: core.loop.ModeEv) !void {
         switch (ev) {
@@ -634,13 +635,10 @@ const InputWatcher = struct {
     stash_len: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     fn init(fd: std.posix.fd_t) !InputWatcher {
-        const pipe = try std.posix.pipe2(.{
-            .NONBLOCK = true,
-            .CLOEXEC = true,
-        });
+        const pipe = try makePipe(true);
         errdefer {
-            std.posix.close(pipe[0]);
-            std.posix.close(pipe[1]);
+            closeFd(pipe[0]);
+            closeFd(pipe[1]);
         }
         return .{
             .fd = fd,
@@ -651,8 +649,8 @@ const InputWatcher = struct {
 
     fn deinit(self: *InputWatcher) void {
         self.join(null);
-        std.posix.close(self.wake_r);
-        std.posix.close(self.wake_w);
+        closeFd(self.wake_r);
+        closeFd(self.wake_w);
         self.* = undefined;
     }
 
@@ -719,7 +717,7 @@ const InputWatcher = struct {
             }
             if (paused or (fds[1].revents & std.posix.POLL.IN) == 0) continue;
             var buf: [1]u8 = undefined;
-            const r = std.posix.read(self.fd, &buf) catch break;
+            const r = fdRead(self.fd, &buf) catch break;
             if (r == 1 and buf[0] == 0x1b) {
                 self.canceled.store(true, .release);
                 return;
@@ -736,13 +734,13 @@ const InputWatcher = struct {
 };
 
 fn signalWake(fd: std.posix.fd_t) void {
-    _ = std.posix.write(fd, "\x01") catch {}; // cleanup: propagation impossible
+    _ = fdWrite(fd, "\x01") catch {}; // cleanup: propagation impossible
 }
 
 fn drainWake(fd: std.posix.fd_t) void {
     var buf: [32]u8 = undefined;
     while (true) {
-        _ = std.posix.read(fd, &buf) catch |err| switch (err) {
+        _ = fdRead(fd, &buf) catch |err| switch (err) {
             error.WouldBlock => return,
             else => return,
         };
@@ -764,6 +762,30 @@ const TurnCancelFlag = struct {
 
     fn isCanceled(self: *TurnCancelFlag) bool {
         return self.canceled.load(.acquire);
+    }
+};
+
+const Mutex = struct {
+    inner: std.Io.Mutex = .init,
+
+    fn lock(self: *Mutex) void {
+        self.inner.lockUncancelable(defaultIo());
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock(defaultIo());
+    }
+};
+
+const Condition = struct {
+    inner: std.Io.Condition = .init,
+
+    fn wait(self: *Condition, mutex: *Mutex) void {
+        self.inner.waitUncancelable(defaultIo(), &mutex.inner);
+    }
+
+    fn signal(self: *Condition) void {
+        self.inner.signal(defaultIo());
     }
 };
 
@@ -793,7 +815,7 @@ const LiveTurn = struct {
     };
 
     alloc: std.mem.Allocator,
-    mu: std.Thread.Mutex = .{},
+    mu: Mutex = .{},
     evs: std.ArrayListUnmanaged(SeqProviderEv) = .empty,
     ev_head: usize = 0,
     next_seq: u64 = 1,
@@ -814,8 +836,8 @@ const LiveTurn = struct {
     ask_txn: ?*AskTxn = null,
 
     const AskTxn = struct {
-        mu: std.Thread.Mutex = .{},
-        cv: std.Thread.Condition = .{},
+        mu: Mutex = .{},
+        cv: Condition = .{},
         claimed: bool = false,
         done: bool = false,
         args: OwnedAskArgs,
@@ -842,13 +864,10 @@ const LiveTurn = struct {
     };
 
     fn init(alloc: std.mem.Allocator) !LiveTurn {
-        const pipe = try std.posix.pipe2(.{
-            .NONBLOCK = true,
-            .CLOEXEC = true,
-        });
+        const pipe = try makePipe(true);
         errdefer {
-            std.posix.close(pipe[0]);
-            std.posix.close(pipe[1]);
+            closeFd(pipe[0]);
+            closeFd(pipe[1]);
         }
         return .{
             .alloc = alloc,
@@ -874,8 +893,8 @@ const LiveTurn = struct {
         if (self.last_model) |m| self.alloc.free(m);
         if (self.last_req) |*req| req.deinit(self.alloc);
         self.mu.unlock();
-        std.posix.close(self.wake_r);
-        std.posix.close(self.wake_w);
+        closeFd(self.wake_r);
+        closeFd(self.wake_w);
         self.* = undefined;
     }
 
@@ -1147,7 +1166,7 @@ const LiveTurn = struct {
 
     fn nudge(self: *LiveTurn) void {
         const b = [_]u8{1};
-        _ = std.posix.write(self.wake_w, &b) catch {}; // cleanup: propagation impossible
+        _ = fdWrite(self.wake_w, &b) catch {}; // cleanup: propagation impossible
     }
 };
 
@@ -1324,7 +1343,7 @@ fn freeProviderEv(alloc: std.mem.Allocator, ev: core.providers.Event) void {
 const JsonSink = struct {
     mode_sink: core.loop.ModeSink = .{ .vt = &core.loop.ModeSink.Bind(@This(), @This().push).vt },
     alloc: std.mem.Allocator,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
 
     fn push(self: *JsonSink, ev: core.loop.ModeEv) !void {
         switch (ev) {
@@ -1364,12 +1383,13 @@ const RpcReq = struct {
 };
 
 const AuditHooks = struct {
+    io: std.Io = std.Io.failing,
     audit_emitter: ?*core.audit.Emitter = null,
-    now_ms: *const fn () i64 = std.time.milliTimestamp,
+    now_ms: *const fn () i64 = core.time.milliTimestamp,
     auth_home: ?[]const u8 = null,
     auth_lock: core.policy.Lock = .{},
     ca_file: ?[]const u8 = null,
-    share_gist: *const fn (std.mem.Allocator, []const u8, *const RuntimePolicy) anyerror![]u8 = shareGist,
+    share_gist: *const fn (std.mem.Allocator, std.Io, []const u8, *const RuntimePolicy) anyerror![]u8 = shareGist,
     run_upgrade: *const fn (std.mem.Allocator, update_mod.AuditHooks) anyerror!update_mod.Outcome = update_mod.runOutcomeAudited,
     seq_tracker: ?*core.audit_integrity.SeqTracker = null,
 
@@ -1401,10 +1421,11 @@ const AuditShipper = struct {
         transport: core.syslog.Transport,
         overflow: core.audit.OverflowPolicy,
         buf_cap: u16,
-        spool_dir: ?std.fs.Dir,
+        io: std.Io,
+        spool_dir: ?std.Io.Dir,
         allow_private: bool = false,
         ca_file: ?[]const u8 = null,
-        now_ms: *const fn () i64 = std.time.milliTimestamp,
+        now_ms: *const fn () i64 = core.time.milliTimestamp,
     };
 
     fn init(self: *AuditShipper, opts: InitOpts) !void {
@@ -1413,6 +1434,7 @@ const AuditShipper = struct {
         self.sender_conn = .{
             .alloc = opts.alloc,
             .opts = .{
+                .io = opts.io,
                 .transport = opts.transport,
                 .host = opts.host,
                 .port = opts.port,
@@ -1424,6 +1446,7 @@ const AuditShipper = struct {
             .connector = &self.sender_conn.connector,
             .buf_cap = opts.buf_cap,
             .overflow = opts.overflow,
+            .io = opts.io,
             .spool_dir = opts.spool_dir,
         });
     }
@@ -1561,8 +1584,10 @@ fn exportAuditHooks(hooks: AuditHooks) core.session.@"export".AuditHooks {
     };
 }
 
-fn updateAuditHooks(hooks: AuditHooks, home: ?[]const u8) update_mod.AuditHooks {
+fn updateAuditHooks(hooks: AuditHooks, io: std.Io, home: ?[]const u8) update_mod.AuditHooks {
     return .{
+        .io = io,
+        .http_deps = .{ .io = io },
         .home = home,
         .audit_emitter = hooks.audit_emitter,
         .now_ms = hooks.now_ms,
@@ -1627,11 +1652,11 @@ fn reloadContextWithAudit(
     sys_prompt: *?[]const u8,
     sys_prompt_owned: *?[]u8,
     audit: *RuntimeCtlAudit,
-    load_fn: *const fn (std.mem.Allocator, ?[]const u8) anyerror!?[]u8,
+    load_fn: *const fn (std.mem.Allocator, std.Io, ?[]const u8) anyerror!?[]u8,
     home: ?[]const u8,
 ) !ReloadRes {
     try runtimeCtlAudit(audit, alloc, "reload", .cfg, runtimeCfgResName(), null, .start, null, &.{});
-    const next_ctx = load_fn(alloc, home) catch |err| {
+    const next_ctx = load_fn(alloc, defaultIo(), home) catch |err| {
         try runtimeCtlAudit(
             audit,
             alloc,
@@ -1680,7 +1705,7 @@ pub fn exec(alloc: std.mem.Allocator, run_cmd: cli.Run) (Err || anyerror)![]u8 {
 pub fn execWithWriter(
     alloc: std.mem.Allocator,
     run_cmd: cli.Run,
-    out: ?std.Io.AnyWriter,
+    out: ?*std.Io.Writer,
 ) (Err || anyerror)![]u8 {
     return execWithIo(alloc, run_cmd, null, out);
 }
@@ -1688,8 +1713,8 @@ pub fn execWithWriter(
 pub fn execWithIo(
     alloc: std.mem.Allocator,
     run_cmd: cli.Run,
-    in: ?std.Io.AnyReader,
-    out: ?std.Io.AnyWriter,
+    in: ?*std.Io.Reader,
+    out: ?*std.Io.Writer,
 ) (Err || anyerror)![]u8 {
     return execWithIoHooks(alloc, run_cmd, in, out, .{});
 }
@@ -1703,11 +1728,135 @@ const TuiHooks = struct {
     submit_text: ?[]const u8 = null,
 };
 
+fn readLineAlloc(alloc: std.mem.Allocator, in: *std.Io.Reader, limit: usize) !?[]u8 {
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+
+    const n = in.streamDelimiterLimit(&buf.writer, '\n', .limited(limit)) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => |e| return e,
+    };
+
+    var had_delimiter = false;
+    if (in.bufferedLen() > 0) {
+        const peeked = try in.peek(1);
+        if (peeked.len > 0 and peeked[0] == '\n') {
+            in.toss(1);
+            had_delimiter = true;
+        }
+    }
+
+    if (!had_delimiter and n == 0) return null;
+    return try buf.toOwnedSlice();
+}
+
+fn getenv(name: [*:0]const u8) ?[]const u8 {
+    return if (std.c.getenv(name)) |value| std.mem.span(value) else null;
+}
+
+fn defaultIo() std.Io {
+    return @import("../core/rt_io.zig").default();
+}
+
+fn testRealPathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8) ![]u8 {
+    const resolved = try dir.realPathFileAlloc(std.testing.io, sub_path, alloc);
+    defer alloc.free(resolved);
+    return try alloc.dupe(u8, resolved);
+}
+
+fn testCwdRealPathAlloc(alloc: std.mem.Allocator, sub_path: []const u8) ![]u8 {
+    const resolved = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, sub_path, alloc);
+    defer alloc.free(resolved);
+    return try alloc.dupe(u8, resolved);
+}
+
+fn isTty(fd: std.posix.fd_t) bool {
+    return std.c.isatty(fd) == 1;
+}
+
+fn openDirPath(path: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
+    if (std.fs.path.isAbsolute(path)) {
+        return std.Io.Dir.openDirAbsolute(defaultIo(), path, options);
+    }
+    return std.Io.Dir.cwd().openDir(defaultIo(), path, options);
+}
+
+fn closeFd(fd: std.posix.fd_t) void {
+    _ = std.c.close(fd);
+}
+
+fn chdirPath(path: []const u8) !void {
+    const path_z = try std.posix.toPosixPath(path);
+    if (std.c.chdir(&path_z) != 0) return std.posix.unexpectedErrno(std.posix.errno(-1));
+}
+
+fn makePipe(nonblocking: bool) ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return std.posix.unexpectedErrno(std.posix.errno(-1));
+    errdefer {
+        closeFd(fds[0]);
+        closeFd(fds[1]);
+    }
+    try setCloexec(fds[0]);
+    try setCloexec(fds[1]);
+    if (nonblocking) {
+        try setNonblockFd(fds[0]);
+        try setNonblockFd(fds[1]);
+    }
+    return fds;
+}
+
+fn setCloexec(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, @as(c_int, std.posix.F.GETFD), @as(c_int, 0));
+    if (flags == -1) return std.posix.unexpectedErrno(std.posix.errno(-1));
+    if (std.c.fcntl(fd, @as(c_int, std.posix.F.SETFD), flags | @as(c_int, std.posix.FD_CLOEXEC)) == -1) {
+        return std.posix.unexpectedErrno(std.posix.errno(-1));
+    }
+}
+
+fn setNonblockFd(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, @as(c_int, std.posix.F.GETFL), @as(c_int, 0));
+    if (flags == -1) return std.posix.unexpectedErrno(std.posix.errno(-1));
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    if (std.c.fcntl(fd, @as(c_int, std.posix.F.SETFL), flags | nonblock) == -1) {
+        return std.posix.unexpectedErrno(std.posix.errno(-1));
+    }
+}
+
+fn fdRead(fd: std.posix.fd_t, buf: []u8) !usize {
+    while (true) {
+        const rc = std.c.read(fd, buf.ptr, buf.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn fdWrite(fd: std.posix.fd_t, bytes: []const u8) !usize {
+    while (true) {
+        const rc = std.c.write(fd, bytes.ptr, bytes.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn fdWriteAll(fd: std.posix.fd_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) off += try fdWrite(fd, bytes[off..]);
+}
+
 fn execWithIoHooks(
     alloc: std.mem.Allocator,
     run_cmd: cli.Run,
-    in: ?std.Io.AnyReader,
-    out: ?std.Io.AnyWriter,
+    in: ?*std.Io.Reader,
+    out: ?*std.Io.Writer,
     audit_hooks: AuditHooks,
 ) (Err || anyerror)![]u8 {
     return execWithIoTuiHooks(alloc, run_cmd, in, out, audit_hooks, .{});
@@ -1716,16 +1865,18 @@ fn execWithIoHooks(
 fn execWithIoTuiHooks(
     alloc: std.mem.Allocator,
     run_cmd: cli.Run,
-    in: ?std.Io.AnyReader,
-    out: ?std.Io.AnyWriter,
+    in: ?*std.Io.Reader,
+    out: ?*std.Io.Writer,
     audit_hooks: AuditHooks,
     tui_hooks: TuiHooks,
 ) (Err || anyerror)![]u8 {
     var provider_rt: ProviderRuntime = undefined;
     var native_rt: NativeProviderRuntime = undefined;
     var hooks = audit_hooks;
+    hooks.io = run_cmd.io;
     if (hooks.ca_file == null) hooks.ca_file = run_cmd.cfg.ca_file;
     hooks.auth_lock = run_cmd.cfg.policy_lock;
+    if (hooks.auth_home == null) hooks.auth_home = run_cmd.home;
     var missing_provider = MissingProvider{
         .alloc = alloc,
         .msg = missing_provider_msg,
@@ -1737,7 +1888,7 @@ fn execWithIoTuiHooks(
     defer if (has_native_rt) native_rt.deinit();
 
     const home = run_cmd.home;
-    var pol = try RuntimePolicy.load(alloc, home);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), home);
     defer pol.deinit();
 
     // Durable audit sequence tracker: persists high-water mark so
@@ -1746,7 +1897,7 @@ fn execWithIoTuiHooks(
     const seq_path: ?[]const u8 = if (home) |h| blk: {
         break :blk std.fmt.bufPrint(&seq_path_buf, "{s}/.pz/audit_seq", .{h}) catch unreachable; // max_path_bytes (4096) >> home + 16 chars
     } else null;
-    var seq_tracker = core.audit_integrity.SeqTracker.init(alloc, seq_path);
+    var seq_tracker = core.audit_integrity.SeqTracker.init(alloc, defaultIo(), seq_path);
     hooks.seq_tracker = &seq_tracker;
 
     // Durable audit forwarding: when syslog is configured, create a
@@ -1754,8 +1905,8 @@ fn execWithIoTuiHooks(
     // silently drop privileged audit events.
     var audit_shipper: AuditShipper = undefined;
     var has_audit_shipper = false;
-    var spool_dir: ?std.fs.Dir = null;
-    defer if (spool_dir) |*d| d.close();
+    var spool_dir: ?std.Io.Dir = null;
+    defer if (spool_dir) |d| d.close(defaultIo());
     defer if (has_audit_shipper) audit_shipper.deinit();
 
     if (hooks.audit_emitter == null) {
@@ -1775,7 +1926,7 @@ fn execWithIoTuiHooks(
                         if (overflow == .fail_closed) return error.AuditSpoolSetup else null;
                     if (spool_path) |sp| {
                         if (core.fs_secure.ensureDirPath(sp)) {
-                            spool_dir = std.fs.openDirAbsolute(sp, .{ .iterate = true }) catch
+                            spool_dir = std.Io.Dir.openDirAbsolute(run_cmd.io, sp, .{ .iterate = true }) catch
                                 if (overflow == .fail_closed) return error.AuditSpoolSetup else null;
                         } else |_| {
                             if (overflow == .fail_closed) return error.AuditSpoolSetup;
@@ -1792,6 +1943,7 @@ fn execWithIoTuiHooks(
                     .transport = transport,
                     .overflow = overflow,
                     .buf_cap = fwd.buf_cap,
+                    .io = run_cmd.io,
                     .spool_dir = spool_dir,
                     .ca_file = run_cmd.cfg.ca_file,
                     .now_ms = hooks.now_ms,
@@ -1827,19 +1979,26 @@ fn execWithIoTuiHooks(
 
     defer if (store) |s| s.deinit();
 
-    const writer = if (out) |w| w else std.fs.File.stdout().deprecatedWriter().any();
-    const reader = if (in) |r| r else std.fs.File.stdin().deprecatedReader().any();
+    var stdout_buf: [4096]u8 = undefined;
+    var stdin_buf: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(run_cmd.io, &stdout_buf);
+    var stdin_reader = std.Io.File.stdin().readerStreaming(run_cmd.io, &stdin_buf);
+    const writer = if (out) |w| w else &stdout_writer.interface;
+    const reader = if (in) |r| r else &stdin_reader.interface;
 
     // Init provider
     var needs_login: ?NativeProviderKind = null;
     if (run_cmd.cfg.provider_cmd) |provider_cmd| {
-        try provider_rt.init(alloc, provider_cmd);
+        try provider_rt.init(alloc, defaultIo(), provider_cmd);
         has_provider_rt = true;
         provider = &provider_rt.client.provider;
     } else {
         const provider_name = resolveDefaultProvider(run_cmd.cfg.provider);
         if (parseNativeProviderKind(provider_name)) |native_kind| {
-            if (NativeProviderRuntime.init(alloc, native_kind, hooks.auth())) |nr| {
+            if (run_cmd.no_config) {
+                missing_provider.msg = missingProviderMsgForInitErr(native_kind, error.AuthNotFound);
+                provider = &missing_provider.provider;
+            } else if (NativeProviderRuntime.init(alloc, native_kind, hooks.auth())) |nr| {
                 native_rt = nr;
                 has_native_rt = true;
                 if (el) |*e| native_rt.setEventLoop(e);
@@ -1872,8 +2031,8 @@ fn execWithIoTuiHooks(
         session_dir_path = plan.dir_path;
 
         try core.fs_secure.ensureDirPath(plan.dir_path);
-        var session_dir = try std.fs.cwd().openDir(plan.dir_path, .{ .iterate = true });
-        errdefer session_dir.close();
+        var session_dir = try std.Io.Dir.cwd().openDir(defaultIo(), plan.dir_path, .{ .iterate = true });
+        errdefer session_dir.close(defaultIo());
         core.session.cleanOrphanTmpFiles(session_dir);
         fs_store_impl = try core.session.fs_store.Store.init(.{
             .alloc = alloc,
@@ -1958,6 +2117,7 @@ fn execWithIoTuiHooks(
         }
     }
 
+    if (out == null) try stdout_writer.interface.flush();
     return sid;
 }
 
@@ -1969,7 +2129,7 @@ fn runPrint(
     store: *core.session.SessionStore,
     pol: *const RuntimePolicy,
     tools_rt: *core.tools.builtin.Runtime,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     sys_prompt: ?[]const u8,
     audit_hooks: AuditHooks,
     is_oauth: bool,
@@ -2000,9 +2160,9 @@ fn runPrint(
     };
     var cmd_cache = core.loop.CmdCache.init(alloc);
     defer cmd_cache.deinit();
-    const approval_bind = try loadApprovalBindAlloc(alloc, home);
+    const approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
     defer approval_bind.deinit(alloc);
-    const approval_loc = try getApprovalLocAlloc(alloc);
+    const approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
     defer freeApprovalLoc(alloc, approval_loc);
 
     _ = try core.loop.run(.{
@@ -2146,8 +2306,8 @@ fn runJson(
     store: *core.session.SessionStore,
     pol: *const RuntimePolicy,
     tools_rt: *core.tools.builtin.Runtime,
-    in: std.Io.AnyReader,
-    out: std.Io.AnyWriter,
+    in: *std.Io.Reader,
+    out: *std.Io.Writer,
     sys_prompt: ?[]const u8,
     audit_hooks: AuditHooks,
     is_oauth: bool,
@@ -2161,9 +2321,9 @@ fn runJson(
     const popts = run_cmd.thinking.toProviderOpts();
     var cmd_cache = core.loop.CmdCache.init(alloc);
     defer cmd_cache.deinit();
-    const approval_bind = try loadApprovalBindAlloc(alloc, home);
+    const approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
     defer approval_bind.deinit(alloc);
-    const approval_loc = try getApprovalLocAlloc(alloc);
+    const approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
     defer freeApprovalLoc(alloc, approval_loc);
     const tctx = TurnCtx{
         .alloc = alloc,
@@ -2193,7 +2353,7 @@ fn runJson(
     }
 
     var turn_ct: usize = 0;
-    while (try in.readUntilDelimiterOrEofAlloc(alloc, '\n', 64 * 1024)) |raw_line| {
+    while (try readLineAlloc(alloc, in, 64 * 1024)) |raw_line| {
         defer alloc.free(raw_line);
 
         var line = raw_line;
@@ -2222,8 +2382,8 @@ fn runTui(
     store: *core.session.SessionStore,
     pol: *const RuntimePolicy,
     tools_rt: *core.tools.builtin.Runtime,
-    in: std.Io.AnyReader,
-    out: std.Io.AnyWriter,
+    in: *std.Io.Reader,
+    out: *std.Io.Writer,
     session_dir_path: ?[]const u8,
     no_session: bool,
     sys_prompt_arg: ?[]const u8,
@@ -2252,7 +2412,7 @@ fn runTui(
         break :blk ptr[0..m.len];
     } else &model_cycle;
 
-    const cwd_path = getProjectPath(alloc, home) catch "";
+    const cwd_path = getProjectPath(alloc, defaultIo(), home) catch "";
     defer if (cwd_path.len > 0) alloc.free(cwd_path);
     const branch = getGitBranch(alloc) catch "";
     defer if (branch.len > 0) alloc.free(branch);
@@ -2290,7 +2450,7 @@ fn runTui(
     };
 
     const stdin_fd = tui_hooks.stdin_fd;
-    const is_tty = tui_hooks.live orelse std.posix.isatty(stdin_fd);
+    const is_tty = tui_hooks.live orelse isTty(stdin_fd);
 
     // Enable raw mode early so the InputWatcher's poll() works for -p prompts
     if (is_tty and tui_hooks.raw_mode) {
@@ -2303,9 +2463,9 @@ fn runTui(
 
     var cmd_cache = core.loop.CmdCache.init(alloc);
     defer cmd_cache.deinit();
-    const approval_bind = try loadApprovalBindAlloc(alloc, home);
+    const approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
     defer approval_bind.deinit(alloc);
-    const approval_loc = try getApprovalLocAlloc(alloc);
+    const approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
     defer freeApprovalLoc(alloc, approval_loc);
     var bg_mgr = try bg.Manager.initWithOpts(alloc, .{
         .home = home,
@@ -2358,9 +2518,9 @@ fn runTui(
     ui.border_fg = thinkingBorderFg(thinking);
 
     // Background version check (TUI only, skip for dev builds)
-    const force_ver = std.posix.getenv("PZ_FORCE_VERSION_CHECK") != null;
+    const force_ver = getenv("PZ_FORCE_VERSION_CHECK") != null;
     const skip_ver = (!force_ver and builtin.is_test) or
-        std.posix.getenv("PZ_SKIP_VERSION_CHECK") != null or
+        getenv("PZ_SKIP_VERSION_CHECK") != null or
         (!force_ver and std.mem.indexOf(u8, cli.version, "-dev") != null);
     var ver_check = version_check.Checker.init();
     var ver_notice_done = skip_ver;
@@ -2374,9 +2534,9 @@ fn runTui(
     };
     if (is_resumed) {
         const restored = try tryRestoreSessionIntoUi(alloc, &ui, session_dir_path, no_session, sid.*);
-        if (!restored) try showStartup(alloc, &ui, true, home);
+        if (!restored) try showStartup(alloc, run_cmd.io, &ui, true, home);
     } else {
-        try showStartup(alloc, &ui, false, home);
+        try showStartup(alloc, run_cmd.io, &ui, false, home);
     }
 
     // Set terminal title (OSC 0)
@@ -2388,7 +2548,7 @@ fn runTui(
 
     // Auto-login: start OAuth flow on startup if auth is missing or expired.
     // Skip when using --provider-cmd (tests) or --no-config (no real auth expected).
-    if (run_cmd.cfg.provider_cmd == null) {
+    if (run_cmd.cfg.provider_cmd == null and !run_cmd.no_config) {
         const login_prov: ?core.providers.auth.Provider = if (native_rt) |nrt|
             nrt.expiredOAuthProvider()
         else if (needs_login) |kind| switch (kind) {
@@ -2401,8 +2561,8 @@ fn runTui(
             ui.tr.scrollToBottom();
             try ui.draw(out);
             var login_buf: [4096]u8 = undefined;
-            var login_fbs = std.io.fixedBufferStream(&login_buf);
-            runLoginFlow(alloc, login_fbs.writer().any(), .{
+            var login_writer: std.Io.Writer = .fixed(&login_buf);
+            runLoginFlow(alloc, &login_writer, .{
                 .prov = prov,
                 .prov_name = core.providers.auth.providerName(prov),
                 .key = "",
@@ -2411,7 +2571,7 @@ fn runTui(
                 defer alloc.free(em);
                 try ui.tr.infoText(em);
             };
-            const login_out = login_fbs.getWritten();
+            const login_out = login_writer.buffered();
             if (login_out.len > 0) {
                 try infoTextSafe(alloc, &ui, login_out);
             }
@@ -2424,7 +2584,7 @@ fn runTui(
 
     if (run_cmd.prompt) |prompt| {
         var init_cmd_buf: [4096]u8 = undefined;
-        var init_cmd_fbs = std.io.fixedBufferStream(&init_cmd_buf);
+        var init_cmd_writer: std.Io.Writer = .fixed(&init_cmd_buf);
         const cmd = try handleSlashCommand(
             alloc,
             prompt,
@@ -2439,7 +2599,7 @@ fn runTui(
             session_dir_path,
             no_session,
             sys_prompt,
-            init_cmd_fbs.writer().any(),
+            &init_cmd_writer,
             audit_hooks,
             &ctl_audit,
             home,
@@ -2499,7 +2659,7 @@ fn runTui(
             ui.panels.noteCompaction();
         }
         if (cmd == .handled or cmd == .compacted or cmd == .resumed or cmd == .clear or cmd == .copy or cmd == .cost or cmd == .reload or cmd == .select_model or cmd == .select_session or cmd == .select_settings or cmd == .select_fork) {
-            const cmd_text = init_cmd_fbs.getWritten();
+            const cmd_text = init_cmd_writer.buffered();
             if (cmd_text.len > 0) {
                 try infoTextSafe(alloc, &ui, cmd_text);
                 ui.tr.scrollToBottom();
@@ -2551,9 +2711,9 @@ fn runTui(
 
         var live_cmd_cache = core.loop.CmdCache.init(alloc);
         defer live_cmd_cache.deinit();
-        const live_approval_bind = try loadApprovalBindAlloc(alloc, home);
+        const live_approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
         defer live_approval_bind.deinit(alloc);
-        const live_approval_loc = try getApprovalLocAlloc(alloc);
+        const live_approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
         defer freeApprovalLoc(alloc, live_approval_loc);
         var live_tctx = TurnCtx{
             .alloc = alloc,
@@ -2814,7 +2974,7 @@ fn runTui(
                             defer alloc.free(prompt);
 
                             var cmd_buf: [4096]u8 = undefined;
-                            var cmd_fbs = std.io.fixedBufferStream(&cmd_buf);
+                            var cmd_writer: std.Io.Writer = .fixed(&cmd_buf);
                             const cmd = try handleSlashCommand(
                                 alloc,
                                 prompt,
@@ -2829,7 +2989,7 @@ fn runTui(
                                 session_dir_path,
                                 no_session,
                                 sys_prompt,
-                                cmd_fbs.writer().any(),
+                                &cmd_writer,
                                 audit_hooks,
                                 &ctl_audit,
                                 home,
@@ -2920,7 +3080,7 @@ fn runTui(
                             }
                             if (cmd == .handled or cmd == .compacted or cmd == .resumed) {
                                 if (cmd == .compacted) ui.panels.noteCompaction();
-                                const cmd_text = cmd_fbs.getWritten();
+                                const cmd_text = cmd_writer.buffered();
                                 if (cmd_text.len > 0) {
                                     try infoTextSafe(alloc, &ui, cmd_text);
                                     ui.tr.scrollToBottom();
@@ -3275,7 +3435,7 @@ fn runTui(
         // Non-TTY (piped input): line-buffered mode for tests/scripts
         var turn_ct: usize = 0;
         var cmd_ct: usize = 0;
-        while (try in.readUntilDelimiterOrEofAlloc(alloc, '\n', 64 * 1024)) |raw_line| {
+        while (try readLineAlloc(alloc, in, 64 * 1024)) |raw_line| {
             defer alloc.free(raw_line);
             try maybeShowVersionUpdate(alloc, &ui, &ver_check, &ver_notice_done, out);
 
@@ -3381,8 +3541,8 @@ fn runRpc(
     store: *core.session.SessionStore,
     pol: *const RuntimePolicy,
     tools_rt: *core.tools.builtin.Runtime,
-    in: std.Io.AnyReader,
-    out: std.Io.AnyWriter,
+    in: *std.Io.Reader,
+    out: *std.Io.Writer,
     session_dir_path: ?[]const u8,
     no_session: bool,
     sys_prompt: ?[]const u8,
@@ -3406,9 +3566,9 @@ fn runRpc(
     const popts = run_cmd.thinking.toProviderOpts();
     var cmd_cache = core.loop.CmdCache.init(alloc);
     defer cmd_cache.deinit();
-    const approval_bind = try loadApprovalBindAlloc(alloc, home);
+    const approval_bind = try loadApprovalBindAlloc(alloc, defaultIo(), home);
     defer approval_bind.deinit(alloc);
-    const approval_loc = try getApprovalLocAlloc(alloc);
+    const approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
     defer freeApprovalLoc(alloc, approval_loc);
     const tctx = TurnCtx{
         .alloc = alloc,
@@ -3433,7 +3593,7 @@ fn runRpc(
     });
     defer bg_mgr.deinit();
 
-    while (try in.readUntilDelimiterOrEofAlloc(alloc, '\n', 128 * 1024)) |raw_line| {
+    while (try readLineAlloc(alloc, in, 128 * 1024)) |raw_line| {
         defer alloc.free(raw_line);
 
         const bg_done = try bg_mgr.drainDone(alloc);
@@ -3732,7 +3892,7 @@ fn runRpc(
             },
             .upgrade => {
                 try runtimeCtlAudit(&ctl_audit, alloc, "upgrade", .cmd, runtimeUpgradeResName(), null, .start, null, &.{});
-                const outcome = audit_hooks.run_upgrade(alloc, updateAuditHooks(audit_hooks, home)) catch |err| {
+                const outcome = audit_hooks.run_upgrade(alloc, updateAuditHooks(audit_hooks, run_cmd.io, home)) catch |err| {
                     try runtimeCtlAudit(
                         &ctl_audit,
                         alloc,
@@ -3951,8 +4111,8 @@ fn runRpc(
                     });
                     continue;
                 };
-                var dir = try std.fs.cwd().openDir(session_dir, .{});
-                defer dir.close();
+                const dir = try openDirPath(session_dir, .{});
+                defer dir.close(defaultIo());
                 const ck = core.session.compactSession(alloc, dir, sid.*, audit_hooks.now_ms()) catch |err| {
                     try runtimeCtlAudit(
                         &ctl_audit,
@@ -4091,7 +4251,7 @@ fn parseAuthReq(arg: []const u8, provider_hint: ?[]const u8) !AuthReq {
 
 fn runLoginFlow(
     alloc: std.mem.Allocator,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     req: AuthReq,
     hooks: core.providers.auth.Hooks,
 ) !void {
@@ -4165,7 +4325,7 @@ fn runLoginFlow(
 
 fn runOAuthCallbackLogin(
     alloc: std.mem.Allocator,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     prov: core.providers.auth.Provider,
     oauth_name: []const u8,
     listener: *core.providers.oauth_callback.Listener,
@@ -4221,10 +4381,10 @@ fn runRpcLogin(alloc: std.mem.Allocator, req: RpcReq, hooks: core.providers.auth
         var flow = try core.providers.auth.beginOAuthWithRedirect(alloc, auth_req.prov, listener.redirect_uri);
         defer flow.deinit(alloc);
 
-        var out = std.ArrayList(u8).empty;
-        errdefer out.deinit(alloc);
-        try runOAuthCallbackLogin(alloc, out.writer(alloc).any(), auth_req.prov, oauth_name, &listener, &flow, hooks);
-        return out.toOwnedSlice(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        try runOAuthCallbackLogin(alloc, &out.writer, auth_req.prov, oauth_name, &listener, &flow, hooks);
+        return try out.toOwnedSlice();
     }
     if (kind == .oauth_complete) {
         const verifier = takePendingVerifier(auth_req.prov) orelse return error.MissingOAuthVerifier;
@@ -4317,7 +4477,7 @@ fn handleSlashCommand(
     session_dir_path: ?[]const u8,
     no_session: bool,
     _: ?[]const u8, // sys_prompt (unused after settings became interactive)
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     audit_hooks: AuditHooks,
     ctl_audit: *RuntimeCtlAudit,
     home: ?[]const u8,
@@ -4506,7 +4666,7 @@ fn handleSlashCommand(
         },
         .upgrade => {
             try runtimeCtlAudit(ctl_audit, alloc, "upgrade", .cmd, runtimeUpgradeResName(), null, .start, null, &.{});
-            const outcome = audit_hooks.run_upgrade(alloc, updateAuditHooks(audit_hooks, home)) catch |err| {
+            const outcome = audit_hooks.run_upgrade(alloc, updateAuditHooks(audit_hooks, audit_hooks.io, home)) catch |err| {
                 try runtimeCtlAudit(
                     ctl_audit,
                     alloc,
@@ -4626,8 +4786,8 @@ fn handleSlashCommand(
                 try out.writeAll(em);
                 return .handled;
             };
-            var dir = try std.fs.cwd().openDir(session_dir, .{});
-            defer dir.close();
+            const dir = try openDirPath(session_dir, .{});
+            defer dir.close(defaultIo());
             const ck = core.session.compactSession(alloc, dir, sid.*, audit_hooks.now_ms()) catch |err| {
                 try runtimeCtlAudit(
                     ctl_audit,
@@ -4681,8 +4841,8 @@ fn handleSlashCommand(
                 try out.writeAll(em);
                 return .handled;
             };
-            var dir = try std.fs.cwd().openDir(session_dir, .{});
-            defer dir.close();
+            const dir = try openDirPath(session_dir, .{});
+            defer dir.close(defaultIo());
             const out_path = if (arg.len > 0) arg else null;
             const path = core.session.@"export".toMarkdownAudited(alloc, dir, sid.*, out_path, exportAuditHooks(audit_hooks)) catch |err| {
                 try runtimeCtlAudit(
@@ -4842,8 +5002,8 @@ fn handleSlashCommand(
                 try out.writeAll(em);
                 return .handled;
             };
-            var dir = try std.fs.cwd().openDir(session_dir, .{});
-            defer dir.close();
+            const dir = try openDirPath(session_dir, .{});
+            defer dir.close(defaultIo());
             const md_path = core.session.@"export".toMarkdownAudited(alloc, dir, sid.*, null, exportAuditHooks(audit_hooks)) catch |err| {
                 try runtimeCtlAudit(
                     ctl_audit,
@@ -4862,7 +5022,7 @@ fn handleSlashCommand(
                 return .handled;
             };
             defer alloc.free(md_path);
-            const gist_url = audit_hooks.share_gist(alloc, md_path, pol) catch |err| {
+            const gist_url = audit_hooks.share_gist(alloc, audit_hooks.io, md_path, pol) catch |err| {
                 try runtimeCtlAudit(
                     ctl_audit,
                     alloc,
@@ -4953,7 +5113,7 @@ fn runBgCommand(alloc: std.mem.Allocator, bg_mgr: *bg.Manager, arg: []const u8) 
             const v = (try bg_mgr.view(alloc, id)) orelse return alloc.dupe(u8, "bg: not found\n");
             defer bg.deinitView(alloc, v);
 
-            return std.fmt.allocPrint(alloc, "id={d}\npid={d}\nstate={s}\ncode={?d}\nstarted_ms={d}\nended_ms={?d}\nlog={s}\ncmd={s}\n", .{
+            return std.fmt.allocPrint(alloc, "id={d}\npid={d}\nstate={s}\ncode={?}\nstarted_ms={d}\nended_ms={?}\nlog={s}\ncmd={s}\n", .{
                 v.id,
                 v.pid,
                 bg.stateName(v.state),
@@ -4995,7 +5155,7 @@ fn flushBgDone(alloc: std.mem.Allocator, ui: *tui_harness.Ui, bg_mgr: *bg.Manage
                 job.log_path,
             })
         else
-            try std.fmt.allocPrint(alloc, "[bg {d} {s} code={?d} log={s}]", .{
+            try std.fmt.allocPrint(alloc, "[bg {d} {s} code={?} log={s}]", .{
                 job.id,
                 bg.stateName(job.state),
                 job.code,
@@ -5025,7 +5185,7 @@ fn maybeShowVersionUpdate(
     ui: *tui_harness.Ui,
     check: *version_check.Checker,
     done: *bool,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
 ) !void {
     if (done.*) return;
     if (check.poll()) |new_ver| {
@@ -5044,9 +5204,9 @@ fn maybeShowVersionUpdate(
 
 /// Resolve a command to an absolute path from hardcoded candidates only.
 /// Never consults PATH. Caller must free the returned slice.
-fn resolveAbsCmd(alloc: std.mem.Allocator, candidates: []const []const u8) ![]const u8 {
+fn resolveAbsCmd(alloc: std.mem.Allocator, io: std.Io, candidates: []const []const u8) ![]const u8 {
     for (candidates) |p| {
-        std.fs.accessAbsolute(p, .{}) catch continue;
+        std.Io.Dir.accessAbsolute(io, p, .{}) catch continue;
         return try alloc.dupe(u8, p);
     }
     return error.CmdNotFound;
@@ -5057,17 +5217,16 @@ const gh_paths = if (builtin.target.os.tag == .macos)
 else
     &[_][]const u8{ "/usr/bin/gh", "/usr/local/bin/gh" };
 
-fn shareGist(alloc: std.mem.Allocator, md_path: []const u8, pol: *const RuntimePolicy) ![]u8 {
+fn shareGist(alloc: std.mem.Allocator, io: std.Io, md_path: []const u8, pol: *const RuntimePolicy) ![]u8 {
     if (!pol.allowsCmdKind("gh", null, "egress")) return error.PolicyDenied;
-    const gh = try resolveAbsCmd(alloc, gh_paths);
+    const gh = try resolveAbsCmd(alloc, io, gh_paths);
     defer alloc.free(gh);
-    const result = try std.process.Child.run(.{
-        .allocator = alloc,
+    const result = try std.process.run(alloc, io, .{
         .argv = &.{ gh, "gist", "create", "--public=false", md_path },
     });
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
-    if (result.term.Exited != 0) return error.GistFailed;
+    if (result.term != .exited or result.term.exited != 0) return error.GistFailed;
     const url = std.mem.trim(u8, result.stdout, " \t\n\r");
     if (url.len == 0) return error.GistFailed;
     return try alloc.dupe(u8, url);
@@ -5075,7 +5234,7 @@ fn shareGist(alloc: std.mem.Allocator, md_path: []const u8, pol: *const RuntimeP
 
 fn writeJsonLine(
     alloc: std.mem.Allocator,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     value: anytype,
 ) !void {
     const raw = try std.json.Stringify.valueAlloc(alloc, value, .{});
@@ -5086,7 +5245,7 @@ fn writeJsonLine(
 
 fn writeTextLine(
     alloc: std.mem.Allocator,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
@@ -5096,8 +5255,8 @@ fn writeTextLine(
 }
 
 fn listUserMessages(alloc: std.mem.Allocator, session_dir: []const u8, sid: []const u8) ![][]u8 {
-    var dir = try std.fs.cwd().openDir(session_dir, .{});
-    defer dir.close();
+    const dir = try openDirPath(session_dir, .{});
+    defer dir.close(defaultIo());
 
     var rdr = core.session.reader.ReplayReader.init(alloc, dir, sid, .{}) catch return try alloc.alloc([]u8, 0);
     defer rdr.deinit();
@@ -5229,7 +5388,7 @@ fn sessionStats(
     const abs = try std.fs.path.join(alloc, &.{ session_dir_path.?, rel });
     errdefer alloc.free(abs);
 
-    const f = std.fs.openFileAbsolute(abs, .{ .mode = .read_only }) catch |err| switch (err) {
+    const f = std.Io.Dir.openFileAbsolute(defaultIo(), abs, .{ .mode = .read_only }) catch |err| switch (err) {
         error.FileNotFound => {
             return .{
                 .path = abs,
@@ -5240,9 +5399,9 @@ fn sessionStats(
         },
         else => return err,
     };
-    defer f.close();
+    defer f.close(defaultIo());
 
-    const st = try f.stat();
+    const st = try f.stat(defaultIo());
     var lines: usize = 0;
     var user_msgs: u32 = 0;
     var asst_msgs: u32 = 0;
@@ -5250,13 +5409,13 @@ fn sessionStats(
     var tool_results: u32 = 0;
     // Replay once to count lines and message types.
     if (session_dir_path) |sdp| {
-        var dir = std.fs.cwd().openDir(sdp, .{}) catch return .{
+        const dir = openDirPath(sdp, .{}) catch return .{
             .path = abs,
             .path_owned = abs,
             .bytes = st.size,
             .lines = lines,
         };
-        defer dir.close();
+        defer dir.close(defaultIo());
         var rdr = core.session.ReplayReader.init(alloc, dir, sid, .{}) catch return .{
             .path = abs,
             .path_owned = abs,
@@ -5484,8 +5643,8 @@ fn restoreSessionIntoUi(
     sid: []const u8,
 ) !void {
     const dir_path = try requireSessionDir(session_dir_path, no_session);
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
-    defer dir.close();
+    var dir = try openDirPath(dir_path, .{});
+    defer dir.close(defaultIo());
 
     var rdr = try core.session.ReplayReader.init(alloc, dir, sid, .{});
     defer rdr.deinit();
@@ -5622,8 +5781,8 @@ fn applyForkSid(
 }
 
 fn listSessionsAlloc(alloc: std.mem.Allocator, session_dir: []const u8) ![]u8 {
-    var dir = try std.fs.cwd().openDir(session_dir, .{ .iterate = true });
-    defer dir.close();
+    const dir = try openDirPath(session_dir, .{ .iterate = true });
+    defer dir.close(defaultIo());
 
     var names = std.ArrayList([]u8).empty;
     defer {
@@ -5632,7 +5791,7 @@ fn listSessionsAlloc(alloc: std.mem.Allocator, session_dir: []const u8) ![]u8 {
     }
 
     var it = dir.iterate();
-    while (try it.next()) |ent| {
+    while (try it.next(defaultIo())) |ent| {
         if (ent.kind != .file) continue;
         const sid = fileSidFromName(ent.name) orelse continue;
         const dup = try alloc.dupe(u8, sid);
@@ -5652,8 +5811,8 @@ fn listSessionsAlloc(alloc: std.mem.Allocator, session_dir: []const u8) ![]u8 {
 }
 
 fn listSessionRows(alloc: std.mem.Allocator, session_dir: []const u8) ![]tui_overlay.Overlay.SessionRow {
-    var dir = try std.fs.cwd().openDir(session_dir, .{ .iterate = true });
-    defer dir.close();
+    const dir = try openDirPath(session_dir, .{ .iterate = true });
+    defer dir.close(defaultIo());
 
     var names = std.ArrayList([]u8).empty;
     defer {
@@ -5662,7 +5821,7 @@ fn listSessionRows(alloc: std.mem.Allocator, session_dir: []const u8) ![]tui_ove
     }
 
     var it = dir.iterate();
-    while (try it.next()) |ent| {
+    while (try it.next(defaultIo())) |ent| {
         if (ent.kind != .file) continue;
         const sid = fileSidFromName(ent.name) orelse continue;
         const dup = try alloc.dupe(u8, sid);
@@ -5689,7 +5848,7 @@ fn listSessionRows(alloc: std.mem.Allocator, session_dir: []const u8) ![]tui_ove
         .tokens = &.{},
     });
 
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = core.time.milliTimestamp();
     for (names.items, 0..) |sid, idx| {
         rows[idx] = try buildSessionRow(alloc, dir, sid, now_ms);
     }
@@ -5697,8 +5856,8 @@ fn listSessionRows(alloc: std.mem.Allocator, session_dir: []const u8) ![]tui_ove
 }
 
 fn listSessionSids(alloc: std.mem.Allocator, session_dir: []const u8) ![][]u8 {
-    var dir = try std.fs.cwd().openDir(session_dir, .{ .iterate = true });
-    defer dir.close();
+    const dir = try openDirPath(session_dir, .{ .iterate = true });
+    defer dir.close(defaultIo());
 
     var names = std.ArrayList([]u8).empty;
     errdefer {
@@ -5707,7 +5866,7 @@ fn listSessionSids(alloc: std.mem.Allocator, session_dir: []const u8) ![][]u8 {
     }
 
     var it = dir.iterate();
-    while (try it.next()) |ent| {
+    while (try it.next(defaultIo())) |ent| {
         if (ent.kind != .file) continue;
         const sid = fileSidFromName(ent.name) orelse continue;
         const dup = try alloc.dupe(u8, sid);
@@ -5725,7 +5884,7 @@ fn lessSid(_: void, a: []u8, b: []u8) bool {
 
 fn buildSessionRow(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     sid: []const u8,
     now_ms: i64,
 ) !tui_overlay.Overlay.SessionRow {
@@ -5736,7 +5895,7 @@ fn buildSessionRow(
 
     const path = try core.session.path.sidJsonlAlloc(alloc, sid);
     defer alloc.free(path);
-    const st = try dir.statFile(path);
+    const st = try dir.statFile(defaultIo(), path, .{});
     if (st.size > 0) {
         var rdr = try core.session.ReplayReader.init(alloc, dir, sid, .{});
         defer rdr.deinit();
@@ -5813,36 +5972,39 @@ fn fileSidFromName(name: []const u8) ?[]const u8 {
 }
 
 fn forkSessionFile(session_dir: []const u8, src_sid: []const u8, dst_sid: []const u8) !void {
-    var dir = try std.fs.cwd().openDir(session_dir, .{});
-    defer dir.close();
+    const dir = try openDirPath(session_dir, .{});
+    defer dir.close(defaultIo());
 
     var src_buf: [256]u8 = undefined;
     const src_path = std.fmt.bufPrint(&src_buf, "{s}.jsonl", .{src_sid}) catch return error.NameTooLong;
     var dst_buf: [256]u8 = undefined;
     const dst_path = std.fmt.bufPrint(&dst_buf, "{s}.jsonl", .{dst_sid}) catch return error.NameTooLong;
 
-    var dst = try dir.createFile(dst_path, .{
+    const dst = try dir.createFile(defaultIo(), dst_path, .{
         .truncate = true,
     });
-    defer dst.close();
+    defer dst.close(defaultIo());
 
-    var src = dir.openFile(src_path, .{ .mode = .read_only }) catch |err| switch (err) {
+    const src = dir.openFile(defaultIo(), src_path, .{ .mode = .read_only }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer src.close();
+    defer src.close(defaultIo());
 
     var buf: [8192]u8 = undefined;
     while (true) {
-        const n = try src.read(&buf);
+        const n = src.readStreaming(defaultIo(), &.{buf[0..]}) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
         if (n == 0) break;
-        try dst.writeAll(buf[0..n]);
+        try dst.writeStreamingAll(defaultIo(), buf[0..n]);
     }
-    try dst.sync();
+    try dst.sync(defaultIo());
 }
 
 fn newSid(alloc: std.mem.Allocator) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{d}", .{std.time.microTimestamp()});
+    return std.fmt.allocPrint(alloc, "{d}", .{core.time.microTimestamp()});
 }
 
 fn resolveSessionPlan(alloc: std.mem.Allocator, run_cmd: cli.Run) !core.session.selector.Plan {
@@ -5859,14 +6021,19 @@ fn resolveSessionPlan(alloc: std.mem.Allocator, run_cmd: cli.Run) !core.session.
     };
 }
 
-fn getApprovalLocAlloc(alloc: std.mem.Allocator) !core.loop.CmdCache.Loc {
+fn getApprovalLocAlloc(alloc: std.mem.Allocator, io: std.Io) !core.loop.CmdCache.Loc {
     if (try runCmdTrimAlloc(alloc, &.{ "jj", "root" }, 4096)) |root| {
         return .{ .repo_root = root };
     }
     if (try runCmdTrimAlloc(alloc, &.{ "git", "rev-parse", "--show-toplevel" }, 4096)) |root| {
         return .{ .repo_root = root };
     }
-    return .{ .cwd = try std.fs.cwd().realpathAlloc(alloc, ".") };
+    // currentPathAlloc returns a sentinel slice ([:0]u8, n+1 bytes). Loc.cwd is
+    // []const u8, which would erase the sentinel length and make freeApprovalLoc
+    // free n instead of n+1. Copy into an exact-length []u8 so alloc/free match.
+    const abs = try std.process.currentPathAlloc(io, alloc);
+    defer alloc.free(abs);
+    return .{ .cwd = try alloc.dupe(u8, abs) };
 }
 
 fn freeApprovalLoc(alloc: std.mem.Allocator, loc: core.loop.CmdCache.Loc) void {
@@ -5876,14 +6043,14 @@ fn freeApprovalLoc(alloc: std.mem.Allocator, loc: core.loop.CmdCache.Loc) void {
     }
 }
 
-fn loadApprovalBindAlloc(alloc: std.mem.Allocator, home: ?[]const u8) !core.policy.ApprovalBind {
-    const cwd = try std.fs.cwd().realpathAlloc(alloc, ".");
+fn loadApprovalBindAlloc(alloc: std.mem.Allocator, io: std.Io, home: ?[]const u8) !core.policy.ApprovalBind {
+    const cwd = try std.process.currentPathAlloc(io, alloc);
     defer alloc.free(cwd);
-    return core.policy.loadApprovalBind(alloc, cwd, home);
+    return core.policy.loadApprovalBind(alloc, io, cwd, home);
 }
 
-fn getProjectPath(alloc: std.mem.Allocator, home: ?[]const u8) ![]u8 {
-    const loc = try getApprovalLocAlloc(alloc);
+fn getProjectPath(alloc: std.mem.Allocator, io: std.Io, home: ?[]const u8) ![]u8 {
+    const loc = try getApprovalLocAlloc(alloc, io);
     defer freeApprovalLoc(alloc, loc);
     switch (loc) {
         .cwd => |cwd| return shortenHomePath(alloc, cwd, home),
@@ -5910,11 +6077,11 @@ fn getGitBranch(alloc: std.mem.Allocator) ![]u8 {
         alloc.free(branch);
     }
 
-    const head = std.fs.cwd().readFileAlloc(alloc, ".git/HEAD", 256) catch return error.NotFound;
+    const head = std.Io.Dir.cwd().readFileAlloc(defaultIo(), ".git/HEAD", alloc, .limited(256)) catch return error.NotFound;
     defer alloc.free(head);
     const prefix = "ref: refs/heads/";
     if (std.mem.startsWith(u8, head, prefix)) {
-        const rest = std.mem.trimRight(u8, head[prefix.len..], "\n\r ");
+        const rest = std.mem.trim(u8, head[prefix.len..], "\n\r ");
         return try alloc.dupe(u8, rest);
     }
     // Detached HEAD — show "detached" like pi
@@ -5969,17 +6136,17 @@ fn looksLikeHexCommit(text: []const u8) bool {
 
 // hardcoded argv, no user input -- policy gate not needed
 fn runCmdTrimAlloc(alloc: std.mem.Allocator, argv: []const []const u8, max_bytes: usize) error{OutOfMemory}!?[]u8 {
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
+    const result = std.process.run(alloc, defaultIo(), .{
         .argv = argv,
-        .max_output_bytes = max_bytes,
+        .stdout_limit = .limited(max_bytes),
+        .stderr_limit = .limited(max_bytes),
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null, // exec failure, command not found — expected for optional lookups
     };
     defer alloc.free(result.stderr);
     defer alloc.free(result.stdout);
-    if (result.term.Exited != 0) return null;
+    if (result.term != .exited or result.term.exited != 0) return null;
     const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
     if (trimmed.len == 0) return null;
     // Sanitize: external process output may contain invalid UTF-8
@@ -6057,7 +6224,7 @@ fn buildSystemPrompt(alloc: std.mem.Allocator, run_cmd: cli.Run, home: ?[]const 
         return error.PolicyLockedSystemPrompt;
     }
     if (run_cmd.cfg.policy_lock.context) {
-        const paths = try core.context.discoverPaths(alloc, home);
+        const paths = try core.context.discoverPaths(alloc, run_cmd.io, home);
         defer {
             for (paths) |p| alloc.free(p);
             alloc.free(paths);
@@ -6071,7 +6238,7 @@ fn buildSystemPrompt(alloc: std.mem.Allocator, run_cmd: cli.Run, home: ?[]const 
         return try alloc.dupe(u8, sp);
     }
 
-    const ctx = try core.context.load(alloc, home);
+    const ctx = try core.context.load(alloc, run_cmd.io, home);
     if (run_cmd.append_system_prompt) |ap| {
         if (ctx) |c| {
             defer alloc.free(c);
@@ -6249,7 +6416,7 @@ fn thinkingBorderFg(level: args_mod.ThinkingLevel) @import("../modes/tui/frame.z
     };
 }
 
-fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui, is_resumed: bool, home: ?[]const u8) !void {
+fn showStartup(alloc: std.mem.Allocator, io: std.Io, ui: *tui_harness.Ui, is_resumed: bool, home: ?[]const u8) !void {
     const t = tui_theme.get();
 
     // Version banner (matching pi's "pi v0.52.12")
@@ -6292,7 +6459,7 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui, is_resumed: bool, 
     }
 
     // Context section
-    const ctx_paths = try core.context.discoverPaths(alloc, home);
+    const ctx_paths = try core.context.discoverPaths(alloc, io, home);
     defer {
         for (ctx_paths) |p| alloc.free(p);
         alloc.free(ctx_paths);
@@ -6408,13 +6575,12 @@ fn showCost(_: std.mem.Allocator, ui: *tui_harness.Ui) !void {
         "0.000";
 
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(&buf);
     try w.print("Tokens  in: {d}  out: {d}  total: {d}", .{ u.in_tok, u.out_tok, u.tot_tok });
     if (u.cache_read > 0 or u.cache_write > 0)
         try w.print("\nCache   read: {d}  write: {d}", .{ u.cache_read, u.cache_write });
     try w.print("\nCost    ${s}", .{cost_val});
-    try ui.tr.infoText(fbs.getWritten());
+    try ui.tr.infoText(w.buffered());
 }
 
 const clip_paths = if (builtin.target.os.tag == .macos)
@@ -6437,20 +6603,24 @@ fn copyLastResponse(alloc: std.mem.Allocator, ui: *tui_harness.Ui, pol: *const R
 }
 
 fn pipeToCmd(alloc: std.mem.Allocator, cmd: []const u8, text: []const u8, pol: *const RuntimePolicy) !bool {
+    _ = alloc;
     const base = std.fs.path.basename(cmd);
     if (!pol.allowsCmdKind(base, null, "clipboard")) return false;
     const argv = [_][]const u8{cmd};
-    var child = std.process.Child.init(argv[0..], alloc);
-    child.stdin_behavior = .Pipe;
-    child.spawn() catch return false;
+    var child = std.process.spawn(defaultIo(), .{
+        .argv = argv[0..],
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
     if (child.stdin) |*stdin| {
-        try stdin.writeAll(text);
-        stdin.close();
+        try stdin.writeStreamingAll(defaultIo(), text);
+        stdin.close(defaultIo());
         child.stdin = null;
     }
-    const term = child.wait() catch return false;
+    const term = child.wait(defaultIo()) catch return false;
     return switch (term) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
 }
@@ -6500,7 +6670,7 @@ const AutoCompactOutcome = enum {
 const CompactFn = *const fn (
     ctx: ?*anyopaque,
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     sid: []const u8,
     now: i64,
 ) anyerror!CompactRun;
@@ -6508,7 +6678,7 @@ const CompactFn = *const fn (
 fn compactNow(
     _: ?*anyopaque,
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: std.Io.Dir,
     sid: []const u8,
     now: i64,
 ) !CompactRun {
@@ -6534,7 +6704,7 @@ fn formatCompactStopAlloc(alloc: std.mem.Allocator, meta: summary_types.SummaryM
 fn autoCompact(
     alloc: std.mem.Allocator,
     ui: *tui_harness.Ui,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     sid: []const u8,
     session_dir_path: ?[]const u8,
     no_session: bool,
@@ -6546,7 +6716,7 @@ fn autoCompact(
 fn autoCompactWith(
     alloc: std.mem.Allocator,
     ui: *tui_harness.Ui,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     sid: []const u8,
     session_dir_path: ?[]const u8,
     no_session: bool,
@@ -6565,9 +6735,9 @@ fn autoCompactWith(
     try ui.tr.infoText("[compacting...]");
     try ui.draw(out);
 
-    var dir = try std.fs.cwd().openDir(session_dir_path.?, .{});
-    defer dir.close();
-    const now = std.time.milliTimestamp();
+    const dir = try openDirPath(session_dir_path.?, .{});
+    defer dir.close(defaultIo());
+    const now = core.time.milliTimestamp();
     const res = compact_fn(compact_ctx, alloc, dir, sid, now) catch |err| {
         const detail = try report.inlineMsg(alloc, err);
         defer alloc.free(detail);
@@ -6899,10 +7069,10 @@ fn runBashMode(
         return;
     }
 
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
+    const result = std.process.run(alloc, defaultIo(), .{
         .argv = &.{ "/bin/bash", "-lc", bcmd.cmd },
-        .max_output_bytes = 256 * 1024,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
     }) catch |err| {
         const detail = try report.inlineMsg(alloc, err);
         defer alloc.free(detail);
@@ -6916,7 +7086,7 @@ fn runBashMode(
 
     const output = if (result.stdout.len > 0) result.stdout else result.stderr;
     const is_err = switch (result.term) {
-        .Exited => |code| code != 0,
+        .exited => |code| code != 0,
         else => true,
     };
 
@@ -6949,7 +7119,7 @@ fn runBashMode(
 }
 
 fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) !?[]u8 {
-    const raw_ed = std.posix.getenv("EDITOR") orelse std.posix.getenv("VISUAL") orelse "/usr/bin/vi";
+    const raw_ed = getenv("EDITOR") orelse getenv("VISUAL") orelse "/usr/bin/vi";
 
     // Reject null bytes — could truncate the path at the C boundary.
     if (std.mem.indexOfScalar(u8, raw_ed, 0) != null) return error.EditorNotFound;
@@ -6965,7 +7135,7 @@ fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) !?[]u8 {
         var found: ?[]const u8 = null;
         for (safe_dirs) |dir| {
             const full = try std.fs.path.join(alloc, &.{ dir, raw_ed });
-            std.fs.accessAbsolute(full, .{}) catch {
+            std.Io.Dir.accessAbsolute(defaultIo(), full, .{}) catch {
                 alloc.free(full);
                 continue;
             };
@@ -6977,27 +7147,30 @@ fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) !?[]u8 {
 
     // Write current text to unique temp file
     var tmp_buf: [64]u8 = undefined;
-    const ts: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    const ts: u64 = @truncate(@as(u128, @bitCast(core.time.nanoTimestamp())));
     const tmp = try std.fmt.bufPrint(&tmp_buf, "/tmp/pz-edit-{d}.txt", .{ts});
-    defer std.fs.deleteFileAbsolute(tmp) catch {}; // cleanup: propagation impossible
+    defer std.Io.Dir.deleteFileAbsolute(defaultIo(), tmp) catch {}; // cleanup: propagation impossible
     {
-        const f = try std.fs.createFileAbsolute(tmp, .{});
-        defer f.close();
-        try f.writeAll(current);
+        const f = try std.Io.Dir.createFileAbsolute(defaultIo(), tmp, .{});
+        defer f.close(defaultIo());
+        try f.writeStreamingAll(defaultIo(), current);
     }
 
     const argv = [_][]const u8{ ed, tmp };
-    var child = std.process.Child.init(argv[0..], alloc);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    try child.spawn();
-    _ = try child.wait();
+    var child = try std.process.spawn(defaultIo(), .{
+        .argv = argv[0..],
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    _ = try child.wait(defaultIo());
 
     // Read back
-    const f = try std.fs.openFileAbsolute(tmp, .{});
-    defer f.close();
-    const content = try f.readToEndAlloc(alloc, 1024 * 1024);
+    const f = try std.Io.Dir.openFileAbsolute(defaultIo(), tmp, .{});
+    defer f.close(defaultIo());
+    var read_buf: [8192]u8 = undefined;
+    var reader = f.readerStreaming(defaultIo(), &read_buf);
+    const content = try reader.interface.allocRemaining(alloc, .limited(1024 * 1024));
     // Trim trailing newline
     var len = content.len;
     while (len > 0 and (content[len - 1] == '\n' or content[len - 1] == '\r')) len -= 1;
@@ -7020,13 +7193,13 @@ fn pasteImage(alloc: std.mem.Allocator, ui: *tui_harness.Ui, tmp_dir: []const u8
     }
     // macOS: check clipboard for image via osascript
     const argv = [_][]const u8{
-        "/usr/bin/osascript",                                                                                            "-e",
+        "/usr/bin/osascript", "-e",
         "try\nset theType to (clipboard info for «class PNGf»)\nreturn \"image\"\non error\nreturn \"none\"\nend try",
     };
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
+    const result = std.process.run(alloc, defaultIo(), .{
         .argv = argv[0..],
-        .max_output_bytes = 256,
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(256),
     }) catch {
         try ui.tr.infoText("[paste: clipboard check failed]");
         return;
@@ -7042,9 +7215,9 @@ fn pasteImage(alloc: std.mem.Allocator, ui: *tui_harness.Ui, tmp_dir: []const u8
 
     // Save clipboard image to unique temp file
     var tmp_buf: [128]u8 = undefined;
-    const ts: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    const ts: u64 = @truncate(@as(u128, @bitCast(core.time.nanoTimestamp())));
     const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}/pz-paste-{d}.png", .{ tmp_dir, ts });
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {}; // cleanup: propagation impossible
+    defer std.Io.Dir.deleteFileAbsolute(defaultIo(), tmp_path) catch {}; // cleanup: propagation impossible
 
     // Reject paths with chars that could break out of AppleScript string interpolation.
     if (std.mem.indexOfAny(u8, tmp_path, "\"\\") != null) {
@@ -7056,10 +7229,10 @@ fn pasteImage(alloc: std.mem.Allocator, ui: *tui_harness.Ui, tmp_dir: []const u8
     defer alloc.free(script);
 
     const save_argv = [_][]const u8{ "/usr/bin/osascript", "-e", script };
-    const save_result = std.process.Child.run(.{
-        .allocator = alloc,
+    const save_result = std.process.run(alloc, defaultIo(), .{
         .argv = save_argv[0..],
-        .max_output_bytes = 256,
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(256),
     }) catch {
         try ui.tr.infoText("[paste: save failed]");
         return;
@@ -7080,10 +7253,10 @@ fn pasteText(alloc: std.mem.Allocator, ui: *tui_harness.Ui, pol: *const RuntimeP
         return;
     }
     const argv = [_][]const u8{"/usr/bin/pbpaste"};
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
+    const result = std.process.run(alloc, defaultIo(), .{
         .argv = argv[0..],
-        .max_output_bytes = 256 * 1024,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
     }) catch {
         try ui.tr.infoText("[paste failed]");
         return;
@@ -7342,7 +7515,7 @@ fn waitForAskTxn(live: *LiveTurn) !*LiveTurn.AskTxn {
     var spins: usize = 0;
     while (ask_txn == null and spins < 1000) : (spins += 1) {
         ask_txn = live.takeAsk();
-        if (ask_txn == null) std.Thread.sleep(std.time.ns_per_ms);
+        if (ask_txn == null) try std.Io.sleep(defaultIo(), .fromNanoseconds(std.time.ns_per_ms), .awake);
     }
     return ask_txn orelse error.TestUnexpectedResult;
 }
@@ -7446,19 +7619,19 @@ test "live turn ask handoff keeps editor input isolated and cannot deadlock" {
     try ui.ed.setText("draft");
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
-    const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
-    defer std.posix.close(pipe[0]);
-    defer std.posix.close(pipe[1]);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+    const pipe = try makePipe(false);
+    defer closeFd(pipe[0]);
+    defer closeFd(pipe[1]);
     var watcher = try InputWatcher.init(pipe[0]);
     defer watcher.deinit();
     var ask_ui_ctx = AskUiCtx{
         .alloc = std.testing.allocator,
         .ui = &ui,
-        .out = out_fbs.writer().any(),
+        .out = &out_fbs,
         .pause = &watcher.pause_ctl,
     };
-    _ = try std.posix.write(pipe[1], "\r\x1b[B\r");
+    try fdWriteAll(pipe[1], "\r\x1b[B\r");
     var reader = tui_input.Reader.init(watcher.fd);
 
     var ctx = Ctx{ .live = &live };
@@ -7513,19 +7686,19 @@ test "live turn ask handoff frees custom other answers cleanly" {
     try ui.ed.setText("draft");
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
-    const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
-    defer std.posix.close(pipe[0]);
-    defer std.posix.close(pipe[1]);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+    const pipe = try makePipe(false);
+    defer closeFd(pipe[0]);
+    defer closeFd(pipe[1]);
     var watcher = try InputWatcher.init(pipe[0]);
     defer watcher.deinit();
     var ask_ui_ctx = AskUiCtx{
         .alloc = std.testing.allocator,
         .ui = &ui,
-        .out = out_fbs.writer().any(),
+        .out = &out_fbs,
         .pause = &watcher.pause_ctl,
     };
-    _ = try std.posix.write(pipe[1], "\x1b[B\rZ\r\x1b[B\r");
+    try fdWriteAll(pipe[1], "\x1b[B\rZ\r\x1b[B\r");
     var reader = tui_input.Reader.init(watcher.fd);
 
     var ctx = Ctx{ .live = &live };
@@ -7583,19 +7756,19 @@ test "ask ui cancel frees temporary state and overlay" {
     try ui.ed.setText("draft");
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
-    const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
-    defer std.posix.close(pipe[0]);
-    defer std.posix.close(pipe[1]);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+    const pipe = try makePipe(false);
+    defer closeFd(pipe[0]);
+    defer closeFd(pipe[1]);
     var watcher = try InputWatcher.init(pipe[0]);
     defer watcher.deinit();
     var ask_ui_ctx = AskUiCtx{
         .alloc = std.testing.allocator,
         .ui = &ui,
-        .out = out_fbs.writer().any(),
+        .out = &out_fbs,
         .pause = &watcher.pause_ctl,
     };
-    _ = try std.posix.write(pipe[1], "\x03");
+    try fdWriteAll(pipe[1], "\x03");
     var reader = tui_input.Reader.init(watcher.fd);
 
     var ctx = Ctx{ .live = &live };
@@ -7618,18 +7791,18 @@ test "ask ui cancel frees temporary state and overlay" {
 }
 
 test "input watcher join wakes promptly while paused" {
-    const in_pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
-    defer std.posix.close(in_pipe[0]);
-    defer std.posix.close(in_pipe[1]);
+    const in_pipe = try makePipe(false);
+    defer closeFd(in_pipe[0]);
+    defer closeFd(in_pipe[1]);
 
     var watcher = try InputWatcher.init(in_pipe[0]);
     defer watcher.deinit();
     try std.testing.expect(watcher.start());
     watcher.setPaused(true);
 
-    const done_pipe = try std.posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
-    defer std.posix.close(done_pipe[0]);
-    defer std.posix.close(done_pipe[1]);
+    const done_pipe = try makePipe(true);
+    defer closeFd(done_pipe[0]);
+    defer closeFd(done_pipe[1]);
 
     const Ctx = struct {
         watcher: *InputWatcher,
@@ -7637,7 +7810,7 @@ test "input watcher join wakes promptly while paused" {
 
         fn run(self: *@This()) void {
             self.watcher.join(null);
-            _ = std.posix.write(self.fd, "\x01") catch {}; // cleanup: propagation impossible
+            fdWriteAll(self.fd, "\x01") catch {}; // cleanup: propagation impossible
         }
     };
     var ctx = Ctx{ .watcher = &watcher, .fd = done_pipe[1] };
@@ -7814,13 +7987,13 @@ test "showQueueOverlay and dequeueQueuedIntoEditor edit selected message" {
 }
 
 fn writeSessionEventsFile(tmp: std.testing.TmpDir, sub_path: []const u8, events: []const core.session.Event) !void {
-    const file = try tmp.dir.createFile(sub_path, .{});
-    defer file.close();
+    const file = try tmp.dir.createFile(std.testing.io, sub_path, .{});
+    defer file.close(std.testing.io);
     for (events) |ev| {
         const raw = try core.session.encodeEventAlloc(std.testing.allocator, ev);
         defer std.testing.allocator.free(raw);
-        try file.writeAll(raw);
-        try file.writeAll("\n");
+        try file.writeStreamingAll(std.testing.io, raw);
+        try file.writeStreamingAll(std.testing.io, "\n");
     }
 }
 
@@ -7849,17 +8022,17 @@ test "showResumeOverlay lists sessions and supports arrow navigation" {
     const oh = OhSnap{};
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "sess/200.jsonl",
         .data = "",
     });
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "sess/100.jsonl",
         .data = "",
     });
 
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
@@ -7932,9 +8105,9 @@ test "showResumeOverlay fixed-width snapshot aligns age and token columns" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
 
-    const now = std.time.milliTimestamp();
+    const now = core.time.milliTimestamp();
     const long_events = [_]core.session.Event{
         .{
             .at_ms = now - (2 * 60 * 60 * std.time.ms_per_s),
@@ -7959,7 +8132,7 @@ test "showResumeOverlay fixed-width snapshot aligns age and token columns" {
     };
     try writeSessionEventsFile(tmp, "sess/200.jsonl", &short_events);
 
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 48, 8, "m", "p");
@@ -8006,8 +8179,8 @@ test "showResumeOverlay fixed-width snapshot aligns age and token columns" {
 test "showResumeOverlay returns false when no sessions exist" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
@@ -8020,10 +8193,10 @@ test "showResumeOverlay returns false when no sessions exist" {
 test "restoreSessionIntoUi replays session history and resets stale ui state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
 
-    const file = try tmp.dir.createFile("sess/100.jsonl", .{});
-    defer file.close();
+    const file = try tmp.dir.createFile(std.testing.io, "sess/100.jsonl", .{});
+    defer file.close(std.testing.io);
     const events = [_]core.session.Event{
         .{
             .at_ms = 1,
@@ -8053,11 +8226,11 @@ test "restoreSessionIntoUi replays session history and resets stale ui state" {
     for (events) |ev| {
         const raw = try core.session.encodeEventAlloc(std.testing.allocator, ev);
         defer std.testing.allocator.free(raw);
-        try file.writeAll(raw);
-        try file.writeAll("\n");
+        try file.writeStreamingAll(std.testing.io, raw);
+        try file.writeStreamingAll(std.testing.io, "\n");
     }
 
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
@@ -8108,10 +8281,10 @@ test "restoreSessionIntoUi replays session history and resets stale ui state" {
 test "restoreSessionIntoUi ignores empty blocks when rendering bottom row" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
 
-    const file = try tmp.dir.createFile("sess/100.jsonl", .{});
-    defer file.close();
+    const file = try tmp.dir.createFile(std.testing.io, "sess/100.jsonl", .{});
+    defer file.close(std.testing.io);
     const events = [_]core.session.Event{
         .{
             .at_ms = 1,
@@ -8133,11 +8306,11 @@ test "restoreSessionIntoUi ignores empty blocks when rendering bottom row" {
     for (events) |ev| {
         const raw = try core.session.encodeEventAlloc(std.testing.allocator, ev);
         defer std.testing.allocator.free(raw);
-        try file.writeAll(raw);
-        try file.writeAll("\n");
+        try file.writeStreamingAll(std.testing.io, raw);
+        try file.writeStreamingAll(std.testing.io, "\n");
     }
 
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(std.testing.allocator, 24, 4, "m", "p");
@@ -8162,9 +8335,9 @@ test "runtime tui non-tty /resume restores session without running provider turn
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const file = try tmp.dir.createFile("sess/100.jsonl", .{});
-    defer file.close();
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const file = try tmp.dir.createFile(std.testing.io, "sess/100.jsonl", .{});
+    defer file.close(std.testing.io);
     const events = [_]core.session.Event{
         .{
             .at_ms = 1,
@@ -8182,11 +8355,11 @@ test "runtime tui non-tty /resume restores session without running provider turn
     for (events) |ev| {
         const raw = try core.session.encodeEventAlloc(std.testing.allocator, ev);
         defer std.testing.allocator.free(raw);
-        try file.writeAll(raw);
-        try file.writeAll("\n");
+        try file.writeStreamingAll(std.testing.io, raw);
+        try file.writeStreamingAll(std.testing.io, "\n");
     }
 
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -8202,25 +8375,25 @@ test "runtime tui non-tty /resume restores session without running provider turn
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("/resume 100\n");
+    var in_fbs: std.Io.Reader = .fixed("/resume 100\n");
     var out_buf: [65536]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
     try std.testing.expectEqualStrings("100", sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "resumed session 100") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "MODEL-RAN") == null);
 
-    var session_dir = try std.fs.openDirAbsolute(sess_abs, .{});
-    defer session_dir.close();
+    var session_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, sess_abs, .{});
+    defer session_dir.close(std.testing.io);
     var rdr = try core.session.ReplayReader.init(std.testing.allocator, session_dir, "100", .{});
     defer rdr.deinit();
 
@@ -8331,14 +8504,8 @@ test "sanitized cwd/branch render in footer without InvalidUtf8" {
     try ui.panels.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 80, .h = 2 });
 }
 
-fn eofReader() std.Io.AnyReader {
-    const S = struct {
-        fn read(_: *const anyopaque, buf: []u8) anyerror!usize {
-            _ = buf;
-            return 0; // EOF
-        }
-    };
-    return .{ .context = undefined, .readFn = &S.read };
+fn eofReader() *std.Io.Reader {
+    return std.Io.Reader.ending;
 }
 
 fn runtimeTestPolicyKeyPair() !core.signing.KeyPair {
@@ -8358,12 +8525,12 @@ fn noopPolicy() RuntimePolicy {
     };
 }
 
-fn writeRuntimePolicy(dir: std.fs.Dir, doc: core.policy.Doc) !void {
-    try dir.makePath(".pz");
+fn writeRuntimePolicy(dir: std.Io.Dir, doc: core.policy.Doc) !void {
+    try dir.createDirPath(std.testing.io, ".pz");
     const kp = try runtimeTestPolicyKeyPair();
     const raw = try core.policy.encodeSignedDoc(std.testing.allocator, doc, kp);
     defer std.testing.allocator.free(raw);
-    try dir.writeFile(.{ .sub_path = config.policy_rel_path, .data = raw });
+    try dir.writeFile(std.testing.io, .{ .sub_path = config.policy_rel_path, .data = raw });
 }
 
 const AuditRows = struct {
@@ -8500,8 +8667,8 @@ test "runtime print mode skips session persistence by default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -8518,27 +8685,27 @@ test "runtime print mode skips session persistence by default" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [1024]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
     // Output still works
-    try std.testing.expectEqualStrings("pong\n", out_fbs.getWritten());
+    try std.testing.expectEqualStrings("pong\n", out_fbs.buffered());
 
     // No session file should exist -- NullStore discards writes
-    var sess_dir = try std.fs.openDirAbsolute(sess_abs, .{ .iterate = true });
-    defer sess_dir.close();
+    var sess_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, sess_abs, .{ .iterate = true });
+    defer sess_dir.close(std.testing.io);
     var it = sess_dir.iterate();
-    try std.testing.expect((try it.next()) == null);
+    try std.testing.expect((try it.next(std.testing.io)) == null);
 }
 
 test "runtime executes tool calls through loop registry in print mode" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -8564,12 +8731,12 @@ test "runtime executes tool calls through loop registry in print mode" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [4096]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "done") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "stop reason=done") != null);
 }
@@ -8578,7 +8745,7 @@ test "runtime blocks tool dispatch under verified policy" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
     try writeRuntimePolicy(tmp.dir, .{
         .rules = &.{
             .{ .pattern = "runtime/tool/bash", .effect = .deny, .tool = "bash" },
@@ -8586,15 +8753,15 @@ test "runtime blocks tool dispatch under verified policy" {
         },
     });
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(root_abs);
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
     const provider_cmd =
         "req=$(cat); " ++
@@ -8619,12 +8786,12 @@ test "runtime blocks tool dispatch under verified policy" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [4096]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "tool_result id=\"call-1\" is_err=true out=\"blocked by policy\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "stop reason=done") != null);
 
@@ -8636,7 +8803,7 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
     try writeRuntimePolicy(tmp.dir, .{
         .rules = &.{
             .{ .pattern = "runtime/tool/bash", .effect = .deny, .tool = "bash" },
@@ -8644,11 +8811,11 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
         },
     });
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
     const provider_cmd =
         "req=$(cat); " ++
@@ -8673,7 +8840,7 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [4096]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
     var rows = AuditRows{};
     defer rows.deinit(std.testing.allocator);
 
@@ -8681,7 +8848,7 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
         std.testing.allocator,
         cfg,
         eofReader(),
-        out_fbs.writer().any(),
+        &out_fbs,
         .{
             .audit_emitter = &rows.emitter,
             .now_ms = struct {
@@ -8693,7 +8860,7 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "tool_result id=\"call-1\" is_err=true out=\"blocked by policy\"") != null);
     try std.testing.expect(rows.rows.items.len != 0);
 
@@ -8702,8 +8869,15 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
             var collector = try syslog_mock.UdpCollector.init();
             defer collector.deinit();
             const t = try collector.spawnCount(rows.rows.items.len);
+            // Join exactly once, before collector.deinit closes the socket: an
+            // early `try` failure below must not leave the collector thread
+            // receiving on a closed fd (BADF). The bool guard prevents a
+            // double-join on the success path.
+            var joined = false;
+            defer if (!joined) t.join();
 
             var sender = try core.syslog.Sender.init(std.testing.allocator, .{
+                .io = std.testing.io,
                 .transport = .udp,
                 .host = "127.0.0.1",
                 .port = collector.port(),
@@ -8713,14 +8887,22 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
 
             try audit_e2e.shipAuditRows(std.testing.allocator, &sender, rows.rows.items);
             t.join();
+            joined = true;
             try audit_e2e.verifyRoundTrip(&collector, rows.rows.items);
         },
         .tcp, .tls => {
             var collector = try syslog_mock.TcpCollector.init();
             defer collector.deinit();
             const t = try collector.spawnCount(rows.rows.items.len);
+            // Join exactly once, before collector.deinit closes the socket: an
+            // early `try` failure below must not leave the collector thread
+            // accepting/receiving on a closed fd (BADF). The bool guard
+            // prevents a double-join on the success path.
+            var joined = false;
+            defer if (!joined) t.join();
 
             var sender = try core.syslog.Sender.init(std.testing.allocator, .{
+                .io = std.testing.io,
                 .transport = .tcp,
                 .host = "127.0.0.1",
                 .port = collector.port(),
@@ -8730,6 +8912,7 @@ fn verifyDeniedBashAuditSyslog(transport: core.syslog.Transport) !void {
 
             try audit_e2e.shipAuditRows(std.testing.allocator, &sender, rows.rows.items);
             t.join();
+            joined = true;
             try audit_e2e.verifyRoundTrip(&collector, rows.rows.items);
         },
     }
@@ -8770,6 +8953,7 @@ test "AuditShipper buffers events during disconnect and flushes on reconnect" {
         .connector = &fail_conn.connector,
         .buf_cap = 8,
         .overflow = .drop_oldest,
+        .io = std.testing.io,
         .spool_dir = tmp.dir,
     });
     defer shipper.deinit();
@@ -8789,7 +8973,7 @@ test "AuditShipper buffers events during disconnect and flushes on reconnect" {
     // Verify spool file was written
     var count: usize = 0;
     var it = tmp.dir.iterate();
-    while (try it.next()) |ent| {
+    while (try it.next(std.testing.io)) |ent| {
         if (std.mem.endsWith(u8, ent.name, ".spool")) count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), count);
@@ -8843,14 +9027,14 @@ test "subagent stub inherits effective policy hash" {
         },
     });
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(root_abs);
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     var stub = try initSubagentStub(&pol, "agent-child");
@@ -8875,12 +9059,12 @@ test "subagent spawn fails closed under verified policy" {
         },
     });
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     try std.testing.expectError(error.PolicyDenied, initSubagentStub(&pol, "blocked"));
@@ -8890,8 +9074,8 @@ test "runtime print requires explicit approval for privileged escalation from un
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -8917,12 +9101,12 @@ test "runtime print requires explicit approval for privileged escalation from un
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [4096]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "approval required: bash `printf hi` derived from untrusted input") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "tool_result id=\"call-1\" is_err=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "out=\"hi\"") == null);
@@ -8932,8 +9116,8 @@ test "runtime forwards provider label to provider request" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -8955,12 +9139,12 @@ test "runtime forwards provider label to provider request" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [2048]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "provider=prov-x") != null);
 }
 
@@ -8968,8 +9152,8 @@ test "runtime executes tui mode path with provided prompt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -8986,17 +9170,17 @@ test "runtime executes tui mode path with provided prompt" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[2J") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "pong") != null);
 
-    var session_dir = try std.fs.openDirAbsolute(sess_abs, .{});
-    defer session_dir.close();
+    var session_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, sess_abs, .{});
+    defer session_dir.close(std.testing.io);
 
     var rdr = try core.session.ReplayReader.init(std.testing.allocator, session_dir, sid, .{});
     defer rdr.deinit();
@@ -9014,12 +9198,12 @@ test "runtime tui overflow retries once with injected live stdin" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
 
@@ -9035,9 +9219,9 @@ test "runtime tui overflow retries once with injected live stdin" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    const stdin_pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
-    defer std.posix.close(stdin_pipe[0]);
-    defer std.posix.close(stdin_pipe[1]);
+    const stdin_pipe = try makePipe(false);
+    defer closeFd(stdin_pipe[0]);
+    defer closeFd(stdin_pipe[1]);
 
     const RetryStream = struct {
         stream: core.providers.Stream = .{ .vt = &core.providers.Stream.Bind(@This(), @This().next, @This().deinit).vt },
@@ -9085,13 +9269,13 @@ test "runtime tui overflow retries once with injected live stdin" {
     };
     var provider_impl = RetryProvider{ .alloc = std.testing.allocator };
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
     var tools_rt = core.tools.builtin.Runtime.init(.{
         .alloc = std.testing.allocator,
         .tool_mask = core.tools.builtin.mask_all,
     });
-    const dir = try tmp.dir.openDir("sess", .{ .iterate = true });
+    const dir = try tmp.dir.openDir(std.testing.io, "sess", .{ .iterate = true });
     var fs_store = try core.session.fs_store.Store.init(.{
         .alloc = std.testing.allocator,
         .dir = dir,
@@ -9105,7 +9289,7 @@ test "runtime tui overflow retries once with injected live stdin" {
     defer std.testing.allocator.free(sid);
 
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     try runTui(
         std.testing.allocator,
@@ -9116,7 +9300,7 @@ test "runtime tui overflow retries once with injected live stdin" {
         &pol,
         &tools_rt,
         eofReader(),
-        out_fbs.writer().any(),
+        &out_fbs,
         "sess",
         false,
         null,
@@ -9133,22 +9317,21 @@ test "runtime tui overflow retries once with injected live stdin" {
         null,
     );
 
-    var session_dir = try std.fs.openDirAbsolute(sess_abs, .{});
-    defer session_dir.close();
+    var session_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, sess_abs, .{});
+    defer session_dir.close(std.testing.io);
     var rdr = try core.session.ReplayReader.init(std.testing.allocator, session_dir, sid, .{});
     defer rdr.deinit();
 
     var events = std.ArrayList(u8).empty;
     defer events.deinit(std.testing.allocator);
-    const w = events.writer(std.testing.allocator);
     while (try rdr.next()) |ev| {
         switch (ev.data) {
-            .prompt => |p| try w.print("prompt:{s}\n", .{p.text}),
-            .text => |t| try w.print("text:{s}\n", .{t.text}),
+            .prompt => |p| try events.print(std.testing.allocator, "prompt:{s}\n", .{p.text}),
+            .text => |t| try events.print(std.testing.allocator, "text:{s}\n", .{t.text}),
             else => {}, // test only inspects .prompt and .text events
         }
     }
-    const plain_out = try tui_transcript.stripAnsi(std.testing.allocator, out_fbs.getWritten());
+    const plain_out = try tui_transcript.stripAnsi(std.testing.allocator, out_fbs.buffered());
     defer std.testing.allocator.free(plain_out);
 
     const Snap = struct {
@@ -9180,8 +9363,8 @@ test "runtime tui reports error when no provider available" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9198,21 +9381,70 @@ test "runtime tui reports error when no provider available" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "provider unavailable") != null);
+}
+
+test "runtime no-config does not read or migrate legacy auth" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "home/.pi/agent/auth.json",
+        .data =
+        \\{
+        \\  "anthropic": {
+        \\    "type": "api_key",
+        \\    "key": "sk-legacy"
+        \\  }
+        \\}
+        ,
+    });
+    const home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_abs);
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var cfg = cli.Run{
+        .mode = .tui,
+        .prompt = "ping",
+        .home = home_abs,
+        .no_session = true,
+        .no_config = true,
+        .cfg = .{
+            .mode = .tui,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "anthropic"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = null,
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var out_buf: [16384]u8 = undefined;
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
+    defer std.testing.allocator.free(sid);
+
+    const written = out_fbs.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "ANTHROPIC_API_KEY") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "home/.pz/auth.json", .{}));
 }
 
 test "runtime print reports unsupported native provider without provider_cmd" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9229,14 +9461,14 @@ test "runtime print reports unsupported native provider without provider_cmd" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [4096]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     try std.testing.expectError(
         error.ProviderStopped,
-        execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any()),
+        execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs),
     );
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "native provider unavailable") != null);
 }
 
@@ -9244,8 +9476,8 @@ test "runtime tui consumes multiple prompts from input stream" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9266,24 +9498,24 @@ test "runtime tui consumes multiple prompts from input stream" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("first\nsecond\n");
+    var in_fbs: std.Io.Reader = .fixed("first\nsecond\n");
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "u1") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "u2") != null);
 
-    var session_dir = try std.fs.openDirAbsolute(sess_abs, .{});
-    defer session_dir.close();
+    var session_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, sess_abs, .{});
+    defer session_dir.close(std.testing.io);
     var rdr = try core.session.ReplayReader.init(std.testing.allocator, session_dir, sid, .{});
     defer rdr.deinit();
 
@@ -9305,8 +9537,8 @@ test "runtime tui rejects blank-only stdin input" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9322,17 +9554,17 @@ test "runtime tui rejects blank-only stdin input" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("\n\r\n\n");
+    var in_fbs: std.Io.Reader = .fixed("\n\r\n\n");
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     try std.testing.expectError(
         error.EmptyPrompt,
         execWithIo(
             std.testing.allocator,
             cfg,
-            in_fbs.reader().any(),
-            out_fbs.writer().any(),
+            &in_fbs,
+            &out_fbs,
         ),
     );
 }
@@ -9341,13 +9573,13 @@ fn expectLatestSessionReused(session_sel: anytype) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     {
-        const old_file = try tmp.dir.createFile("sess/100.jsonl", .{});
-        defer old_file.close();
+        const old_file = try tmp.dir.createFile(std.testing.io, "sess/100.jsonl", .{});
+        defer old_file.close(std.testing.io);
         const old_ev = try core.session.encodeEventAlloc(std.testing.allocator, .{
             .at_ms = 1,
             .data = .{
@@ -9355,12 +9587,12 @@ fn expectLatestSessionReused(session_sel: anytype) !void {
             },
         });
         defer std.testing.allocator.free(old_ev);
-        try old_file.writeAll(old_ev);
-        try old_file.writeAll("\n");
+        try old_file.writeStreamingAll(std.testing.io, old_ev);
+        try old_file.writeStreamingAll(std.testing.io, "\n");
     }
     {
-        const old_file = try tmp.dir.createFile("sess/200.jsonl", .{});
-        defer old_file.close();
+        const old_file = try tmp.dir.createFile(std.testing.io, "sess/200.jsonl", .{});
+        defer old_file.close(std.testing.io);
         const old_ev = try core.session.encodeEventAlloc(std.testing.allocator, .{
             .at_ms = 1,
             .data = .{
@@ -9368,8 +9600,8 @@ fn expectLatestSessionReused(session_sel: anytype) !void {
             },
         });
         defer std.testing.allocator.free(old_ev);
-        try old_file.writeAll(old_ev);
-        try old_file.writeAll("\n");
+        try old_file.writeStreamingAll(std.testing.io, old_ev);
+        try old_file.writeStreamingAll(std.testing.io, "\n");
     }
 
     var cfg = cli.Run{
@@ -9387,14 +9619,14 @@ fn expectLatestSessionReused(session_sel: anytype) !void {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [1024]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
     try std.testing.expectEqualStrings("200", sid);
 
-    var dir = try std.fs.openDirAbsolute(sess_abs, .{});
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, sess_abs, .{});
+    defer dir.close(std.testing.io);
     var rdr = try core.session.ReplayReader.init(std.testing.allocator, dir, "200", .{});
     defer rdr.deinit();
 
@@ -9427,13 +9659,13 @@ test "runtime explicit session path resumes that session id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     {
-        const old_file = try tmp.dir.createFile("sess/sid-1.jsonl", .{});
-        defer old_file.close();
+        const old_file = try tmp.dir.createFile(std.testing.io, "sess/sid-1.jsonl", .{});
+        defer old_file.close(std.testing.io);
         const old_ev = try core.session.encodeEventAlloc(std.testing.allocator, .{
             .at_ms = 1,
             .data = .{
@@ -9441,11 +9673,11 @@ test "runtime explicit session path resumes that session id" {
             },
         });
         defer std.testing.allocator.free(old_ev);
-        try old_file.writeAll(old_ev);
-        try old_file.writeAll("\n");
+        try old_file.writeStreamingAll(std.testing.io, old_ev);
+        try old_file.writeStreamingAll(std.testing.io, "\n");
     }
 
-    const sid_path = try tmp.dir.realpathAlloc(std.testing.allocator, "sess/sid-1.jsonl");
+    const sid_path = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess/sid-1.jsonl");
     defer std.testing.allocator.free(sid_path);
 
     var cfg = cli.Run{
@@ -9463,8 +9695,8 @@ test "runtime explicit session path resumes that session id" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [1024]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
     try std.testing.expectEqualStrings("sid-1", sid);
 }
@@ -9473,8 +9705,8 @@ test "runtime no session mode does not persist jsonl files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9492,23 +9724,23 @@ test "runtime no session mode does not persist jsonl files" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [1024]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    var sess_dir = try std.fs.openDirAbsolute(sess_abs, .{ .iterate = true });
-    defer sess_dir.close();
+    var sess_dir = try std.Io.Dir.openDirAbsolute(std.testing.io, sess_abs, .{ .iterate = true });
+    defer sess_dir.close(std.testing.io);
     var it = sess_dir.iterate();
-    try std.testing.expect((try it.next()) == null);
+    try std.testing.expect((try it.next(std.testing.io)) == null);
 }
 
 test "runtime tool mask filters builtins used by loop registry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9535,17 +9767,17 @@ test "runtime tool mask filters builtins used by loop registry" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [1024]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
         null,
-        out_fbs.writer().any(),
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "tool_result id=\"call-1\" is_err=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "tool-not-found:bash") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "stop reason=done") != null);
@@ -9555,8 +9787,8 @@ test "runtime json mode emits JSON lines for loop events" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9573,12 +9805,12 @@ test "runtime json mode emits JSON lines for loop events" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"session\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"provider\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "pong") != null);
@@ -9588,8 +9820,8 @@ test "runtime print mode uses configured model and provider" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9612,12 +9844,12 @@ test "runtime print mode uses configured model and provider" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [2048]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "model=cfg-model provider=cfg-provider") != null);
 }
 
@@ -9625,8 +9857,8 @@ test "runtime json mode uses configured model and stdin prompts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -9648,19 +9880,19 @@ test "runtime json mode uses configured model and stdin prompts" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("from-stdin\n");
+    var in_fbs: std.Io.Reader = .fixed("from-stdin\n");
     var out_buf: [4096]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "model=cfg-json-model provider=cfg-json-provider") != null);
 }
 
@@ -9668,8 +9900,8 @@ test "runtime json mode errors on empty stdin when no prompt is supplied" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9686,7 +9918,7 @@ test "runtime json mode errors on empty stdin when no prompt is supplied" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [1024]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     try std.testing.expectError(
         error.EmptyPrompt,
@@ -9694,7 +9926,7 @@ test "runtime json mode errors on empty stdin when no prompt is supplied" {
             std.testing.allocator,
             cfg,
             eofReader(),
-            out_fbs.writer().any(),
+            &out_fbs,
         ),
     );
 }
@@ -9705,24 +9937,24 @@ test "execWithIo cleans orphan compact temp files on startup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
     {
-        var f = try tmp.dir.createFile("sess/orphan.jsonl.compact.tmp", .{});
-        f.close();
+        var f = try tmp.dir.createFile(std.testing.io, "sess/orphan.jsonl.compact.tmp", .{});
+        f.close(std.testing.io);
     }
     // Need a real session file for --continue to latch onto
     {
-        const sf = try tmp.dir.createFile("sess/100.jsonl", .{});
-        defer sf.close();
+        const sf = try tmp.dir.createFile(std.testing.io, "sess/100.jsonl", .{});
+        defer sf.close(std.testing.io);
         const ev = try core.session.encodeEventAlloc(std.testing.allocator, .{
             .at_ms = 1,
             .data = .{ .prompt = .{ .text = "old" } },
         });
         defer std.testing.allocator.free(ev);
-        try sf.writeAll(ev);
-        try sf.writeAll("\n");
+        try sf.writeStreamingAll(std.testing.io, ev);
+        try sf.writeStreamingAll(std.testing.io, "\n");
     }
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9740,22 +9972,22 @@ test "execWithIo cleans orphan compact temp files on startup" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var out_buf: [2048]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
-    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs);
     defer std.testing.allocator.free(sid);
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile("sess/orphan.jsonl.compact.tmp"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "sess/orphan.jsonl.compact.tmp", .{}));
 }
 
 test "PrintSink surfaces session write errors non-fatally" {
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
-    var sink = PrintSink.init(std.testing.allocator, out_fbs.writer().any());
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+    var sink = PrintSink.init(std.testing.allocator, &out_fbs);
     defer sink.deinit();
 
     try sink.push(.{ .provider = .{ .text = "hello" } });
     try sink.push(.{ .session_write_err = "DiskFull" });
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "hello\n[session write failed: DiskFull]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "hello\n[session write failed: DiskFull]") != null);
 }
 
 test "TuiSink surfaces session write errors in transcript" {
@@ -9763,10 +9995,10 @@ test "TuiSink surfaces session write errors in transcript" {
     defer ui.deinit();
 
     var out_buf: [4096]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
     var sink = TuiSink{
         .ui = &ui,
-        .out = out_fbs.writer().any(),
+        .out = &out_fbs,
     };
 
     try sink.push(.{ .session_write_err = "DiskFull" });
@@ -9851,8 +10083,8 @@ test "runtime rpc mode handles session model prompt and quit commands" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9868,7 +10100,7 @@ test "runtime rpc mode handles session model prompt and quit commands" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream(
+    var in_fbs: std.Io.Reader = .fixed(
         "{\"cmd\":\"session\"}\n" ++
             "{\"cmd\":\"tools\",\"arg\":\"read,write\"}\n" ++
             "{\"cmd\":\"model\",\"arg\":\"m2\"}\n" ++
@@ -9878,17 +10110,17 @@ test "runtime rpc mode handles session model prompt and quit commands" {
             "{\"cmd\":\"quit\"}\n",
     );
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"rpc_session\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"session_file\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"session_lines\":") != null);
@@ -9906,8 +10138,8 @@ test "runtime tui slash commands execute without prompt turns" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -9923,19 +10155,19 @@ test "runtime tui slash commands execute without prompt turns" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("/help\n/session\n/provider p2\n/tools read\n/settings\n/new\n/quit\n");
+    var in_fbs: std.Io.Reader = .fixed("/help\n/session\n/provider p2\n/tools read\n/settings\n/new\n/quit\n");
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "/help") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "/session") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "/model") != null);
@@ -9952,10 +10184,10 @@ test "discoverSkills returns skill metadata with source" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz/skills/release");
-    var skill = try tmp.dir.createFile(".pz/skills/release/SKILL.md", .{});
-    defer skill.close();
-    try skill.writeAll(
+    try tmp.dir.createDirPath(std.testing.io, ".pz/skills/release");
+    var skill = try tmp.dir.createFile(std.testing.io, ".pz/skills/release/SKILL.md", .{});
+    defer skill.close(std.testing.io);
+    try skill.writeStreamingAll(std.testing.io,
         \\---
         \\name: release
         \\description: release pz
@@ -9965,11 +10197,11 @@ test "discoverSkills returns skill metadata with source" {
         \\
     );
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     const skills = try discoverSkills(std.testing.allocator, null);
@@ -9984,10 +10216,10 @@ test "handleSlashCommand falls through for user-invocable skills" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz/skills/release");
-    var skill = try tmp.dir.createFile(".pz/skills/release/SKILL.md", .{});
-    defer skill.close();
-    try skill.writeAll(
+    try tmp.dir.createDirPath(std.testing.io, ".pz/skills/release");
+    var skill = try tmp.dir.createFile(std.testing.io, ".pz/skills/release/SKILL.md", .{});
+    defer skill.close(std.testing.io);
+    try skill.writeStreamingAll(std.testing.io,
         \\---
         \\name: release
         \\description: release pz
@@ -9997,11 +10229,11 @@ test "handleSlashCommand falls through for user-invocable skills" {
         \\
     );
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try std.testing.allocator.dupe(u8, "sid");
@@ -10018,7 +10250,7 @@ test "handleSlashCommand falls through for user-invocable skills" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [256]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const got = try handleSlashCommand(
         std.testing.allocator,
@@ -10034,24 +10266,24 @@ test "handleSlashCommand falls through for user-invocable skills" {
         null,
         true,
         null,
-        out_fbs.writer().any(),
+        &out_fbs,
         .{},
         &ctl_audit,
         null,
     );
 
     try std.testing.expectEqual(CmdRes.unhandled, got);
-    try std.testing.expectEqual(@as(usize, 0), out_fbs.getWritten().len);
+    try std.testing.expectEqual(@as(usize, 0), out_fbs.buffered().len);
 }
 
 test "handleSlashCommand blocks non-user-invocable skills" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz/skills/release");
-    var skill = try tmp.dir.createFile(".pz/skills/release/SKILL.md", .{});
-    defer skill.close();
-    try skill.writeAll(
+    try tmp.dir.createDirPath(std.testing.io, ".pz/skills/release");
+    var skill = try tmp.dir.createFile(std.testing.io, ".pz/skills/release/SKILL.md", .{});
+    defer skill.close(std.testing.io);
+    try skill.writeStreamingAll(std.testing.io,
         \\---
         \\name: release
         \\description: release pz
@@ -10061,11 +10293,11 @@ test "handleSlashCommand blocks non-user-invocable skills" {
         \\
     );
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try std.testing.allocator.dupe(u8, "sid");
@@ -10082,7 +10314,7 @@ test "handleSlashCommand blocks non-user-invocable skills" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [256]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const got = try handleSlashCommand(
         std.testing.allocator,
@@ -10098,28 +10330,28 @@ test "handleSlashCommand blocks non-user-invocable skills" {
         null,
         true,
         null,
-        out_fbs.writer().any(),
+        &out_fbs,
         .{},
         &ctl_audit,
         null,
     );
 
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "skill blocked: /release") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "skill blocked: /release") != null);
 }
 
 test "TurnCtx.run binds approval context for destructive tools" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(cwd);
 
     const steps = [_]provider_mock.Step{
@@ -10252,12 +10484,12 @@ test "handleSlashCommand blocks builtins under verified policy" {
         },
     });
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try std.testing.allocator.dupe(u8, "sid");
@@ -10274,7 +10506,7 @@ test "handleSlashCommand blocks builtins under verified policy" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [256]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const got = try handleSlashCommand(
         std.testing.allocator,
@@ -10290,14 +10522,14 @@ test "handleSlashCommand blocks builtins under verified policy" {
         null,
         true,
         null,
-        out_fbs.writer().any(),
+        &out_fbs,
         .{},
         &ctl_audit,
         null,
     );
 
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "blocked by policy: /share") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "blocked by policy: /share") != null);
 }
 
 test "handleSlashCommand export share and upgrade emit audited redacted records" {
@@ -10307,7 +10539,7 @@ test "handleSlashCommand export share and upgrade emit audited redacted records"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
     const events = [_]core.session.Event{
         .{
             .at_ms = 1,
@@ -10324,17 +10556,17 @@ test "handleSlashCommand export share and upgrade emit audited redacted records"
     };
     try writeSessionEventsFile(tmp, "sess/100.jsonl", &events);
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
 
-    var pol = try RuntimePolicy.load(std.testing.allocator, null);
+    var pol = try RuntimePolicy.load(std.testing.allocator, defaultIo(), null);
     defer pol.deinit();
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(root_abs);
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var sid = try std.testing.allocator.dupe(u8, "100");
@@ -10359,7 +10591,7 @@ test "handleSlashCommand export share and upgrade emit audited redacted records"
             }
         }.f,
         .share_gist = struct {
-            fn ok(alloc: std.mem.Allocator, _: []const u8, _: *const RuntimePolicy) ![]u8 {
+            fn ok(alloc: std.mem.Allocator, _: std.Io, _: []const u8, _: *const RuntimePolicy) ![]u8 {
                 return try alloc.dupe(u8, "https://gist.github.test/private/secret-url");
             }
         }.ok,
@@ -10373,7 +10605,7 @@ test "handleSlashCommand export share and upgrade emit audited redacted records"
         }.ok,
     } };
     var out_buf: [1024]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     _ = try handleSlashCommand(
         std.testing.allocator,
@@ -10389,14 +10621,14 @@ test "handleSlashCommand export share and upgrade emit audited redacted records"
         sess_abs,
         false,
         null,
-        out_fbs.writer().any(),
+        &out_fbs,
         ctl_audit.hooks,
         &ctl_audit,
         null,
     );
 
     ctl_audit.hooks.share_gist = struct {
-        fn fail(_: std.mem.Allocator, _: []const u8, _: *const RuntimePolicy) ![]u8 {
+        fn fail(_: std.mem.Allocator, _: std.Io, _: []const u8, _: *const RuntimePolicy) ![]u8 {
             return error.GistFailed;
         }
     }.fail;
@@ -10415,7 +10647,7 @@ test "handleSlashCommand export share and upgrade emit audited redacted records"
         sess_abs,
         false,
         null,
-        out_fbs.writer().any(),
+        &out_fbs,
         ctl_audit.hooks,
         &ctl_audit,
         null,
@@ -10435,7 +10667,7 @@ test "handleSlashCommand export share and upgrade emit audited redacted records"
         sess_abs,
         false,
         null,
-        out_fbs.writer().any(),
+        &out_fbs,
         ctl_audit.hooks,
         &ctl_audit,
         null,
@@ -10464,7 +10696,7 @@ test "handleSlashCommand export share and upgrade emit audited redacted records"
         sess_abs,
         false,
         null,
-        out_fbs.writer().any(),
+        &out_fbs,
         ctl_audit.hooks,
         &ctl_audit,
         null,
@@ -10511,8 +10743,8 @@ test "runtime tui bg command starts and lists background jobs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10528,19 +10760,19 @@ test "runtime tui bg command starts and lists background jobs" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("/bg run sleep 1\n/bg list\n/quit\n");
+    var in_fbs: std.Io.Reader = .fixed("/bg run sleep 1\n/bg list\n/quit\n");
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "bg started id=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "id pid state code log cmd") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "bg L1 R1 D0") != null);
@@ -10552,8 +10784,8 @@ test "runtime snapshot for slash + bg flow" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10569,19 +10801,19 @@ test "runtime snapshot for slash + bg flow" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("/help\n/tools all\n/bg run sleep 1\n/bg list\n/quit\n");
+    var in_fbs: std.Io.Reader = .fixed("/help\n/tools all\n/bg run sleep 1\n/bg list\n/quit\n");
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     const Snap = struct {
         has_help: bool,
         has_tools_set: bool,
@@ -10609,8 +10841,8 @@ test "runtime rpc accepts type envelope aliases and echoes ids" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10626,7 +10858,7 @@ test "runtime rpc accepts type envelope aliases and echoes ids" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream(
+    var in_fbs: std.Io.Reader = .fixed(
         "{\"id\":\"1\",\"type\":\"get_state\"}\n" ++
             "{\"id\":\"2\",\"type\":\"set_model\",\"provider\":\"p2\",\"model_id\":\"m2\"}\n" ++
             "{\"id\":\"3\",\"type\":\"get_commands\"}\n" ++
@@ -10634,17 +10866,17 @@ test "runtime rpc accepts type envelope aliases and echoes ids" {
             "{\"id\":\"5\",\"type\":\"quit\"}\n",
     );
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"id\":\"1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"id\":\"2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"id\":\"3\"") != null);
@@ -10660,8 +10892,8 @@ test "runtime rpc bg command starts lists and stops jobs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -10677,24 +10909,24 @@ test "runtime rpc bg command starts lists and stops jobs" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream(
+    var in_fbs: std.Io.Reader = .fixed(
         "{\"id\":\"1\",\"cmd\":\"bg\",\"arg\":\"run sleep 1\"}\n" ++
             "{\"id\":\"2\",\"cmd\":\"bg\",\"arg\":\"list\"}\n" ++
             "{\"id\":\"3\",\"cmd\":\"bg\",\"arg\":\"stop 1\"}\n" ++
             "{\"id\":\"4\",\"cmd\":\"quit\"}\n",
     );
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"rpc_bg\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "bg started id=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "id pid state code log cmd") != null);
@@ -10711,17 +10943,17 @@ test "runtime rpc auth commands emit audited success and failure records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    try tmp.dir.makePath("home");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "home");
     {
-        var bad = try tmp.dir.createFile("home-bad", .{});
-        bad.close();
+        var bad = try tmp.dir.createFile(std.testing.io, "home-bad", .{});
+        bad.close(std.testing.io);
     }
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_abs);
-    const bad_home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home-bad");
+    const bad_home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home-bad");
     defer std.testing.allocator.free(bad_home_abs);
 
     var cfg = cli.Run{
@@ -10737,21 +10969,21 @@ test "runtime rpc auth commands emit audited success and failure records" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream(
+    var in_fbs: std.Io.Reader = .fixed(
         "{\"id\":\"1\",\"cmd\":\"login\",\"provider\":\"openai\",\"arg\":\"sk-openai-secret\"}\n" ++
             "{\"id\":\"2\",\"cmd\":\"logout\",\"provider\":\"openai\"}\n" ++
             "{\"id\":\"3\",\"cmd\":\"quit\"}\n",
     );
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
     var rows = AuditRows{};
     defer rows.deinit(std.testing.allocator);
 
     const sid = try execWithIoHooks(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
         .{
             .audit_emitter = &rows.emitter,
             .now_ms = struct {
@@ -10764,7 +10996,7 @@ test "runtime rpc auth commands emit audited success and failure records" {
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"rpc_auth\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "API key saved for openai") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "logged out of openai") != null);
@@ -10782,18 +11014,18 @@ test "runtime rpc auth commands emit audited success and failure records" {
     };
     defer fail_cfg.cfg.deinit(std.testing.allocator);
 
-    var fail_in_fbs = std.io.fixedBufferStream(
+    var fail_in_fbs: std.Io.Reader = .fixed(
         "{\"id\":\"4\",\"cmd\":\"login\",\"provider\":\"openai\",\"arg\":\"sk-openai-secret\"}\n" ++
             "{\"id\":\"5\",\"cmd\":\"quit\"}\n",
     );
     var fail_out_buf: [32768]u8 = undefined;
-    var fail_out_fbs = std.io.fixedBufferStream(&fail_out_buf);
+    var fail_out_fbs: std.Io.Writer = .fixed(&fail_out_buf);
 
     const fail_sid = try execWithIoHooks(
         std.testing.allocator,
         fail_cfg,
-        fail_in_fbs.reader().any(),
-        fail_out_fbs.writer().any(),
+        &fail_in_fbs,
+        &fail_out_fbs,
         .{
             .audit_emitter = &rows.emitter,
             .now_ms = struct {
@@ -10806,7 +11038,7 @@ test "runtime rpc auth commands emit audited success and failure records" {
     );
     defer std.testing.allocator.free(fail_sid);
 
-    const fail_written = fail_out_fbs.getWritten();
+    const fail_written = fail_out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, fail_written, "\"type\":\"rpc_error\"") != null);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -11270,8 +11502,8 @@ test "runtime rpc bg commands emit audited redacted control records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -11287,22 +11519,22 @@ test "runtime rpc bg commands emit audited redacted control records" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream(
+    var in_fbs: std.Io.Reader = .fixed(
         "{\"id\":\"1\",\"cmd\":\"bg\",\"arg\":\"run printf done\"}\n" ++
             "{\"id\":\"2\",\"cmd\":\"bg\",\"arg\":\"list\"}\n" ++
             "{\"id\":\"3\",\"cmd\":\"bg\",\"arg\":\"stop 42\"}\n" ++
             "{\"id\":\"4\",\"cmd\":\"quit\"}\n",
     );
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
     var rows = AuditRows{};
     defer rows.deinit(std.testing.allocator);
 
     const sid = try execWithIoHooks(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
         .{
             .audit_emitter = &rows.emitter,
             .now_ms = struct {
@@ -11314,7 +11546,7 @@ test "runtime rpc bg commands emit audited redacted control records" {
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"rpc_bg\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "bg started id=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "bg not found id=42") != null);
@@ -11780,17 +12012,17 @@ test "runtime tui auth commands emit audited success and failure records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    try tmp.dir.makePath("home");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "home");
     {
-        var bad = try tmp.dir.createFile("home-bad", .{});
-        bad.close();
+        var bad = try tmp.dir.createFile(std.testing.io, "home-bad", .{});
+        bad.close(std.testing.io);
     }
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_abs);
-    const bad_home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home-bad");
+    const bad_home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home-bad");
     defer std.testing.allocator.free(bad_home_abs);
 
     var cfg = cli.Run{
@@ -11806,17 +12038,17 @@ test "runtime tui auth commands emit audited success and failure records" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("/login openai sk-openai-secret\n/logout openai\n/quit\n");
+    var in_fbs: std.Io.Reader = .fixed("/login openai sk-openai-secret\n/logout openai\n/quit\n");
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
     var rows = AuditRows{};
     defer rows.deinit(std.testing.allocator);
 
     const sid = try execWithIoHooks(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
         .{
             .audit_emitter = &rows.emitter,
             .now_ms = struct {
@@ -11829,7 +12061,7 @@ test "runtime tui auth commands emit audited success and failure records" {
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "API key saved for openai") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "logged out of openai") != null);
 
@@ -11846,15 +12078,15 @@ test "runtime tui auth commands emit audited success and failure records" {
     };
     defer fail_cfg.cfg.deinit(std.testing.allocator);
 
-    var fail_in_fbs = std.io.fixedBufferStream("/login openai sk-openai-secret\n/quit\n");
+    var fail_in_fbs: std.Io.Reader = .fixed("/login openai sk-openai-secret\n/quit\n");
     var fail_out_buf: [32768]u8 = undefined;
-    var fail_out_fbs = std.io.fixedBufferStream(&fail_out_buf);
+    var fail_out_fbs: std.Io.Writer = .fixed(&fail_out_buf);
 
     const fail_sid = try execWithIoHooks(
         std.testing.allocator,
         fail_cfg,
-        fail_in_fbs.reader().any(),
-        fail_out_fbs.writer().any(),
+        &fail_in_fbs,
+        &fail_out_fbs,
         .{
             .audit_emitter = &rows.emitter,
             .now_ms = struct {
@@ -11867,7 +12099,7 @@ test "runtime tui auth commands emit audited success and failure records" {
     );
     defer std.testing.allocator.free(fail_sid);
 
-    const fail_written = fail_out_fbs.getWritten();
+    const fail_written = fail_out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, fail_written, "error: login failed") != null);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -12331,8 +12563,8 @@ test "runtime tui bg commands emit audited redacted control records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     var cfg = cli.Run{
@@ -12348,17 +12580,17 @@ test "runtime tui bg commands emit audited redacted control records" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("/bg run printf done\n/bg list\n/bg stop 42\n/quit\n");
+    var in_fbs: std.Io.Reader = .fixed("/bg run printf done\n/bg list\n/bg stop 42\n/quit\n");
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
     var rows = AuditRows{};
     defer rows.deinit(std.testing.allocator);
 
     const sid = try execWithIoHooks(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
         .{
             .audit_emitter = &rows.emitter,
             .now_ms = struct {
@@ -12370,7 +12602,7 @@ test "runtime tui bg commands emit audited redacted control records" {
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "bg started id=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "bg not found id=42") != null);
 
@@ -12852,7 +13084,7 @@ test "runtime reload audit snapshots start success and failure" {
         &sys_prompt_owned,
         &ctl_audit,
         struct {
-            fn f(alloc: std.mem.Allocator, _: ?[]const u8) !?[]u8 {
+            fn f(alloc: std.mem.Allocator, _: std.Io, _: ?[]const u8) !?[]u8 {
                 return try alloc.dupe(u8, "ctx a");
             }
         }.f,
@@ -12866,7 +13098,7 @@ test "runtime reload audit snapshots start success and failure" {
         &sys_prompt_owned,
         &ctl_audit,
         struct {
-            fn f(_: std.mem.Allocator, _: ?[]const u8) !?[]u8 {
+            fn f(_: std.mem.Allocator, _: std.Io, _: ?[]const u8) !?[]u8 {
                 return null;
             }
         }.f,
@@ -12882,7 +13114,7 @@ test "runtime reload audit snapshots start success and failure" {
             &sys_prompt_owned,
             &ctl_audit,
             struct {
-                fn f(_: std.mem.Allocator, _: ?[]const u8) !?[]u8 {
+                fn f(_: std.mem.Allocator, _: std.Io, _: ?[]const u8) !?[]u8 {
                     return error.AccessDenied;
                 }
             }.f,
@@ -12910,8 +13142,8 @@ test "runtime rpc control commands emit audited redacted control records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
     const events = [_]core.session.Event{
         .{
@@ -12942,7 +13174,7 @@ test "runtime rpc control commands emit audited redacted control records" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream(
+    var in_fbs: std.Io.Reader = .fixed(
         "{\"id\":\"1\",\"cmd\":\"provider\",\"arg\":\"p2\"}\n" ++
             "{\"id\":\"2\",\"type\":\"set_model\",\"provider\":\"p3\",\"model_id\":\"m2\"}\n" ++
             "{\"id\":\"3\",\"cmd\":\"tools\",\"arg\":\"bogus\"}\n" ++
@@ -12957,15 +13189,15 @@ test "runtime rpc control commands emit audited redacted control records" {
             "{\"id\":\"12\",\"cmd\":\"quit\"}\n",
     );
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
     var rows = AuditRows{};
     defer rows.deinit(std.testing.allocator);
 
     const sid = try execWithIoHooks(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
         .{
             .audit_emitter = &rows.emitter,
             .now_ms = struct {
@@ -13106,7 +13338,7 @@ test "UX8 walkthrough: bg run spawns job, bg list shows it, bg show shows detail
         &sys_prompt_owned,
         &ctl_audit,
         struct {
-            fn f(alloc: std.mem.Allocator, _: ?[]const u8) !?[]u8 {
+            fn f(alloc: std.mem.Allocator, _: std.Io, _: ?[]const u8) !?[]u8 {
                 return try alloc.dupe(u8, "refreshed context");
             }
         }.f,
@@ -13274,8 +13506,8 @@ test "runtime tui tools command updates tool availability per turn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -13299,19 +13531,19 @@ test "runtime tui tools command updates tool availability per turn" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("/tools read\none\n/tools all\ntwo\n/quit\n");
+    var in_fbs: std.Io.Reader = .fixed("/tools read\none\n/tools all\ntwo\n/quit\n");
     var out_buf: [65536]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "tools set to read") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "no-bash") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "has-bash") != null);
@@ -13321,8 +13553,8 @@ test "runtime rpc tools command updates tool availability per turn" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
 
     const provider_cmd =
@@ -13346,7 +13578,7 @@ test "runtime rpc tools command updates tool availability per turn" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream(
+    var in_fbs: std.Io.Reader = .fixed(
         "{\"cmd\":\"tools\",\"arg\":\"read\"}\n" ++
             "{\"cmd\":\"prompt\",\"text\":\"one\"}\n" ++
             "{\"cmd\":\"tools\",\"arg\":\"all\"}\n" ++
@@ -13354,17 +13586,17 @@ test "runtime rpc tools command updates tool availability per turn" {
             "{\"cmd\":\"quit\"}\n",
     );
     var out_buf: [65536]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIo(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
     );
     defer std.testing.allocator.free(sid);
 
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"cmd\":\"tools\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "no-bash") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "has-bash") != null);
@@ -13409,12 +13641,12 @@ test "showLogoutOverlay builds overlay and frees on deinit" {
 test "slash logout without explicit provider frees logged-in list cleanly" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
-    try tmp.dir.makePath("home");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "home");
 
-    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
     defer std.testing.allocator.free(sess_abs);
-    const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
+    const home_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_abs);
 
     var cfg = cli.Run{
@@ -13430,22 +13662,22 @@ test "slash logout without explicit provider frees logged-in list cleanly" {
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    var in_fbs = std.io.fixedBufferStream("/login openai sk-openai-secret\n/logout\n/quit\n");
+    var in_fbs: std.Io.Reader = .fixed("/login openai sk-openai-secret\n/logout\n/quit\n");
     var out_buf: [32768]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const sid = try execWithIoHooks(
         std.testing.allocator,
         cfg,
-        in_fbs.reader().any(),
-        out_fbs.writer().any(),
+        &in_fbs,
+        &out_fbs,
         .{
             .auth_home = home_abs,
         },
     );
     defer std.testing.allocator.free(sid);
 
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "API key saved for openai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "API key saved for openai") != null);
 }
 
 test "LiveTurn tracks last_stop last_err and last_model" {
@@ -13571,13 +13803,13 @@ test "buildSystemPrompt rejects context under policy lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "ctx" });
-    const old = try std.process.getCwdAlloc(std.testing.allocator);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "AGENTS.md", .data = "ctx" });
+    const old = try testCwdRealPathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(old);
-    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const cwd = try testRealPathAlloc(std.testing.allocator, tmp.dir, ".");
     defer std.testing.allocator.free(cwd);
-    try std.posix.chdir(cwd);
-    defer std.posix.chdir(old) catch {}; // test: error irrelevant
+    try chdirPath(cwd);
+    defer chdirPath(old) catch {}; // test: error irrelevant
 
     var run = cli.Run{
         .mode = .tui,
@@ -13690,8 +13922,8 @@ test "autoCompact draws compacting notice before compactor runs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -13701,13 +13933,13 @@ test "autoCompact draws compacting notice before compactor runs" {
     ui.panels.has_usage = true;
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const Ctx = struct {
         ui: *tui_harness.Ui,
         saw_notice: bool = false,
 
-        fn run(raw: ?*anyopaque, _: std.mem.Allocator, _: std.fs.Dir, _: []const u8, _: i64) !CompactRun {
+        fn run(raw: ?*anyopaque, _: std.mem.Allocator, _: std.Io.Dir, _: []const u8, _: i64) !CompactRun {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             for (self.ui.tr.blocks.items) |blk| {
                 if (std.mem.eql(u8, blk.buf.items, "[compacting...]")) {
@@ -13723,7 +13955,7 @@ test "autoCompact draws compacting notice before compactor runs" {
     try std.testing.expectEqual(AutoCompactOutcome.compacted, try autoCompactWith(
         alloc,
         &ui,
-        out_fbs.writer().any(),
+        &out_fbs,
         "sess-1",
         sess_abs,
         false,
@@ -13747,7 +13979,7 @@ test "autoCompact draws compacting notice before compactor runs" {
         \\  "[compacting...]
         \\[session compacted]"
     ).expectEqual(snap_txt);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "[compacting...]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "[compacting...]") != null);
 }
 
 test "autoCompact reports summary budget stop metadata" {
@@ -13757,8 +13989,8 @@ test "autoCompact reports summary budget stop metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -13768,10 +14000,10 @@ test "autoCompact reports summary budget stop metadata" {
     ui.panels.has_usage = true;
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const Ctx = struct {
-        fn run(_: ?*anyopaque, _: std.mem.Allocator, _: std.fs.Dir, _: []const u8, _: i64) !CompactRun {
+        fn run(_: ?*anyopaque, _: std.mem.Allocator, _: std.Io.Dir, _: []const u8, _: i64) !CompactRun {
             return .{ .stopped = .{
                 .outcome = .over_budget,
                 .input_bytes = 90210,
@@ -13787,7 +14019,7 @@ test "autoCompact reports summary budget stop metadata" {
     try std.testing.expectEqual(AutoCompactOutcome.stopped, try autoCompactWith(
         alloc,
         &ui,
-        out_fbs.writer().any(),
+        &out_fbs,
         "sess-1",
         sess_abs,
         false,
@@ -13810,7 +14042,7 @@ test "autoCompact reports summary budget stop metadata" {
         \\  "[compacting...]
         \\[auto-compact stopped: summary input over budget bytes=90210/65536 tokens=8192/4096 kept=3 dropped=17]"
     ).expectEqual(snap_txt);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "[compacting...]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "[compacting...]") != null);
 }
 
 test "resolveAbsCmd rejects PATH-only commands" {
@@ -13818,14 +14050,14 @@ test "resolveAbsCmd rejects PATH-only commands" {
     // Candidates that do not exist as absolute paths.
     const bogus = &[_][]const u8{ "/nonexistent/bin/xyz123", "/also/missing/xyz123" };
     // Must fail — PATH is never consulted.
-    try std.testing.expectError(error.CmdNotFound, resolveAbsCmd(alloc, bogus));
+    try std.testing.expectError(error.CmdNotFound, resolveAbsCmd(alloc, std.testing.io, bogus));
 }
 
 test "resolveAbsCmd finds existing absolute path" {
     const alloc = std.testing.allocator;
     // /bin/sh exists on all POSIX systems.
     const candidates = &[_][]const u8{ "/nonexistent/bin/nope", "/bin/sh" };
-    const result = try resolveAbsCmd(alloc, candidates);
+    const result = try resolveAbsCmd(alloc, std.testing.io, candidates);
     defer alloc.free(result);
     try std.testing.expectEqualStrings("/bin/sh", result);
 }
@@ -13900,7 +14132,7 @@ fn slashHelper(
     bg_mgr: *bg.Manager,
     session_dir_path: ?[]const u8,
     no_session: bool,
-    out: std.io.FixedBufferStream([]u8).Writer,
+    out: *std.Io.Writer,
     ctl_audit: *RuntimeCtlAudit,
 ) !CmdRes {
     return handleSlashCommand(
@@ -13917,7 +14149,7 @@ fn slashHelper(
         session_dir_path,
         no_session,
         null,
-        out.any(),
+        out,
         .{},
         ctl_audit,
         null,
@@ -13928,11 +14160,11 @@ test "UX6: /new creates clean session with new sid" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "old-session");
@@ -13949,28 +14181,28 @@ test "UX6: /new creates clean session with new sid" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/new", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/new", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
     // sid changed from original
     try std.testing.expect(!std.mem.eql(u8, sid, "old-session"));
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "new session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "new session") != null);
 }
 
 test "UX6: /name persists session title" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "100");
@@ -13987,22 +14219,22 @@ test "UX6: /name persists session title" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/name my-project", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/name my-project", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "session named: my-project") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "session named: my-project") != null);
 }
 
 test "UX6: /name without arg shows usage" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14019,22 +14251,22 @@ test "UX6: /name without arg shows usage" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/name", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/name", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "usage: /name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "usage: /name") != null);
 }
 
 test "UX6: /resume with no arg returns select_session" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14051,9 +14283,9 @@ test "UX6: /resume with no arg returns select_session" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/resume", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/resume", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.select_session, got);
 }
 
@@ -14061,8 +14293,8 @@ test "UX6: /resume with sid switches to that session" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     // Write a minimal session file so resume can find it.
@@ -14072,11 +14304,11 @@ test "UX6: /resume with sid switches to that session" {
     };
     try writeSessionEventsFile(tmp, "sess/200.jsonl", &events);
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "100");
@@ -14093,23 +14325,23 @@ test "UX6: /resume with sid switches to that session" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/resume 200", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/resume 200", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.resumed, got);
     try std.testing.expectEqualStrings("200", sid);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "resumed session 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "resumed session 200") != null);
 }
 
 test "UX6: /fork with no arg returns select_fork" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14126,9 +14358,9 @@ test "UX6: /fork with no arg returns select_fork" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/fork", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/fork", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.select_fork, got);
 }
 
@@ -14136,8 +14368,8 @@ test "UX6: /fork with sid copies session" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     const events = [_]core.session.Event{
@@ -14146,11 +14378,11 @@ test "UX6: /fork with sid copies session" {
     };
     try writeSessionEventsFile(tmp, "sess/300.jsonl", &events);
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "100");
@@ -14167,11 +14399,11 @@ test "UX6: /fork with sid copies session" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/fork 300", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/fork 300", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "forked session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "forked session") != null);
     // sid changed to the new fork
     try std.testing.expect(!std.mem.eql(u8, sid, "100"));
 }
@@ -14180,11 +14412,11 @@ test "UX6: /compact on disabled session shows notice" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14201,23 +14433,23 @@ test "UX6: /compact on disabled session shows notice" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/compact", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/compact", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
     // Should report error about sessions being disabled
-    try std.testing.expect(out_fbs.getWritten().len > 0);
+    try std.testing.expect(out_fbs.buffered().len > 0);
 }
 
 test "UX6: /export on disabled session shows error" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14234,19 +14466,19 @@ test "UX6: /export on disabled session shows error" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/export out.md", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/export out.md", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(out_fbs.getWritten().len > 0);
+    try std.testing.expect(out_fbs.buffered().len > 0);
 }
 
 test "UX6: /export writes file for valid session" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     const events = [_]core.session.Event{
@@ -14256,11 +14488,11 @@ test "UX6: /export writes file for valid session" {
     };
     try writeSessionEventsFile(tmp, "sess/400.jsonl", &events);
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "400");
@@ -14277,11 +14509,11 @@ test "UX6: /export writes file for valid session" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/export", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/export", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "exported to") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "exported to") != null);
 }
 
 // --- UX7: Auth/providers walkthrough tests ---
@@ -14290,11 +14522,11 @@ test "UX7: /login with no arg returns select_login overlay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14311,9 +14543,9 @@ test "UX7: /login with no arg returns select_login overlay" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/login", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/login", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.select_login, got);
 }
 
@@ -14321,11 +14553,11 @@ test "UX7: /login unknown provider shows error" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14342,22 +14574,22 @@ test "UX7: /login unknown provider shows error" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/login bogus-provider", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/login bogus-provider", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "unknown provider: bogus-provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "unknown provider: bogus-provider") != null);
 }
 
 test "UX7: /logout with unknown provider shows error" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14374,22 +14606,22 @@ test "UX7: /logout with unknown provider shows error" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/logout bogus", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/logout bogus", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "unknown provider: bogus") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "unknown provider: bogus") != null);
 }
 
 test "UX7: /model with arg changes active model" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14406,23 +14638,23 @@ test "UX7: /model with arg changes active model" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/model opus-4", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/model opus-4", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
     try std.testing.expectEqualStrings("opus-4", model);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "model set to opus-4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "model set to opus-4") != null);
 }
 
 test "UX7: /model with no arg returns select_model" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14439,9 +14671,9 @@ test "UX7: /model with no arg returns select_model" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/model", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/model", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.select_model, got);
 }
 
@@ -14450,7 +14682,7 @@ test "UX6: /share calls share_gist and prints url" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
     const events = [_]core.session.Event{
         .{ .at_ms = 1, .data = .{ .prompt = .{ .text = "hello" } } },
         .{ .at_ms = 2, .data = .{ .text = .{ .text = "world" } } },
@@ -14458,14 +14690,14 @@ test "UX6: /share calls share_gist and prints url" {
     };
     try writeSessionEventsFile(tmp, "sess/100.jsonl", &events);
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var sid = try alloc.dupe(u8, "100");
@@ -14482,17 +14714,17 @@ test "UX6: /share calls share_gist and prints url" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{
         .share_gist = struct {
-            fn ok(a: std.mem.Allocator, _: []const u8, _: *const RuntimePolicy) ![]u8 {
+            fn ok(a: std.mem.Allocator, _: std.Io, _: []const u8, _: *const RuntimePolicy) ![]u8 {
                 return try a.dupe(u8, "https://gist.example.com/123");
             }
         }.ok,
     } };
     var out_buf: [1024]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try handleSlashCommand(alloc, "/share", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, null, out_fbs.writer().any(), ctl_audit.hooks, &ctl_audit, null);
+    const got = try handleSlashCommand(alloc, "/share", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, null, &out_fbs, ctl_audit.hooks, &ctl_audit, null);
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "https://gist.example.com/123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "https://gist.example.com/123") != null);
 }
 
 test "UX6: /resume failure leaves prior sid intact" {
@@ -14500,21 +14732,21 @@ test "UX6: /resume failure leaves prior sid intact" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
     // Only session 100 exists; resuming 999 must fail
     const events = [_]core.session.Event{
         .{ .at_ms = 1, .data = .{ .prompt = .{ .text = "x" } } },
         .{ .at_ms = 2, .data = .{ .stop = .{ .reason = .done } } },
     };
     try writeSessionEventsFile(tmp, "sess/100.jsonl", &events);
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "100");
@@ -14531,9 +14763,9 @@ test "UX6: /resume failure leaves prior sid intact" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/resume 999", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/resume 999", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, sess_abs, false, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
     // sid must remain unchanged after failed resume
     try std.testing.expectEqualStrings("100", sid);
@@ -14543,11 +14775,11 @@ test "UX7: /provider with arg switches active provider" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14564,12 +14796,12 @@ test "UX7: /provider with arg switches active provider" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/provider openai", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/provider openai", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
     try std.testing.expectEqualStrings("openai", provider);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "provider set to openai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "provider set to openai") != null);
 }
 
 test "UX7: missing credential hint includes login instruction" {
@@ -14599,10 +14831,10 @@ test "UX10: version check notice appears when update available" {
     defer checker.deinit();
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
     var done = false;
 
-    try maybeShowVersionUpdate(alloc, &ui, &checker, &done, out_fbs.writer().any());
+    try maybeShowVersionUpdate(alloc, &ui, &checker, &done, &out_fbs);
 
     try std.testing.expect(done);
 
@@ -14628,10 +14860,10 @@ test "UX10: version check notice skips when already done" {
     defer checker.deinit();
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
     var done = true; // Already done
 
-    try maybeShowVersionUpdate(alloc, &ui, &checker, &done, out_fbs.writer().any());
+    try maybeShowVersionUpdate(alloc, &ui, &checker, &done, &out_fbs);
 
     // No blocks should be added when already done.
     try std.testing.expectEqual(@as(usize, 0), ui.tr.blocks.items.len);
@@ -14642,8 +14874,8 @@ test "UX11: manual /compact shows compacting notice" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -14653,13 +14885,13 @@ test "UX11: manual /compact shows compacting notice" {
     ui.panels.has_usage = true;
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const Ctx = struct {
         saw_notice: bool = false,
         ui_ref: *tui_harness.Ui,
 
-        fn run(raw: ?*anyopaque, _: std.mem.Allocator, _: std.fs.Dir, _: []const u8, _: i64) !CompactRun {
+        fn run(raw: ?*anyopaque, _: std.mem.Allocator, _: std.Io.Dir, _: []const u8, _: i64) !CompactRun {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             for (self.ui_ref.tr.blocks.items) |blk| {
                 if (std.mem.eql(u8, blk.buf.items, "[compacting...]")) {
@@ -14675,7 +14907,7 @@ test "UX11: manual /compact shows compacting notice" {
     const outcome = try autoCompactWith(
         alloc,
         &ui,
-        out_fbs.writer().any(),
+        &out_fbs,
         "sess-1",
         sess_abs,
         false,
@@ -14688,7 +14920,7 @@ test "UX11: manual /compact shows compacting notice" {
     try std.testing.expect(ctx.saw_notice);
 
     // Verify output stream also contains the notice.
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "[compacting...]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "[compacting...]") != null);
 }
 
 test "UX11: compaction preserves history after compact" {
@@ -14696,8 +14928,8 @@ test "UX11: compaction preserves history after compact" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -14712,10 +14944,10 @@ test "UX11: compaction preserves history after compact" {
     const pre_ct = ui.tr.blocks.items.len;
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const Ctx = struct {
-        fn run(_: ?*anyopaque, _: std.mem.Allocator, _: std.fs.Dir, _: []const u8, _: i64) !CompactRun {
+        fn run(_: ?*anyopaque, _: std.mem.Allocator, _: std.Io.Dir, _: []const u8, _: i64) !CompactRun {
             return .compacted;
         }
     };
@@ -14723,7 +14955,7 @@ test "UX11: compaction preserves history after compact" {
     const outcome = try autoCompactWith(
         alloc,
         &ui,
-        out_fbs.writer().any(),
+        &out_fbs,
         "sess-1",
         sess_abs,
         false,
@@ -14746,8 +14978,8 @@ test "UX11: compaction failure is non-fatal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sess");
-    const sess_abs = try tmp.dir.realpathAlloc(alloc, "sess");
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(alloc, tmp.dir, "sess");
     defer alloc.free(sess_abs);
 
     var ui = try tui_harness.Ui.init(alloc, 80, 12, "m", "p");
@@ -14757,10 +14989,10 @@ test "UX11: compaction failure is non-fatal" {
     ui.panels.has_usage = true;
 
     var out_buf: [16384]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const Ctx = struct {
-        fn run(_: ?*anyopaque, _: std.mem.Allocator, _: std.fs.Dir, _: []const u8, _: i64) !CompactRun {
+        fn run(_: ?*anyopaque, _: std.mem.Allocator, _: std.Io.Dir, _: []const u8, _: i64) !CompactRun {
             return error.FileNotFound;
         }
     };
@@ -14769,7 +15001,7 @@ test "UX11: compaction failure is non-fatal" {
     const outcome = try autoCompactWith(
         alloc,
         &ui,
-        out_fbs.writer().any(),
+        &out_fbs,
         "sess-1",
         sess_abs,
         false,
@@ -14924,11 +15156,11 @@ test "UX3 /session returns session info" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "test-sid");
@@ -14945,11 +15177,11 @@ test "UX3 /session returns session info" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [2048]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/session", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/session", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
-    const written = out_fbs.getWritten();
+    const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Session Info") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "test-sid") != null);
 }
@@ -14958,11 +15190,11 @@ test "UX3 /changelog returns changelog text" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -14979,22 +15211,22 @@ test "UX3 /changelog returns changelog text" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [4096]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/changelog", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/changelog", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.handled, got);
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.getWritten(), "What's New") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "What's New") != null);
 }
 
 test "UX3 /copy returns copy action" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -15011,9 +15243,9 @@ test "UX3 /copy returns copy action" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/copy", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/copy", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.copy, got);
 }
 
@@ -15021,11 +15253,11 @@ test "UX3 /quit returns quit action" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root = try tmp.dir.openDir(".", .{});
-    defer root.close();
+    var root = try tmp.dir.openDir(std.testing.io, ".", .{});
+    defer root.close(std.testing.io);
     var guard = try path_guard.CwdGuard.enter(root);
     defer guard.deinit();
-    var pol = try RuntimePolicy.load(alloc, null);
+    var pol = try RuntimePolicy.load(alloc, defaultIo(), null);
     defer pol.deinit();
 
     var sid = try alloc.dupe(u8, "s");
@@ -15042,8 +15274,8 @@ test "UX3 /quit returns quit action" {
     defer bg_mgr.deinit();
     var ctl_audit = RuntimeCtlAudit{ .hooks = .{} };
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
-    const got = try slashHelper(alloc, "/quit", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, out_fbs.writer(), &ctl_audit);
+    const got = try slashHelper(alloc, "/quit", &sid, &model, &model_owned, &provider, &provider_owned, &pol, &tools_rt, &bg_mgr, null, true, &out_fbs, &ctl_audit);
     try std.testing.expectEqual(CmdRes.quit, got);
 }

@@ -82,18 +82,22 @@ pub const Aborter = struct {
 };
 
 pub const AbortSlot = struct {
-    mu: @import("std").Thread.Mutex = .{},
+    mu: @import("std").Io.Mutex = .init,
     cur: ?*Aborter = null,
 
+    fn io() @import("std").Io {
+        return @import("std").Io.Threaded.global_single_threaded.io();
+    }
+
     pub fn set(self: *AbortSlot, aborter: ?*Aborter) void {
-        self.mu.lock();
+        self.mu.lockUncancelable(io());
         self.cur = aborter;
-        self.mu.unlock();
+        self.mu.unlock(io());
     }
 
     pub fn abort(self: *AbortSlot) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(io());
+        defer self.mu.unlock(io());
         if (self.cur) |a| a.abort();
     }
 };

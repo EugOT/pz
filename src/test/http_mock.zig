@@ -1,5 +1,36 @@
 //! Test mock: HTTP request/response stub.
 const std = @import("std");
+const net = std.Io.net;
+
+fn defaultIo() std.Io {
+    return @import("../core/rt_io.zig").default();
+}
+
+fn fdRead(fd: std.posix.fd_t, buf: []u8) !usize {
+    const rc = std.c.read(fd, buf.ptr, buf.len);
+    if (rc < 0) {
+        const err = std.posix.errno(rc);
+        // Non-blocking fd with no data returns EAGAIN/EWOULDBLOCK; do NOT route
+        // it through unexpectedErrno, which prints "unexpected errno: 35" and
+        // dumps a stack trace in Debug test builds (flagging the test failed).
+        switch (err) {
+            .AGAIN => return error.WouldBlock,
+            else => return std.posix.unexpectedErrno(err),
+        }
+    }
+    return @intCast(rc);
+}
+
+fn fdWrite(fd: std.posix.fd_t, bytes: []const u8) !usize {
+    const rc = std.c.write(fd, bytes.ptr, bytes.len);
+    if (rc < 0) return std.posix.unexpectedErrno(std.posix.errno(rc));
+    return @intCast(rc);
+}
+
+fn connectLocal(port: u16) !net.Stream {
+    const addr = try net.IpAddress.parse("127.0.0.1", port);
+    return addr.connect(defaultIo(), .{ .mode = .stream });
+}
 
 pub const Response = struct {
     status: []const u8 = "200 OK",
@@ -22,7 +53,7 @@ pub const Server = struct {
     const max_reqs = 16;
 
     alloc: std.mem.Allocator,
-    server: std.net.Server,
+    server: net.Server,
     steps: []const Step = &.{},
     resps: []const Response = &.{},
     req_bufs: [max_reqs][8192]u8 = undefined,
@@ -33,8 +64,8 @@ pub const Server = struct {
 
     pub fn init(alloc: std.mem.Allocator, steps: []const Step) !Server {
         if (steps.len == 0 or steps.len > max_reqs) return error.InvalidResponseCount;
-        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        const server = try addr.listen(.{ .reuse_address = true });
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        const server = try addr.listen(defaultIo(), .{ .reuse_address = true });
         return .{
             .alloc = alloc,
             .server = server,
@@ -44,8 +75,8 @@ pub const Server = struct {
 
     pub fn initSeq(alloc: std.mem.Allocator, resps: []const Response) !Server {
         if (resps.len == 0 or resps.len > max_reqs) return error.InvalidResponseCount;
-        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
-        const server = try addr.listen(.{ .reuse_address = true });
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        const server = try addr.listen(defaultIo(), .{ .reuse_address = true });
         return .{
             .alloc = alloc,
             .server = server,
@@ -54,12 +85,12 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
-        self.server.deinit();
+        self.server.deinit(defaultIo());
         self.* = undefined;
     }
 
     pub fn port(self: *const Server) u16 {
-        return self.server.listen_address.getPort();
+        return self.server.socket.address.getPort();
     }
 
     pub fn spawn(self: *Server) !std.Thread {
@@ -98,9 +129,9 @@ fn run(self: *Server) void {
                 self.failure = err;
                 return;
             } orelse return;
-            defer conn.stream.close();
+            defer conn.close(defaultIo());
 
-            self.req_lens[i] = readRequest(conn.stream.handle, self.req_bufs[i][0..]) catch |err| {
+            self.req_lens[i] = readRequest(conn.socket.handle, self.req_bufs[i][0..]) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -110,7 +141,7 @@ fn run(self: *Server) void {
                 self.failure = error.UnexpectedRequest;
                 return;
             }
-            writeResponse(self.alloc, conn.stream.handle, self.steps[i].resp) catch |err| {
+            writeResponse(self.alloc, conn.socket.handle, self.steps[i].resp) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -123,23 +154,23 @@ fn run(self: *Server) void {
             self.failure = err;
             return;
         } orelse return;
-        defer conn.stream.close();
+        defer conn.close(defaultIo());
 
-        self.req_lens[i] = readRequest(conn.stream.handle, self.req_bufs[i][0..]) catch |err| {
+        self.req_lens[i] = readRequest(conn.socket.handle, self.req_bufs[i][0..]) catch |err| {
             self.failure = err;
             return;
         };
         self.req_count = i + 1;
-        writeResponse(self.alloc, conn.stream.handle, resp) catch |err| {
+        writeResponse(self.alloc, conn.socket.handle, resp) catch |err| {
             self.failure = err;
             return;
         };
     }
 }
 
-fn acceptReady(self: *Server) !?std.net.Server.Connection {
+fn acceptReady(self: *Server) !?net.Stream {
     var fds = [_]std.posix.pollfd{.{
-        .fd = self.server.stream.handle,
+        .fd = self.server.socket.handle,
         .events = std.posix.POLL.IN,
         .revents = 0,
     }};
@@ -147,14 +178,14 @@ fn acceptReady(self: *Server) !?std.net.Server.Connection {
         if (self.stop.load(.acquire)) return null;
         const ready = try std.posix.poll(fds[0..], 20);
         if (ready == 0) continue;
-        return try self.server.accept();
+        return try self.server.accept(defaultIo());
     }
 }
 
 fn readRequest(fd: std.posix.socket_t, buf: []u8) !usize {
     var off: usize = 0;
     while (off < buf.len) {
-        const got = try std.posix.read(fd, buf[off..]);
+        const got = try fdRead(fd, buf[off..]);
         if (got == 0) break;
         off += got;
         if (std.mem.indexOf(u8, buf[0..off], "\r\n\r\n") != null) break;
@@ -165,7 +196,7 @@ fn readRequest(fd: std.posix.socket_t, buf: []u8) !usize {
 fn readResponse(fd: std.posix.socket_t, buf: []u8) !usize {
     var off: usize = 0;
     while (off < buf.len) {
-        const got = try std.posix.read(fd, buf[off..]);
+        const got = try fdRead(fd, buf[off..]);
         if (got == 0) break;
         off += got;
         if (std.mem.indexOf(u8, buf[0..off], "\r\n\r\n")) |hdr_end| {
@@ -221,20 +252,20 @@ fn matchesExpect(raw: []const u8, exp: Expect) bool {
 fn writeResponse(alloc: std.mem.Allocator, fd: std.posix.socket_t, resp: Response) !void {
     const prefix = try std.fmt.allocPrint(alloc, "HTTP/1.1 {s}\r\n", .{resp.status});
     defer alloc.free(prefix);
-    _ = try std.posix.write(fd, prefix);
+    _ = try fdWrite(fd, prefix);
     var saw_len = false;
     for (resp.headers) |hdr| {
         if (std.ascii.startsWithIgnoreCase(hdr, "content-length:")) saw_len = true;
-        _ = try std.posix.write(fd, hdr);
-        _ = try std.posix.write(fd, "\r\n");
+        _ = try fdWrite(fd, hdr);
+        _ = try fdWrite(fd, "\r\n");
     }
     if (!saw_len) {
         const len = try std.fmt.allocPrint(alloc, "Content-Length: {d}\r\n", .{resp.body.len});
         defer alloc.free(len);
-        _ = try std.posix.write(fd, len);
+        _ = try fdWrite(fd, len);
     }
-    _ = try std.posix.write(fd, "\r\n");
-    _ = try std.posix.write(fd, resp.body);
+    _ = try fdWrite(fd, "\r\n");
+    _ = try fdWrite(fd, resp.body);
 }
 
 test "http mock captures ordered requests and returns scripted responses" {
@@ -267,12 +298,10 @@ test "http mock captures ordered requests and returns scripted responses" {
 
     const thr = try server.spawn();
 
-    var addr = try std.net.Address.parseIp("127.0.0.1", server.port());
-    const fd = try std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
-    defer (std.net.Stream{ .handle = fd }).close();
-    try std.posix.connect(fd, &addr.any, addr.getOsSockLen());
-    _ = try std.posix.write(
-        fd,
+    var stream = try connectLocal(server.port());
+    defer stream.close(defaultIo());
+    _ = try fdWrite(
+        stream.socket.handle,
         "GET /health HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Connection: close\r\n" ++
@@ -280,21 +309,20 @@ test "http mock captures ordered requests and returns scripted responses" {
     );
 
     var buf: [128]u8 = undefined;
-    const got = try readResponse(fd, buf[0..]);
+    const got = try readResponse(stream.socket.handle, buf[0..]);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..got], "HTTP/1.1 302 Found") != null);
 
-    const fd2 = try std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
-    defer (std.net.Stream{ .handle = fd2 }).close();
-    try std.posix.connect(fd2, &addr.any, addr.getOsSockLen());
-    _ = try std.posix.write(
-        fd2,
+    var stream2 = try connectLocal(server.port());
+    defer stream2.close(defaultIo());
+    _ = try fdWrite(
+        stream2.socket.handle,
         "GET /ready HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "Connection: close\r\n" ++
             "\r\n",
     );
 
-    const got2 = try readResponse(fd2, buf[0..]);
+    const got2 = try readResponse(stream2.socket.handle, buf[0..]);
     try server.join(thr);
 
     try std.testing.expectEqual(@as(usize, 2), server.requestCount());
@@ -322,31 +350,27 @@ test "http mock serves sequential responses and captures each request" {
 
     const thr = try server.spawn();
 
-    var addr = try std.net.Address.parseIp("127.0.0.1", server.port());
-
-    const fd0 = try std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
-    defer (std.net.Stream{ .handle = fd0 }).close();
-    try std.posix.connect(fd0, &addr.any, addr.getOsSockLen());
-    _ = try std.posix.write(
-        fd0,
+    var stream0 = try connectLocal(server.port());
+    defer stream0.close(defaultIo());
+    _ = try fdWrite(
+        stream0.socket.handle,
         "GET /start HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "\r\n",
     );
     var buf0: [256]u8 = undefined;
-    const got0 = try readResponse(fd0, buf0[0..]);
+    const got0 = try readResponse(stream0.socket.handle, buf0[0..]);
 
-    const fd1 = try std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
-    defer (std.net.Stream{ .handle = fd1 }).close();
-    try std.posix.connect(fd1, &addr.any, addr.getOsSockLen());
-    _ = try std.posix.write(
-        fd1,
+    var stream1 = try connectLocal(server.port());
+    defer stream1.close(defaultIo());
+    _ = try fdWrite(
+        stream1.socket.handle,
         "GET /next HTTP/1.1\r\n" ++
             "Host: 127.0.0.1\r\n" ++
             "\r\n",
     );
     var buf1: [256]u8 = undefined;
-    const got1 = try readResponse(fd1, buf1[0..]);
+    const got1 = try readResponse(stream1.socket.handle, buf1[0..]);
 
     try server.join(thr);
 

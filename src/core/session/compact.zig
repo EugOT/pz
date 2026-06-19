@@ -11,8 +11,20 @@ const summary_types = @import("summary.zig");
 const fs_secure = @import("../fs_secure.zig");
 const shared = @import("../tools/shared.zig");
 const log = std.log.scoped(.compact);
+const Dir = std.Io.Dir;
+const File = std.Io.File;
 
 pub const checkpoint_version: u16 = 1;
+
+fn defaultIo() std.Io {
+    return @import("../rt_io.zig").default();
+}
+
+fn readAllAlloc(file: File, alloc: Allocator, limit: usize) ![]u8 {
+    var buf: [8192]u8 = undefined;
+    var reader_stream = file.readerStreaming(defaultIo(), &buf);
+    return reader_stream.interface.allocRemaining(alloc, .limited(limit));
+}
 
 pub const Checkpoint = struct {
     version: u16 = checkpoint_version,
@@ -25,7 +37,7 @@ pub const Checkpoint = struct {
 
 pub fn run(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: Dir,
     sid: []const u8,
     compacted_at_ms: i64,
 ) !Checkpoint {
@@ -33,8 +45,8 @@ pub fn run(
     defer alloc.free(src_path);
 
     const in_file = try fs_secure.openConfined(dir, src_path, .{ .mode = .read_only });
-    const in_bytes = try in_file.getEndPos();
-    in_file.close();
+    const in_bytes = (try in_file.stat(defaultIo())).size;
+    in_file.close(defaultIo());
 
     var rdr = try reader.ReplayReader.init(alloc, dir, sid, .{});
     defer rdr.deinit();
@@ -45,7 +57,7 @@ pub fn run(
     var out_file = try fs_secure.createConfined(dir, tmp.path, .{
         .truncate = true,
     });
-    defer out_file.close();
+    defer out_file.close(defaultIo());
 
     var in_lines: u64 = 0;
     var out_lines: u64 = 0;
@@ -57,14 +69,14 @@ pub fn run(
         const raw = try schema.encodeAlloc(alloc, ev);
         defer alloc.free(raw);
 
-        try out_file.writeAll(raw);
-        try out_file.writeAll("\n");
+        try out_file.writeStreamingAll(defaultIo(), raw);
+        try out_file.writeStreamingAll(defaultIo(), "\n");
         out_lines += 1;
         out_bytes += raw.len + 1;
     }
-    try out_file.sync();
+    try out_file.sync(defaultIo());
 
-    try dir.rename(tmp.path, src_path);
+    try dir.rename(tmp.path, dir, src_path, defaultIo());
     tmp.close();
 
     const ck = Checkpoint{
@@ -80,7 +92,7 @@ pub fn run(
 
 pub fn loadCheckpoint(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: Dir,
     sid: []const u8,
 ) !?Checkpoint {
     const path = try sid_path.sidExtAlloc(alloc, sid, ".compact.json");
@@ -91,8 +103,8 @@ pub fn loadCheckpoint(
         error.FileNotFound => return null,
         else => return read_err,
     };
-    defer ck_file.close();
-    const raw = try ck_file.readToEndAlloc(alloc, 64 * 1024);
+    defer ck_file.close(defaultIo());
+    const raw = try readAllAlloc(ck_file, alloc, 64 * 1024);
     defer alloc.free(raw);
     if (raw.len == 0 or raw[raw.len - 1] != '\n') return error.TornCheckpoint;
 
@@ -107,7 +119,7 @@ pub fn loadCheckpoint(
 
 fn saveCheckpoint(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: Dir,
     sid: []const u8,
     ck: Checkpoint,
 ) !void {
@@ -125,7 +137,7 @@ fn saveCheckpoint(
 
 fn collectSemanticJson(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    dir: Dir,
     sid: []const u8,
 ) ![][]u8 {
     var rdr = try reader.ReplayReader.init(alloc, dir, sid, .{});
@@ -411,13 +423,14 @@ const summary_chunk_sep = "\n\n";
 const SummaryCall = struct {
     req: providers.Request,
     msgs: []providers.Msg,
+    parts: []providers.Part,
     prompt: []u8,
     meta: summary_types.SummaryMeta,
 };
 
 fn freeSummaryCall(alloc: std.mem.Allocator, call: SummaryCall) void {
     alloc.free(call.prompt);
-    alloc.free(call.msgs[0].parts.ptr[0..3]);
+    alloc.free(call.parts);
     alloc.free(call.msgs);
 }
 
@@ -558,6 +571,7 @@ fn buildSummaryCall(
             },
         },
         .msgs = msgs,
+        .parts = parts,
         .prompt = prompt,
         .meta = fit_req.meta,
     };
@@ -710,7 +724,7 @@ test "compaction checkpoint rejects torn file without trailing newline" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "s1.compact.json",
         .data = "{\"version\":1,\"in_lines\":1,\"out_lines\":1,\"in_bytes\":1,\"out_bytes\":1,\"compacted_at_ms\":1}",
     });
@@ -1178,8 +1192,8 @@ test "empty session compacts to zero lines" {
     const path = try sid_path.sidJsonlAlloc(std.testing.allocator, "e1");
     defer std.testing.allocator.free(path);
     {
-        var f = try tmp.dir.createFile(path, .{ .truncate = true });
-        f.close();
+        var f = try tmp.dir.createFile(std.testing.io, path, .{ .truncate = true });
+        f.close(std.testing.io);
     }
 
     const ck = try run(std.testing.allocator, tmp.dir, "e1", 0);

@@ -159,9 +159,9 @@ pub const Renderer = struct {
 fn cellsSnapAlloc(alloc: std.mem.Allocator, n: usize, buf: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
-    try std.fmt.format(out.writer(alloc), "n={}", .{n});
+    try out.print(alloc, "n={}", .{n});
     for (buf[0..n], 0..) |cell, i| {
-        try std.fmt.format(out.writer(alloc), "\n[{d}] {s}", .{ i, cell });
+        try out.print(alloc, "\n[{d}] {s}", .{ i, cell });
     }
     return out.toOwnedSlice(alloc);
 }
@@ -550,8 +550,8 @@ const expectSnapText = @import("../../test/helpers.zig").expectSnapText;
 fn appendColorName(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, c: frame.Color) !void {
     switch (c) {
         .default => try out.appendSlice(alloc, "default"),
-        .idx => |idx| try std.fmt.format(out.writer(alloc), "idx:{d}", .{idx}),
-        .rgb => |rgb| try std.fmt.format(out.writer(alloc), "rgb:{x:0>6}", .{rgb}),
+        .idx => |idx| try out.print(alloc, "idx:{d}", .{idx}),
+        .rgb => |rgb| try out.print(alloc, "rgb:{x:0>6}", .{rgb}),
     }
 }
 
@@ -586,7 +586,7 @@ fn frameRowsStyleSnapAlloc(
                 found = true;
             }
         }
-        try std.fmt.format(out.writer(alloc), "{d}:", .{y});
+        try out.print(alloc, "{d}:", .{y});
         if (found) {
             x = 0;
             while (x < last) : (x += 1) {
@@ -611,11 +611,11 @@ fn frameRowsStyleSnapAlloc(
                 const next = try frm.cell(x, y);
                 if (!frame.Style.eql(st, next.style)) break;
             }
-            try std.fmt.format(out.writer(alloc), "\n  {d}..{d} fg=", .{ x0, x });
+            try out.print(alloc, "\n  {d}..{d} fg=", .{ x0, x });
             try appendColorName(&out, alloc, st.fg);
             try out.appendSlice(alloc, " bg=");
             try appendColorName(&out, alloc, st.bg);
-            try std.fmt.format(out.writer(alloc), " b={d} d={d} i={d} u={d} inv={d}", .{
+            try out.print(alloc, " b={d} d={d} i={d} u={d} inv={d}", .{
                 @intFromBool(st.bold),
                 @intFromBool(st.dim),
                 @intFromBool(st.italic),

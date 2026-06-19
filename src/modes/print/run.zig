@@ -17,17 +17,17 @@ pub fn exec(run_ctx: mode.Ctx) run_err.Err!run_err.Result {
     return execWithWriter(run_ctx, out.any());
 }
 
-pub fn execWithWriter(run_ctx: mode.Ctx, out: std.Io.AnyWriter) run_err.Err!run_err.Result {
+pub fn execWithWriter(run_ctx: mode.Ctx, out: *std.Io.Writer) run_err.Err!run_err.Result {
     return execVerbose(run_ctx, out, false);
 }
 
-fn execVerbose(run_ctx: mode.Ctx, out: std.Io.AnyWriter, verbose: bool) run_err.Err!run_err.Result {
+fn execVerbose(run_ctx: mode.Ctx, out: *std.Io.Writer, verbose: bool) run_err.Err!run_err.Result {
     var formatter = format.Formatter.init(run_ctx.alloc, out);
     formatter.verbose = verbose;
     defer formatter.deinit();
 
     run_ctx.store.append(run_ctx.sid, .{
-        .at_ms = std.time.milliTimestamp(),
+        .at_ms = core.time.milliTimestamp(),
         .data = .{
             .prompt = .{ .text = run_ctx.prompt },
         },
@@ -74,7 +74,7 @@ fn execVerbose(run_ctx: mode.Ctx, out: std.Io.AnyWriter, verbose: bool) run_err.
 
 fn mapEvent(ev: core.providers.Event) core.session.Event {
     return .{
-        .at_ms = std.time.milliTimestamp(),
+        .at_ms = core.time.milliTimestamp(),
         .data = switch (ev) {
             .text => |text| .{
                 .text = .{ .text = text },
@@ -314,13 +314,11 @@ test "exec runs prompt path and persists mapped provider events" {
             .evs = in_evs[0..],
         },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var out_buf: [512]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const result = try execVerbose(.{
         .alloc = std.testing.allocator,
@@ -328,7 +326,7 @@ test "exec runs prompt path and persists mapped provider events" {
         .store = &store_impl.session_store,
         .sid = "sid-1",
         .prompt = "ship-it",
-    }, out_fbs.writer().any(), true);
+    }, &out_fbs, true);
 
     try std.testing.expectEqual(run_err.Result.ok, result);
 
@@ -382,7 +380,7 @@ test "exec runs prompt path and persists mapped provider events" {
                 else => return error.TestUnexpectedResult,
             },
         },
-        .output = out_fbs.getWritten(),
+        .output = out_fbs.buffered(),
     };
     try oh.snap(@src(),
         \\modes.print.run.RunVerboseSnap
@@ -502,13 +500,11 @@ test "exec deinit stream and maps stream next error to typed print error" {
     };
 
     var provider_impl = ProviderImpl{};
-    
 
     var store_impl = StoreImpl{};
-    
 
     var out_buf: [32]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     try std.testing.expectError(error.StreamRead, execVerbose(.{
         .alloc = std.testing.allocator,
@@ -516,7 +512,7 @@ test "exec deinit stream and maps stream next error to typed print error" {
         .store = &store_impl.session_store,
         .sid = "sid-2",
         .prompt = "prompt-2",
-    }, out_fbs.writer().any(), true));
+    }, &out_fbs, true));
 
     const snap = RunErrSnap{
         .deinit_ct = provider_impl.stream_impl.deinit_ct,
@@ -525,7 +521,7 @@ test "exec deinit stream and maps stream next error to typed print error" {
             .prompt => |out| out.text,
             else => return error.TestUnexpectedResult,
         },
-        .output = out_fbs.getWritten(),
+        .output = out_fbs.buffered(),
     };
     try oh.snap(@src(),
         \\modes.print.run.RunErrSnap
@@ -609,13 +605,11 @@ test "exec maps max_out stop reason to deterministic typed error" {
             .evs = in_evs[0..],
         },
     };
-    
 
     var store_impl = StoreImpl{};
-    
 
     var out_buf: [128]u8 = undefined;
-    var out_fbs = std.io.fixedBufferStream(&out_buf);
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
 
     const result = try execVerbose(.{
         .alloc = std.testing.allocator,
@@ -623,14 +617,14 @@ test "exec maps max_out stop reason to deterministic typed error" {
         .store = &store_impl.session_store,
         .sid = "sid-3",
         .prompt = "prompt-3",
-    }, out_fbs.writer().any(), true);
+    }, &out_fbs, true);
 
     try std.testing.expectEqual(run_err.Result{ .stop = .max_out }, result);
 
     const snap = RunStopSnap{
         .deinit_ct = provider_impl.stream_impl.deinit_ct,
         .append_ct = store_impl.append_ct,
-        .output = out_fbs.getWritten(),
+        .output = out_fbs.buffered(),
     };
     try oh.snap(@src(),
         \\modes.print.run.RunStopSnap

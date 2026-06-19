@@ -232,10 +232,10 @@ pub const Shrink = struct {
 
 pub const Fmt = struct {
     pub fn valueAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(alloc);
-        try writeVal(out.writer(alloc), value);
-        return try out.toOwnedSlice(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        try writeVal(&out.writer, value);
+        return try out.toOwnedSlice();
     }
 
     pub fn failureAlloc(
@@ -243,18 +243,18 @@ pub const Fmt = struct {
         comptime prop: anytype,
         fail: FailureOf(prop),
     ) ![]u8 {
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(alloc);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
 
-        try std.fmt.format(out.writer(alloc), "seed={d}\niteration={d}\noriginal=", .{
+        try out.writer.print("seed={d}\niteration={d}\noriginal=", .{
             fail.seed,
             fail.iteration,
         });
-        try writeVal(out.writer(alloc), fail.original);
-        try out.appendSlice(alloc, "\nshrunk=");
-        try writeVal(out.writer(alloc), fail.shrunk);
-        try out.append(alloc, '\n');
-        return try out.toOwnedSlice(alloc);
+        try writeVal(&out.writer, fail.original);
+        try out.writer.writeAll("\nshrunk=");
+        try writeVal(&out.writer, fail.shrunk);
+        try out.writer.writeByte('\n');
+        return try out.toOwnedSlice();
     }
 };
 
@@ -285,11 +285,45 @@ pub fn FailureOf(comptime prop: anytype) type {
 }
 
 pub fn run(comptime prop: anytype, opt: Options) !void {
-    try zc.check(prop, cfg(opt));
+    if (check(prop, opt)) |fail| {
+        if (opt.expect_failure) return;
+        if (opt.print_failures) {
+            std.debug.print("\n=== Property failed ===\n{any}\n", .{fail});
+        }
+        return error.PropertyFailed;
+    }
+    if (opt.expect_failure) return error.ExpectedFailure;
 }
 
 pub fn check(comptime prop: anytype, opt: Options) ?FailureOf(prop) {
-    return zc.checkResult(prop, cfg(opt));
+    const Args = ArgsOf(prop);
+    var seed = opt.seed;
+    var prng: std.Random.DefaultPrng = undefined;
+    var random: std.Random = undefined;
+
+    if (opt.random) |external| {
+        random = external;
+    } else {
+        if (seed == 0) seed = fallbackSeed();
+        prng = std.Random.DefaultPrng.init(seed);
+        random = prng.random();
+    }
+
+    var i: usize = 0;
+    while (i < opt.iterations) : (i += 1) {
+        const args = zc.generateWithConfig(Args, random, .{ .use_default_values = opt.use_default_values });
+        if (!prop(args)) {
+            return .{
+                .seed = seed,
+                .iteration = i,
+                .original = args,
+                .shrunk = shrinkFailing(Args, prop, args, opt.max_shrinks, .{
+                    .use_default_values = opt.use_default_values,
+                }),
+            };
+        }
+    }
+    return null;
 }
 
 pub fn expectFail(comptime prop: anytype, opt: Options) !FailureOf(prop) {
@@ -385,6 +419,31 @@ fn cfg(opt: Options) zc.Config {
         .use_default_values = opt.use_default_values,
         .random = opt.random,
     };
+}
+
+fn fallbackSeed() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 1;
+    const sec: u64 = @bitCast(@as(i64, @intCast(ts.sec)));
+    const nsec: u64 = @intCast(ts.nsec);
+    return (sec << 32) ^ nsec;
+}
+
+fn shrinkFailing(
+    comptime T: type,
+    comptime prop: anytype,
+    initial: T,
+    max_steps: usize,
+    cfg0: ShrinkConfig,
+) T {
+    var current = initial;
+    var steps: usize = 0;
+    while (steps < max_steps) : (steps += 1) {
+        const next = shrinkOnce(T, current, cfg0) orelse break;
+        if (prop(next)) break;
+        current = next;
+    }
+    return current;
 }
 
 pub fn shrink(comptime T: type, value: T) ?T {

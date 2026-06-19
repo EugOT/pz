@@ -3,6 +3,24 @@ const builtin = @import("builtin");
 const std = @import("std");
 const fs_secure = @import("../core/fs_secure.zig");
 
+const File = std.Io.File;
+
+fn defaultIo() std.Io {
+    return @import("../core/rt_io.zig").default();
+}
+
+const Mutex = struct {
+    inner: std.Io.Mutex = .init,
+
+    fn lock(self: *Mutex) void {
+        self.inner.lockUncancelable(defaultIo());
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock(defaultIo());
+    }
+};
+
 pub const Active = struct {
     id: u64,
     pid: i32,
@@ -31,8 +49,8 @@ pub const Journal = struct {
     alloc: std.mem.Allocator,
     dir_path: ?[]u8 = null,
     file_path: ?[]u8 = null,
-    file: ?std.fs.File = null,
-    mu: std.Thread.Mutex = .{},
+    file: ?File = null,
+    mu: Mutex = .{},
 
     pub fn init(alloc: std.mem.Allocator, opts: Opts) !Journal {
         const enabled = opts.enabled orelse !builtin.is_test;
@@ -50,29 +68,23 @@ pub const Journal = struct {
 
         const pz_dir = try std.fs.path.join(alloc, &.{ base_dir, "pz" });
         defer alloc.free(pz_dir);
-        std.fs.makeDirAbsolute(pz_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        try fs_secure.ensureDirPath(pz_dir);
 
         const jobs_dir = try std.fs.path.join(alloc, &.{ pz_dir, "jobs" });
         errdefer alloc.free(jobs_dir);
-        std.fs.makeDirAbsolute(jobs_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        try fs_secure.ensureDirPath(jobs_dir);
 
         const events_path = try std.fs.path.join(alloc, &.{ jobs_dir, "events.jsonl" });
         errdefer alloc.free(events_path);
 
-        const f = std.fs.createFileAbsolute(events_path, .{
+        const f = std.Io.Dir.createFileAbsolute(defaultIo(), events_path, .{
             .read = true,
             .truncate = false,
         }) catch |err| switch (err) {
-            error.PathAlreadyExists => try std.fs.openFileAbsolute(events_path, .{ .mode = .read_write }),
+            error.PathAlreadyExists => try std.Io.Dir.openFileAbsolute(defaultIo(), events_path, .{ .mode = .read_write }),
             else => return err,
         };
-        try f.seekFromEnd(0);
+        try seekEnd(f);
 
         return .{
             .alloc = alloc,
@@ -83,7 +95,7 @@ pub const Journal = struct {
     }
 
     pub fn deinit(self: *Journal) void {
-        if (self.file) |f| f.close();
+        if (self.file) |f| f.close(defaultIo());
         if (self.file_path) |p| self.alloc.free(p);
         if (self.dir_path) |p| self.alloc.free(p);
         self.* = undefined;
@@ -138,12 +150,12 @@ pub const Journal = struct {
 
     pub fn replayActive(self: *Journal, alloc: std.mem.Allocator) ![]Active {
         const path = self.file_path orelse return alloc.alloc(Active, 0);
-        const f = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch |err| switch (err) {
+        const f = std.Io.Dir.openFileAbsolute(defaultIo(), path, .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => return alloc.alloc(Active, 0),
             else => return err,
         };
-        defer f.close();
-        const raw = try f.readToEndAlloc(alloc, 8 * 1024 * 1024);
+        defer f.close(defaultIo());
+        const raw = try readAllAlloc(f, alloc, 8 * 1024 * 1024);
         defer alloc.free(raw);
 
         var out: std.ArrayListUnmanaged(Active) = .empty;
@@ -198,12 +210,26 @@ pub const Journal = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
-        try f.seekFromEnd(0);
-        try f.writeAll(raw);
-        try f.writeAll("\n");
-        try f.sync();
+        try seekEnd(f);
+        try f.writeStreamingAll(defaultIo(), raw);
+        try f.writeStreamingAll(defaultIo(), "\n");
+        try f.sync(defaultIo());
     }
 };
+
+fn seekEnd(file: File) !void {
+    const rc = std.c.lseek(file.handle, 0, std.c.SEEK.END);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+fn readAllAlloc(file: File, alloc: std.mem.Allocator, limit: usize) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(defaultIo(), &buf);
+    return reader.interface.allocRemaining(alloc, .limited(limit));
+}
 
 const Line = struct {
     kind: []const u8,
@@ -290,7 +316,7 @@ test "journal replay tracks active launches only" {
     };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(abs);
 
     var j = try Journal.init(std.testing.allocator, .{
@@ -324,7 +350,7 @@ test "journal replay tracks active launches only" {
 test "journal cleanup removes active launch" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(abs);
 
     var j = try Journal.init(std.testing.allocator, .{
@@ -350,7 +376,7 @@ test "journal replay ignores malformed lines" {
     };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(abs);
 
     var j = try Journal.init(std.testing.allocator, .{
@@ -360,11 +386,11 @@ test "journal replay ignores malformed lines" {
     defer j.deinit();
 
     const path = j.file_path orelse return error.TestUnexpectedResult;
-    const f = try std.fs.openFileAbsolute(path, .{ .mode = .read_write });
-    defer f.close();
-    try f.seekFromEnd(0);
-    try f.writeAll("{bad-json}\n");
-    try f.sync();
+    const f = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_write });
+    defer f.close(std.testing.io);
+    const st = try f.stat(std.testing.io);
+    try f.writePositionalAll(std.testing.io, "{bad-json}\n", st.size);
+    try f.sync(std.testing.io);
 
     try j.appendLaunch(11, 111, "sleep 1", "/tmp/j11.log", 11);
 
@@ -389,7 +415,7 @@ test "journal init creates nested absolute state dirs" {
     };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const abs = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(abs);
     const nested = try std.fs.path.join(std.testing.allocator, &.{ abs, "Library", "Application Support" });
     defer std.testing.allocator.free(nested);

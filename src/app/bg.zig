@@ -9,6 +9,30 @@ const sandbox = @import("../core/sandbox.zig");
 const shell = @import("../core/shell.zig");
 const syslog_mock = @import("../test/syslog_mock.zig");
 
+fn defaultIo() std.Io {
+    return @import("../core/rt_io.zig").default();
+}
+
+fn currentEnvMap(alloc: std.mem.Allocator) !std.process.Environ.Map {
+    var env_len: usize = 0;
+    while (std.c.environ[env_len] != null) : (env_len += 1) {}
+    return std.process.Environ.createMap(.{
+        .block = .{ .slice = std.c.environ[0..env_len :null] },
+    }, alloc);
+}
+
+const Mutex = struct {
+    inner: std.Io.Mutex = .init,
+
+    fn lock(self: *Mutex) void {
+        self.inner.lockUncancelable(defaultIo());
+    }
+
+    fn unlock(self: *Mutex) void {
+        self.inner.unlock(defaultIo());
+    }
+};
+
 pub const State = enum {
     running,
     exited,
@@ -94,8 +118,8 @@ pub const Manager = struct {
     };
 
     alloc: std.mem.Allocator,
-    mu: std.Thread.Mutex = .{},
-    audit_mu: std.Thread.Mutex = .{},
+    mu: Mutex = .{},
+    audit_mu: Mutex = .{},
     jobs: std.ArrayListUnmanaged(Job) = .empty,
     done: std.ArrayListUnmanaged(u64) = .empty,
     next_id: u64 = 1,
@@ -114,13 +138,10 @@ pub const Manager = struct {
     }
 
     pub fn initWithOpts(alloc: std.mem.Allocator, opts: Opts) !Manager {
-        const pipe = try std.posix.pipe2(.{
-            .NONBLOCK = true,
-            .CLOEXEC = true,
-        });
+        const pipe = try makePipe(true);
         errdefer {
-            std.posix.close(pipe[0]);
-            std.posix.close(pipe[1]);
+            closeFd(pipe[0]);
+            closeFd(pipe[1]);
         }
 
         var out: Manager = .{
@@ -185,8 +206,8 @@ pub const Manager = struct {
         self.done.deinit(self.alloc);
         self.mu.unlock();
 
-        std.posix.close(self.wake_r);
-        std.posix.close(self.wake_w);
+        closeFd(self.wake_r);
+        closeFd(self.wake_w);
         self.journal.deinit();
         self.* = undefined;
     }
@@ -246,7 +267,7 @@ pub const Manager = struct {
         const cmd_dup = try self.alloc.dupe(u8, cmd);
         errdefer self.alloc.free(cmd_dup);
 
-        var env = try std.process.getEnvMap(self.alloc);
+        var env = try currentEnvMap(self.alloc);
         defer env.deinit();
         sandbox.scrubEnv(&env);
         try env.put("PZ_BG_LOG", log_path);
@@ -260,14 +281,16 @@ pub const Manager = struct {
             wrapped,
         };
 
-        var child = std.process.Child.init(argv[0..], self.alloc);
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-        child.cwd = cwd;
-        child.env_map = &env;
-        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) child.pgid = 0;
-        child.spawn() catch |err| {
+        const is_posix = builtin.os.tag != .windows and builtin.os.tag != .wasi;
+        var child = std.process.spawn(defaultIo(), .{
+            .argv = argv[0..],
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = &env,
+            .pgid = if (is_posix) 0 else null,
+        }) catch |err| {
             try self.emitControlAudit(.{
                 .op = "start",
                 .outcome = .fail,
@@ -287,8 +310,8 @@ pub const Manager = struct {
             .child = child,
         };
 
-        const pid: i32 = @intCast(child.id);
-        const started_at_ms = std.time.milliTimestamp();
+        const pid: i32 = @intCast(child.id.?);
+        const started_at_ms = core.time.milliTimestamp();
 
         self.journal.appendLaunch(id, pid, cmd_dup, log_path, started_at_ms) catch |err| {
             try self.emitControlAudit(.{
@@ -318,8 +341,7 @@ pub const Manager = struct {
             .ctx = ctx,
         }) catch |append_err| {
             self.mu.unlock();
-            _ = child.kill() catch {}; // cleanup: propagation impossible
-            _ = child.wait() catch {}; // cleanup: propagation impossible
+            child.kill(defaultIo()); // cleanup: propagation impossible
             self.journal.appendCleanup(id, "start_append_fail") catch {}; // cleanup: propagation impossible
             self.alloc.destroy(ctx);
             self.alloc.free(cmd_dup);
@@ -337,8 +359,7 @@ pub const Manager = struct {
         self.mu.unlock();
 
         const thr = std.Thread.spawn(.{}, waitThread, .{ctx}) catch |spawn_err| {
-            _ = child.kill() catch {}; // cleanup: propagation impossible
-            _ = child.wait() catch {}; // cleanup: propagation impossible
+            child.kill(defaultIo()); // cleanup: propagation impossible
             self.journal.appendCleanup(id, "start_spawn_fail") catch {}; // cleanup: propagation impossible
 
             self.mu.lock();
@@ -442,16 +463,22 @@ pub const Manager = struct {
         const sig_target: std.posix.pid_t = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) -pid else pid;
         std.posix.kill(sig_target, std.posix.SIG.TERM) catch |err| switch (err) {
             error.ProcessNotFound => {
-                const done_attrs = [_]core.audit.Attribute{
-                    .{ .key = "job_id", .val = .{ .uint = id } },
-                    .{ .key = "status", .val = .{ .str = "already_done" } },
-                };
+                try self.emitStopAlreadyDone(id);
+                return .already_done;
+            },
+            error.PermissionDenied => {
+                if (self.waitForStopRaceDone(id)) {
+                    try self.emitStopAlreadyDone(id);
+                    return .already_done;
+                }
                 try self.emitControlAudit(.{
                     .op = "stop",
-                    .msg = .{ .text = "bg control success", .vis = .@"pub" },
-                    .attrs = &done_attrs,
+                    .outcome = .fail,
+                    .severity = .err,
+                    .msg = .{ .text = @errorName(err), .vis = .mask },
+                    .attrs = &start_attrs,
                 });
-                return .already_done;
+                return err;
             },
             else => {
                 try self.emitControlAudit(.{
@@ -474,6 +501,34 @@ pub const Manager = struct {
             .attrs = &ok_attrs,
         });
         return .sent;
+    }
+
+    fn emitStopAlreadyDone(self: *Manager, id: u64) !void {
+        const done_attrs = [_]core.audit.Attribute{
+            .{ .key = "job_id", .val = .{ .uint = id } },
+            .{ .key = "status", .val = .{ .str = "already_done" } },
+        };
+        try self.emitControlAudit(.{
+            .op = "stop",
+            .msg = .{ .text = "bg control success", .vis = .@"pub" },
+            .attrs = &done_attrs,
+        });
+    }
+
+    fn waitForStopRaceDone(self: *Manager, id: u64) bool {
+        var i: usize = 0;
+        while (i < 5) : (i += 1) {
+            if (self.isDone(id)) return true;
+            std.Io.sleep(defaultIo(), .fromMilliseconds(10), .awake) catch return false;
+        }
+        return self.isDone(id);
+    }
+
+    fn isDone(self: *Manager, id: u64) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const idx = self.findIdxLocked(id) orelse return true;
+        return self.jobs.items[idx].state != .running;
     }
 
     pub fn list(self: *Manager, alloc: std.mem.Allocator) ![]View {
@@ -611,8 +666,8 @@ pub const Manager = struct {
     }
 
     fn waitThread(ctx: *WaitCtx) void {
-        const wait_term = ctx.child.wait();
-        const ended_at_ms = std.time.milliTimestamp();
+        const wait_term = ctx.child.wait(defaultIo());
+        const ended_at_ms = core.time.milliTimestamp();
         ctx.mgr.onExit(ctx.job_id, ended_at_ms, wait_term);
     }
 
@@ -626,22 +681,22 @@ pub const Manager = struct {
 
         if (wait_term) |term| {
             switch (term) {
-                .Exited => |code| {
+                .exited => |code| {
                     job.state = .exited;
                     job.code = @as(i32, code);
                     job.err_name = null;
                 },
-                .Signal => |sig| {
+                .signal => |sig| {
                     job.state = .signaled;
-                    job.code = @intCast(sig);
+                    job.code = @intCast(@intFromEnum(sig));
                     job.err_name = null;
                 },
-                .Stopped => |sig| {
+                .stopped => |sig| {
                     job.state = .stopped;
                     job.code = @intCast(sig);
                     job.err_name = null;
                 },
-                .Unknown => |sig| {
+                .unknown => |sig| {
                     job.state = .unknown;
                     job.code = @intCast(sig);
                     job.err_name = null;
@@ -667,7 +722,7 @@ pub const Manager = struct {
             std.log.warn("bg: done tracking append failed for job {}: {}", .{ id, err });
         };
         const b = [_]u8{1};
-        _ = std.posix.write(self.wake_w, &b) catch {}; // cleanup: propagation impossible
+        _ = fdWrite(self.wake_w, &b) catch {}; // cleanup: propagation impossible
     }
 
     fn recoverStale(self: *Manager) !void {
@@ -711,7 +766,7 @@ pub const Manager = struct {
                     },
                 };
                 // Final blocking reap after KILL.
-                _ = std.posix.waitpid(pid, 0);
+                _ = waitPid(pid, 0) catch {};
             }
             try self.journal.appendCleanup(job.id, "startup_reap");
         }
@@ -723,7 +778,7 @@ pub const Manager = struct {
         var remaining_ms: i32 = 150;
         while (remaining_ms > 0) {
             // Try non-blocking reap first.
-            const res = std.posix.waitpid(pid, std.c.W.NOHANG);
+            const res = waitPid(pid, std.c.W.NOHANG) catch return false;
             if (res.pid != 0) return true;
 
             // Wait for SIGCHLD or timeout.
@@ -735,7 +790,7 @@ pub const Manager = struct {
             remaining_ms -= 50;
         }
         // Final WNOHANG attempt after timeout.
-        const res = std.posix.waitpid(pid, std.c.W.NOHANG);
+        const res = waitPid(pid, std.c.W.NOHANG) catch return false;
         return res.pid != 0;
     }
 
@@ -759,14 +814,14 @@ pub const Manager = struct {
 
         var n: u32 = 0;
         while (n < 64) : (n += 1) {
-            const ts = std.time.milliTimestamp();
+            const ts = core.time.milliTimestamp();
             const path = try std.fmt.allocPrint(self.alloc, "{s}/pz-bg-{d}-{d}.log", .{
                 log_dir,
                 id,
                 ts + @as(i64, n),
             });
 
-            const f = std.fs.createFileAbsolute(path, .{
+            const f = std.Io.Dir.createFileAbsolute(defaultIo(), path, .{
                 .read = true,
                 .exclusive = true,
             }) catch |err| switch (err) {
@@ -779,7 +834,7 @@ pub const Manager = struct {
                     return err;
                 },
             };
-            f.close();
+            f.close(defaultIo());
             return path;
         }
         return error.PathAlreadyExists;
@@ -826,7 +881,78 @@ const ControlAudit = struct {
     attrs: []const core.audit.Attribute = &.{},
 };
 
-const nowMs = std.time.milliTimestamp;
+const nowMs = core.time.milliTimestamp;
+
+fn closeFd(fd: std.posix.fd_t) void {
+    _ = std.c.close(fd);
+}
+
+fn makePipe(nonblocking: bool) ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return std.posix.unexpectedErrno(std.posix.errno(-1));
+    errdefer {
+        closeFd(fds[0]);
+        closeFd(fds[1]);
+    }
+    try setCloexec(fds[0]);
+    try setCloexec(fds[1]);
+    if (nonblocking) {
+        try setNonblockFd(fds[0]);
+        try setNonblockFd(fds[1]);
+    }
+    return fds;
+}
+
+fn setCloexec(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, @as(c_int, std.posix.F.GETFD), @as(c_int, 0));
+    if (flags == -1) return std.posix.unexpectedErrno(std.posix.errno(-1));
+    if (std.c.fcntl(fd, @as(c_int, std.posix.F.SETFD), flags | @as(c_int, std.posix.FD_CLOEXEC)) == -1) {
+        return std.posix.unexpectedErrno(std.posix.errno(-1));
+    }
+}
+
+fn setNonblockFd(fd: std.posix.fd_t) !void {
+    const flags = std.c.fcntl(fd, @as(c_int, std.posix.F.GETFL), @as(c_int, 0));
+    if (flags == -1) return std.posix.unexpectedErrno(std.posix.errno(-1));
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    if (std.c.fcntl(fd, @as(c_int, std.posix.F.SETFL), flags | nonblock) == -1) {
+        return std.posix.unexpectedErrno(std.posix.errno(-1));
+    }
+}
+
+fn fdWrite(fd: std.posix.fd_t, bytes: []const u8) !usize {
+    while (true) {
+        const rc = std.c.write(fd, bytes.ptr, bytes.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+const WaitPidResult = struct {
+    pid: std.posix.pid_t,
+    status: u32,
+};
+
+fn waitPid(pid: std.posix.pid_t, options: c_int) !WaitPidResult {
+    var status: c_int = 0;
+    while (true) {
+        const rc = std.c.waitpid(pid, &status, options);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return .{
+                .pid = rc,
+                .status = @as(u32, @bitCast(status)),
+            },
+            .INTR => continue,
+            .CHILD => return error.ProcessNotFound,
+            .INVAL => unreachable,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
 
 fn copyJob(alloc: std.mem.Allocator, job: Job) !View {
     return .{
@@ -999,7 +1125,7 @@ fn e2eFrameOpts() core.audit.FrameOpts {
 }
 
 fn shipAuditRows(alloc: std.mem.Allocator, sender: *core.syslog.Sender, rows: []const []const u8) !void {
-    var tracker = core.audit_integrity.SeqTracker.init(alloc, null);
+    var tracker = core.audit_integrity.SeqTracker.init(alloc, std.Io.failing, null);
     return shipAuditRowsWithTracker(alloc, sender, rows, &tracker);
 }
 
@@ -1103,9 +1229,11 @@ test "bg manager captures stdout+stderr and reports completion" {
 
     try std.testing.expectEqual(@as(usize, 1), done.len);
 
-    const f = try std.fs.openFileAbsolute(done[0].log_path, .{ .mode = .read_only });
-    defer f.close();
-    const out = try f.readToEndAlloc(std.testing.allocator, 1024);
+    const f = try std.Io.Dir.openFileAbsolute(std.testing.io, done[0].log_path, .{ .mode = .read_only });
+    defer f.close(std.testing.io);
+    var read_buf: [1024]u8 = undefined;
+    var reader = f.readerStreaming(std.testing.io, &read_buf);
+    const out = try reader.interface.allocRemaining(std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(out);
 
     const snap = DoneSnap{
@@ -1276,6 +1404,22 @@ test "bg manager stop reports already_done after completion" {
     try std.testing.expect(stop == .already_done);
 }
 
+test "bg manager stop tolerates short-lived command race" {
+    var mgr = try Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const id = try mgr.start("printf done", null);
+    const stop = try mgr.stop(id);
+    try std.testing.expect(stop == .sent or stop == .already_done);
+
+    const woke = try waitWake(mgr.wakeFd(), 5000);
+    try std.testing.expect(woke);
+
+    const done = try mgr.drainDone(std.testing.allocator);
+    defer deinitViews(std.testing.allocator, done);
+    try std.testing.expectEqual(@as(usize, 1), done.len);
+}
+
 test "bg manager stop sends termination signal" {
     var mgr = try Manager.init(std.testing.allocator);
     defer mgr.deinit();
@@ -1290,7 +1434,7 @@ test "bg manager stop sends termination signal" {
 test "bg manager recovers and clears stale journal launch entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const state_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const state_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(state_dir);
 
     var j = try journal_mod.Journal.init(std.testing.allocator, .{
@@ -1328,7 +1472,13 @@ test "bg manager audit emits start and success entries for control ops" {
     });
     defer mgr.deinit();
 
-    const id = try mgr.start("printf done", "/tmp/secret");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "tmp/secret");
+    const secret_cwd = try tmp.dir.realPathFileAlloc(std.testing.io, "tmp/secret", std.testing.allocator);
+    defer std.testing.allocator.free(secret_cwd);
+
+    const id = try mgr.start("printf done", secret_cwd);
     const listed = try mgr.list(std.testing.allocator);
     defer deinitViews(std.testing.allocator, listed);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
@@ -1410,7 +1560,13 @@ test "bg manager syslog e2e ships redacted chained success audit over udp" {
     });
     defer mgr.deinit();
 
-    const id = try mgr.start("printf done", "/tmp/secret");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "tmp/secret");
+    const secret_cwd = try tmp.dir.realPathFileAlloc(std.testing.io, "tmp/secret", std.testing.allocator);
+    defer std.testing.allocator.free(secret_cwd);
+
+    const id = try mgr.start("printf done", secret_cwd);
     const listed = try mgr.list(std.testing.allocator);
     defer deinitViews(std.testing.allocator, listed);
     try std.testing.expectEqual(@as(usize, 1), listed.len);
@@ -1430,6 +1586,7 @@ test "bg manager syslog e2e ships redacted chained success audit over udp" {
     const t = try collector.spawnCount(cap.rows.items.len);
 
     var sender = try core.syslog.Sender.init(std.testing.allocator, .{
+        .io = defaultIo(),
         .transport = .udp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -1459,7 +1616,7 @@ test "bg manager syslog e2e ships redacted chained success audit over udp" {
     for (0..collector.msgCount()) |i| {
         const raw = collector.messageAt(i);
         try std.testing.expect(std.mem.indexOf(u8, raw, "printf done") == null);
-        try std.testing.expect(std.mem.indexOf(u8, raw, "/tmp/secret") == null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, secret_cwd) == null);
         try std.testing.expect(std.mem.indexOf(u8, raw, "[pz@32473 sid=\"bg\" seq=\"") != null);
     }
 
@@ -1501,6 +1658,7 @@ test "bg manager syslog e2e ships redacted chained failure audit over tcp" {
     const t = try collector.spawnCount(cap.rows.items.len);
 
     var sender = try core.syslog.Sender.init(std.testing.allocator, .{
+        .io = defaultIo(),
         .transport = .tcp,
         .host = "127.0.0.1",
         .port = collector.port(),

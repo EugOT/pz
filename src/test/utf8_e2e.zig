@@ -44,9 +44,11 @@ test "T5d invalid UTF-8 in tool output survives persist and export" {
     const md_path = try export_mod.toMarkdown(alloc, tmp.dir, "utf8-e2e", null);
     defer alloc.free(md_path);
 
-    const md_file = try tmp.dir.openFile(md_path, .{});
-    defer md_file.close();
-    const md = try md_file.readToEndAlloc(alloc, 64 * 1024);
+    const md_file = try tmp.dir.openFile(std.testing.io, md_path, .{});
+    defer md_file.close(std.testing.io);
+    var read_buf: [4096]u8 = undefined;
+    var md_reader = md_file.readerStreaming(std.testing.io, &read_buf);
+    const md = try md_reader.interface.allocRemaining(alloc, .limited(64 * 1024));
     defer alloc.free(md);
 
     // Exported markdown must contain the lossy-sanitized output.

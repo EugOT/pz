@@ -10,6 +10,7 @@ const shared = @import("shared.zig");
 const tool_snap = @import("../../test/tool_snap.zig");
 const noop = @import("../../test/noop_sink.zig");
 const event_loop = @import("../event_loop.zig");
+const net = std.Io.net;
 const EventLoop = event_loop.EventLoop;
 
 pub const Err = error{
@@ -32,7 +33,7 @@ pub const Opts = struct {
 const Launch = struct {
     argv: []const []const u8,
     cwd: ?[]const u8,
-    env: *const std.process.EnvMap,
+    env: *const std.process.Environ.Map,
     cancel: ?*tools.CancelSrc,
 };
 
@@ -91,7 +92,11 @@ pub const Handler = struct {
         }
         if (try deniesProtectedCmd(self.alloc, args.cmd)) return error.Denied;
 
-        var env = std.process.getEnvMap(self.alloc) catch |env_err| {
+        var env_len: usize = 0;
+        while (std.c.environ[env_len] != null) : (env_len += 1) {}
+        var env = std.process.Environ.createMap(.{
+            .block = .{ .slice = std.c.environ[0..env_len :null] },
+        }, self.alloc) catch |env_err| {
             return shared.mapFsErr(env_err);
         };
         defer env.deinit();
@@ -261,25 +266,29 @@ const WaitPoll = union(enum) {
 const wait_poll_ms: u64 = 10;
 const term_grace_ms: u64 = 150;
 
+fn defaultIo() std.Io {
+    return @import("../rt_io.zig").default();
+}
+
 fn runChild(
     self: Handler,
     argv: []const []const u8,
     cwd: ?[]const u8,
-    env: *const std.process.EnvMap,
+    env: *const std.process.Environ.Map,
     cancel: ?*tools.CancelSrc,
     call_id: []const u8,
     at_ms: i64,
     sink: *tools.Sink,
 ) Err!RunOut {
-    var child = std.process.Child.init(argv, self.alloc);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.cwd = cwd;
-    child.env_map = env;
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) child.pgid = 0;
-
-    child.spawn() catch |spawn_err| return shared.mapFsErr(spawn_err);
+    var child = std.process.spawn(defaultIo(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .environ_map = env,
+        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+    }) catch |spawn_err| return shared.mapFsErr(spawn_err);
 
     const stdout_file = child.stdout orelse return error.Io;
     const stderr_file = child.stderr orelse return error.Io;
@@ -316,7 +325,7 @@ fn runChild(
         }
 
         if (final == null) {
-            switch (pollChild(&child)) {
+            switch (pollChild(&child) catch return error.Io) {
                 .status => |status| final = statusToFinal(status),
                 .pending => {},
             }
@@ -365,8 +374,8 @@ fn runChild(
         }
     }
 
-    stdout_file.close();
-    stderr_file.close();
+    stdout_file.close(defaultIo());
+    stderr_file.close(defaultIo());
 
     const stdout_chunk = stdout_buf.toOwnedSlice(self.alloc) catch return error.OutOfMemory;
     errdefer self.alloc.free(stdout_chunk);
@@ -391,11 +400,18 @@ fn runChild(
     };
 }
 
-
 fn setNonblock(fd: std.posix.fd_t) !void {
-    const cur = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
-    const want = cur | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }));
-    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, want);
+    const cur = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+    switch (std.posix.errno(cur)) {
+        .SUCCESS => {},
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+    const nonblock: c_int = @bitCast(std.posix.O{ .NONBLOCK = true });
+    const rc = std.c.fcntl(fd, std.posix.F.SETFL, cur | nonblock);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => {},
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
 }
 
 /// Read all available data from a ready fd. Returns false when EOF.
@@ -441,13 +457,14 @@ fn readFd(
 /// Terminate child: SIGTERM, poll grace period, escalate to SIGKILL.
 /// When `el` is non-null, uses event-loop wait instead of Thread.sleep.
 fn terminateAndReap(child: *std.process.Child, el: ?*EventLoop) !u32 {
-    switch (pollChild(child)) {
+    switch (try pollChild(child)) {
         .status => |status| return status,
         .pending => {},
     }
 
-    signalChild(child.id, std.posix.SIG.TERM) catch |kill_err| switch (kill_err) {
-        error.ProcessNotFound => return reapChild(child),
+    const term_pid = child.id orelse return 0;
+    signalChild(term_pid, std.posix.SIG.TERM) catch |kill_err| switch (kill_err) {
+        error.ProcessNotFound => return try reapChild(child),
         else => return kill_err,
     };
 
@@ -457,20 +474,21 @@ fn terminateAndReap(child: *std.process.Child, el: ?*EventLoop) !u32 {
         if (el) |loop| {
             _ = loop.wait(@intCast(wait_poll_ms), &ev_buf) catch {}; // cleanup: propagation impossible in teardown
         } else {
-            std.Thread.sleep(wait_poll_ms * std.time.ns_per_ms);
+            std.Io.sleep(defaultIo(), .fromMilliseconds(@intCast(wait_poll_ms)), .awake) catch {}; // cleanup: propagation impossible
         }
-        switch (pollChild(child)) {
+        switch (try pollChild(child)) {
             .status => |status| return status,
             .pending => {},
         }
     }
 
-    signalChild(child.id, std.posix.SIG.KILL) catch |kill_err| switch (kill_err) {
+    const kill_pid = child.id orelse return 0;
+    signalChild(kill_pid, std.posix.SIG.KILL) catch |kill_err| switch (kill_err) {
         error.ProcessNotFound => {},
         else => return kill_err,
     };
 
-    return reapChild(child);
+    return try reapChild(child);
 }
 
 fn signalChild(pid: std.posix.pid_t, sig: @TypeOf(std.posix.SIG.TERM)) !void {
@@ -481,16 +499,40 @@ fn signalChild(pid: std.posix.pid_t, sig: @TypeOf(std.posix.SIG.TERM)) !void {
     try std.posix.kill(pid, sig);
 }
 
-fn pollChild(child: *std.process.Child) WaitPoll {
-    const res = std.posix.waitpid(child.id, std.c.W.NOHANG);
+const WaitPidResult = struct {
+    pid: std.posix.pid_t,
+    status: u32,
+};
+
+fn waitPid(pid: std.posix.pid_t, options: c_int) !WaitPidResult {
+    var status: c_int = 0;
+    while (true) {
+        const rc = std.c.waitpid(pid, &status, options);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return .{
+                .pid = rc,
+                .status = @as(u32, @bitCast(status)),
+            },
+            .INTR => continue,
+            .CHILD => return error.ProcessNotFound,
+            .INVAL => unreachable,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn pollChild(child: *std.process.Child) !WaitPoll {
+    const pid = child.id orelse return .{ .status = 0 };
+    const res = try waitPid(pid, std.c.W.NOHANG);
     if (res.pid == 0) return .pending;
-    child.id = undefined;
+    child.id = null;
     return .{ .status = res.status };
 }
 
-fn reapChild(child: *std.process.Child) u32 {
-    const res = std.posix.waitpid(child.id, 0);
-    child.id = undefined;
+fn reapChild(child: *std.process.Child) !u32 {
+    const pid = child.id orelse return 0;
+    const res = try waitPid(pid, 0);
+    child.id = null;
     return res.status;
 }
 
@@ -710,7 +752,7 @@ test "bash handler installs sandbox before bash exec" {
     };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("sub");
+    try tmp.dir.createDirPath(std.testing.io, "sub");
     const path_guard = @import("path_guard.zig");
     var cwd_guard = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd_guard.deinit();
@@ -741,9 +783,9 @@ test "bash handler installs sandbox before bash exec" {
     const res = try handler.run(call, sink);
     defer handler.deinitResult(res);
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
-    const sub = try tmp.dir.realpathAlloc(std.testing.allocator, "sub");
+    const sub = try tmp.dir.realPathFileAlloc(std.testing.io, "sub", std.testing.allocator);
     defer std.testing.allocator.free(sub);
 
     const argv = runner_ctx.argv orelse return error.TestUnexpectedResult;
@@ -806,7 +848,7 @@ test "bash handler returns failed final on non-zero exit" {
         .failed => |ev| ev,
         else => return error.TestUnexpectedResult,
     };
-    const snap = try std.fmt.allocPrint(std.testing.allocator, "out={d}\n0={s}|{s}\nfailed={any}|{s}|{s}\n", .{
+    const snap = try std.fmt.allocPrint(std.testing.allocator, "out={d}\n0={s}|{s}\nfailed={?}|{s}|{s}\n", .{
         res.out.len,
         @tagName(res.out[0].stream),
         res.out[0].chunk,
@@ -851,7 +893,7 @@ test "bash handler returns failed final on signal exit" {
         .failed => |ev| ev,
         else => return error.TestUnexpectedResult,
     };
-    const snap = try std.fmt.allocPrint(std.testing.allocator, "out={d}\nfailed={any}|{s}|{s}\n", .{
+    const snap = try std.fmt.allocPrint(std.testing.allocator, "out={d}\nfailed={?}|{s}|{s}\n", .{
         res.out.len,
         failed.code,
         @tagName(failed.kind),
@@ -989,7 +1031,7 @@ test "bash handler denies file reads outside workspace inside sandbox" {
     const oh = OhSnap{};
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const secret = try std.fs.cwd().realpathAlloc(std.testing.allocator, "README.md");
+    const secret = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, "README.md", std.testing.allocator);
     defer std.testing.allocator.free(secret);
 
     const path_guard = @import("path_guard.zig");
@@ -1030,7 +1072,7 @@ test "bash handler denies file reads outside workspace inside sandbox" {
         \\out=1
         \\0=b-file-deny|0|stderr|false|cat: <repo>/README.md: Operation not permitted
         \\
-        \\final=failed|exec|bash exited non-zero|.{ 1 }
+        \\final=failed|exec|bash exited non-zero|1
         \\"
     ).expectEqual(snap);
 }
@@ -1041,12 +1083,12 @@ test "bash handler denies process exec outside workspace inside sandbox" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const script_rel = ".zig-cache/p30a-run.sh";
-    defer std.fs.cwd().deleteFile(script_rel) catch {}; // test: error irrelevant
-    try std.fs.cwd().writeFile(.{ .sub_path = script_rel, .data = "#!/bin/sh\nprintf nope\n" });
-    var script_file = try std.fs.cwd().openFile(script_rel, .{ .mode = .read_only });
-    defer script_file.close();
-    try script_file.chmod(0o755);
-    const script = try std.fs.cwd().realpathAlloc(std.testing.allocator, script_rel);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, script_rel) catch {}; // test: error irrelevant
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = script_rel, .data = "#!/bin/sh\nprintf nope\n" });
+    var script_file = try std.Io.Dir.cwd().openFile(std.testing.io, script_rel, .{ .mode = .read_only });
+    defer script_file.close(std.testing.io);
+    try script_file.setPermissions(std.testing.io, .fromMode(0o755));
+    const script = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, script_rel, std.testing.allocator);
     defer std.testing.allocator.free(script);
 
     const path_guard = @import("path_guard.zig");
@@ -1087,7 +1129,7 @@ test "bash handler denies process exec outside workspace inside sandbox" {
         \\out=1
         \\0=b-proc-deny|0|stderr|false|/bin/bash: <repo>/.zig-cache/p30a-run.sh: Operation not permitted
         \\
-        \\final=failed|exec|bash exited non-zero|.{ 126 }
+        \\final=failed|exec|bash exited non-zero|126
         \\"
     ).expectEqual(snap);
 }
@@ -1096,23 +1138,23 @@ test "bash handler denies network connects inside sandbox" {
     const OhSnap = @import("ohsnap");
     const oh = OhSnap{};
     const Server = struct {
-        listener: std.net.Server,
+        listener: net.Server,
         stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         fn run(self: *@This()) void {
             var conn = self.acceptReady() catch return orelse return;
-            conn.stream.close();
+            conn.close(std.testing.io);
         }
 
         fn join(self: *@This(), thr: std.Thread) void {
             self.stop.store(true, .release);
             thr.join();
-            self.listener.deinit();
+            self.listener.deinit(std.testing.io);
         }
 
-        fn acceptReady(self: *@This()) !?std.net.Server.Connection {
+        fn acceptReady(self: *@This()) !?net.Stream {
             var fds = [_]std.posix.pollfd{.{
-                .fd = self.listener.stream.handle,
+                .fd = self.listener.socket.handle,
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
@@ -1120,7 +1162,7 @@ test "bash handler denies network connects inside sandbox" {
                 if (self.stop.load(.acquire)) return null;
                 const ready = try std.posix.poll(fds[0..], 20);
                 if (ready == 0) continue;
-                return try self.listener.accept();
+                return try self.listener.accept(std.testing.io);
             }
         }
     };
@@ -1131,13 +1173,13 @@ test "bash handler denies network connects inside sandbox" {
     var cwd_guard = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd_guard.deinit();
 
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
     var server = Server{
-        .listener = try addr.listen(.{
+        .listener = try addr.listen(std.testing.io, .{
             .reuse_address = true,
         }),
     };
-    const port = server.listener.listen_address.in.getPort();
+    const port = server.listener.socket.address.getPort();
     const thr = try std.Thread.spawn(.{}, Server.run, .{&server});
     defer server.join(thr);
 
@@ -1171,7 +1213,7 @@ test "bash handler denies network connects inside sandbox" {
         \\start=0
         \\end=0
         \\out=0
-        \\final=failed|exec|bash exited non-zero|.{ 1 }
+        \\final=failed|exec|bash exited non-zero|1
         \\"
     ).expectEqual(snap);
 }
@@ -1293,26 +1335,27 @@ test "bash handler cancels running child and reaps TERM-resistant process" {
         fn run(pid: std.posix.pid_t) !void {
             var polls: usize = 0;
             while (polls < 50) : (polls += 1) {
-                std.posix.kill(pid, 0) catch |kill_err| switch (kill_err) {
+                const probe_signal: std.posix.SIG = @enumFromInt(0);
+                std.posix.kill(pid, probe_signal) catch |kill_err| switch (kill_err) {
                     error.ProcessNotFound => return,
                     else => return kill_err,
                 };
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                std.Io.sleep(defaultIo(), .fromMilliseconds(10), .awake) catch return error.TestUnexpectedResult;
             }
             return error.TestUnexpectedResult;
         }
     };
     const SinkImpl = struct {
         sink: tools.Sink = .{ .vt = &SinkBind.vt },
-        mu: std.Thread.Mutex = .{},
+        mu: std.Io.Mutex = .init,
         saw_out: bool = false,
         out_before_done: bool = false,
         done: bool = false,
         const SinkBind = tools.Sink.Bind(@This(), push);
 
         fn push(self: *@This(), ev: tools.Event) !void {
-            self.mu.lock();
-            defer self.mu.unlock();
+            self.mu.lockUncancelable(defaultIo());
+            defer self.mu.unlock(defaultIo());
             switch (ev) {
                 .output => {
                     self.saw_out = true;
@@ -1373,7 +1416,14 @@ test "bash handler cancels running child and reaps TERM-resistant process" {
     };
 
     const thr = try std.Thread.spawn(.{}, RunCtx.run, .{&ctx});
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    var ready_polls: usize = 0;
+    while (ready_polls < 50) : (ready_polls += 1) {
+        sink_impl.mu.lockUncancelable(defaultIo());
+        const ready = sink_impl.saw_out;
+        sink_impl.mu.unlock(defaultIo());
+        if (ready) break;
+        std.Io.sleep(defaultIo(), .fromMilliseconds(10), .awake) catch return error.TestUnexpectedResult;
+    }
     cancel_impl.canceled.store(true, .release);
     thr.join();
 
@@ -1381,10 +1431,10 @@ test "bash handler cancels running child and reaps TERM-resistant process" {
     const res = ctx.res orelse return error.TestUnexpectedResult;
     defer handler.deinitResult(res);
 
-    sink_impl.mu.lock();
+    sink_impl.mu.lockUncancelable(defaultIo());
     const saw_out = sink_impl.saw_out;
     const out_before_done = sink_impl.out_before_done;
-    sink_impl.mu.unlock();
+    sink_impl.mu.unlock(defaultIo());
 
     try std.testing.expectEqual(@as(usize, 1), res.out.len);
     const bg_pid = try std.fmt.parseInt(std.posix.pid_t, res.out[0].chunk, 10);

@@ -19,13 +19,19 @@ pub const Rule = enum {
 
 // -- Detection --
 
+fn trimLeft(line: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < line.len and (line[start] == ' ' or line[start] == '\t')) : (start += 1) {}
+    return line[start..];
+}
+
 pub fn isTableLine(line: []const u8) bool {
-    const t = std.mem.trimLeft(u8, line, " \t");
+    const t = trimLeft(line);
     return t.len > 0 and t[0] == '|';
 }
 
 pub fn isSepLine(line: []const u8) bool {
-    const t = std.mem.trimLeft(u8, line, " \t");
+    const t = trimLeft(line);
     if (t.len < 3 or t[0] != '|') return false;
     for (t) |c| {
         switch (c) {
@@ -39,7 +45,7 @@ pub fn isSepLine(line: []const u8) bool {
 // -- Cell splitting --
 
 pub fn splitCells(line: []const u8, buf: *[max_cols][]const u8) usize {
-    const t = std.mem.trimLeft(u8, line, " \t");
+    const t = trimLeft(line);
     var rest = t;
     if (rest.len > 0 and rest[0] == '|') rest = rest[1..];
     if (rest.len > 0 and rest[rest.len - 1] == '|') rest = rest[0 .. rest.len - 1];

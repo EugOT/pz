@@ -4,6 +4,43 @@ Hard-won patterns and anti-patterns from building pz. **Update this file at the 
 
 ---
 
+## Session Notes (2026-06-19)
+
+### Worked Well
+- Use direct test binaries with the same seed when `zig build test --summary failures` is buffered; the direct runner exposes the exact PTY/auth test that is stuck or logging.
+
+### Do More
+- Keep `--no-config` hermetic: it must not initialize native auth, read legacy auth, or migrate `~/.pi/agent/auth.json` into `~/.pz/auth.json`.
+- Suppress expected migration warnings under `builtin.is_test`; Zig's build-runner protocol can report a failed command when tests emit stderr even if the direct test binary exits cleanly.
+- Treat background stop on short-lived commands as an async reap race: only downgrade signal errors to `already_done` after the manager observes the job leaving `running`.
+
+### Do Not Do
+- Do not leave deterministic PTY tests dependent on startup OAuth. Add `--no-config` to fixtures that exercise command/input surfaces, and put real provider/API tests behind an explicit opt-in env var.
+
+## Session Notes (2026-06-18)
+
+### Worked Well
+- Verify Zig package URL/hash review comments with `zig fetch <url>` before editing `build.zig.zon`; the hash prefix can reflect the package's own declared version, not the archive tag.
+
+### Do More
+- Use a real `std.Io` in tests that exercise filesystem metadata, realpath, process spawning, sockets, or TLS certificate bundle loading. `std.testing.io` intentionally fails or stubs many of those operations in Zig 0.16.
+- Confirm the timeout tool exists before relying on the mandated full-suite command on macOS; this host has no `timeout` or `gtimeout` in PATH, so `zig build test` can run past the intended 60-second cap.
+
+### Do Not Do
+- Do not pass `.TRUNC` into `openat` before hardlink/symlink validation. Open first without truncation, validate the fd, then call `ftruncate`.
+- Do not use `std.Io.Reader.take(n)` for provider stdout chunks; it waits for an exact-size buffer and can stall streaming. Use short reads via `File.readStreaming`.
+
+## Session Notes (2026-06-13)
+
+### Worked Well
+- For Zig 0.16 migrations, compile against the installed stdlib source and treat `std.Io` API changes as hard cutovers: pass explicit `Io` handles, use `std.process.spawn`, and update `std.process.Environ.Map` callers instead of adding compatibility helpers.
+- Keep dependency compatibility shims in `src/vendor/` and import the upstream module through the build graph; do not patch generated `zig-pkg/` package contents.
+- For PTY tests on Darwin, map wait statuses to typed `std.posix.SIG` values at the boundary and compare enum tags, not integer signal macros.
+
+### Do Not Do
+- Do not rely on a parent-process alarm wrapper as a test timeout. `zig build test` can leave child test processes running; use a process-group timeout or the project-provided `timeout` command when it exists.
+- Do not diagnose Zig cache `PermissionDenied` at source level until sandbox and disk pressure are ruled out; generated caches can hide real compile errors.
+
 ## Session Notes (2026-03-24)
 
 ### Worked Well

@@ -154,7 +154,7 @@ pub const Panels = struct {
     }
 
     pub fn noteCompaction(self: *Panels) void {
-        self.noteCompactionAt(std.time.milliTimestamp());
+        self.noteCompactionAt(core.time.milliTimestamp());
     }
 
     pub fn compactionActive(self: *Panels, now_ms: i64) bool {
@@ -719,7 +719,6 @@ fn writePart(
     x.* += try frm.write(x.*, y, fit, st);
 }
 
-
 fn rowAscii(frm: *const frame.Frame, y: usize, out: []u8) ![]const u8 {
     std.debug.assert(out.len >= frm.w);
     var x: usize = 0;
@@ -731,7 +730,7 @@ fn rowAscii(frm: *const frame.Frame, y: usize, out: []u8) ![]const u8 {
     return out[0..frm.w];
 }
 
-fn trimRightSpaces(text: []const u8) []const u8 {
+fn trimEndSpaces(text: []const u8) []const u8 {
     var end = text.len;
     while (end > 0 and text[end - 1] == ' ') : (end -= 1) {}
     return text[0..end];
@@ -759,7 +758,7 @@ fn rowSegmentsAlloc(alloc: std.mem.Allocator, frm: *const frame.Frame, y: usize)
 
         if (!first) try out.appendSlice(alloc, " | ");
         first = false;
-        try std.fmt.format(out.writer(alloc), "@{d}:", .{x});
+        try out.print(alloc, "@{d}:", .{x});
 
         while (x < frm.w) : (x += 1) {
             const cur = try frm.cell(x, y);
@@ -779,7 +778,7 @@ fn footerSegmentsAlloc(alloc: std.mem.Allocator, frm: *const frame.Frame, rect: 
         if (y > 0) try out.append(alloc, '\n');
         const segs = try rowSegmentsAlloc(alloc, frm, rect.y + y);
         defer alloc.free(segs);
-        try std.fmt.format(out.writer(alloc), "row{d} {s}", .{ y, trimRightSpaces(segs) });
+        try out.print(alloc, "row{d} {s}", .{ y, trimEndSpaces(segs) });
     }
     return out.toOwnedSlice(alloc);
 }
@@ -798,7 +797,7 @@ test "panels track tool lifecycle and state transitions" {
 
     try ps.append(.{ .text = "hello" });
     try std.testing.expect(ps.state() == .streaming);
-    try std.fmt.format(snap.writer(std.testing.allocator), "after_text state={s}", .{@tagName(ps.state())});
+    try snap.print(std.testing.allocator, "after_text state={s}", .{@tagName(ps.state())});
 
     try ps.append(.{ .tool_call = .{
         .id = "call-1",
@@ -809,7 +808,7 @@ test "panels track tool lifecycle and state transitions" {
     try std.testing.expectEqual(@as(usize, 1), ps.count());
     try std.testing.expectEqual(@as(usize, 1), ps.runningCount());
     try std.testing.expect(ps.tool(0).state == .running);
-    try std.fmt.format(snap.writer(std.testing.allocator), "\nafter_call state={s} id={s} name={s} tool={s}", .{
+    try snap.print(std.testing.allocator, "\nafter_call state={s} id={s} name={s} tool={s}", .{
         @tagName(ps.state()),
         ps.tool(0).id,
         ps.tool(0).name,
@@ -824,7 +823,7 @@ test "panels track tool lifecycle and state transitions" {
     try std.testing.expect(ps.state() == .streaming);
     try std.testing.expectEqual(@as(usize, 0), ps.runningCount());
     try std.testing.expect(ps.tool(0).state == .ok);
-    try std.fmt.format(snap.writer(std.testing.allocator), "\nafter_result state={s} tool={s}", .{
+    try snap.print(std.testing.allocator, "\nafter_result state={s} tool={s}", .{
         @tagName(ps.state()),
         @tagName(ps.tool(0).state),
     });
@@ -834,7 +833,7 @@ test "panels track tool lifecycle and state transitions" {
     } });
     try std.testing.expect(ps.state() == .done);
     try std.testing.expectEqual(@as(u32, 1), ps.turns);
-    try std.fmt.format(snap.writer(std.testing.allocator), "\nafter_stop state={s}", .{@tagName(ps.state())});
+    try snap.print(std.testing.allocator, "\nafter_stop state={s}", .{@tagName(ps.state())});
     try expectSnapText(
         @src(),
         "after_text state=streaming\nafter_call state=tool id=call-1 name=read tool=running\nafter_result state=streaming tool=ok\nafter_stop state=done",
@@ -988,7 +987,7 @@ test "panels compaction indicator expires" {
     var ps = try Panels.initFull(std.testing.allocator, "m", "p", "", "");
     defer ps.deinit();
 
-    const t0 = std.time.milliTimestamp();
+    const t0 = core.time.milliTimestamp();
     try std.testing.expect(!ps.compactionActive(t0));
 
     ps.noteCompactionAt(t0);

@@ -3,6 +3,14 @@ const std = @import("std");
 const policy = @import("policy.zig");
 const syslog_mock = @import("../test/syslog_mock.zig");
 
+const NetAddress = std.Io.net.IpAddress;
+
+fn defaultIo() std.Io {
+    return @import("rt_io.zig").default();
+}
+
+extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
+
 pub const version: u8 = 1;
 pub const nil = "-";
 
@@ -105,6 +113,7 @@ pub const TlsOpts = struct {
 };
 
 pub const SenderOpts = struct {
+    io: std.Io = std.Io.failing,
     transport: Transport = .udp,
     host: []const u8,
     port: u16 = 514,
@@ -118,6 +127,7 @@ pub const SenderOpts = struct {
 
 pub const Sender = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
     transport: Transport,
     host: []u8,
     port: u16,
@@ -126,7 +136,7 @@ pub const Sender = struct {
     tls_opts: TlsOpts,
     hooks: Hooks,
     fd: std.posix.socket_t,
-    addr: std.net.Address,
+    addr: NetAddress,
     tls_conn: ?TlsConn = null,
 
     pub fn init(alloc: std.mem.Allocator, opts: SenderOpts) !Sender {
@@ -136,10 +146,11 @@ pub const Sender = struct {
         const host = try alloc.dupe(u8, opts.host);
         errdefer alloc.free(host);
 
-        const conn = try openConn(opts.hooks, alloc, host, opts.port, opts.transport, opts.allow_private, opts.deadline_s, opts.tls);
+        const conn = try openConn(opts.hooks, alloc, opts.io, host, opts.port, opts.transport, opts.allow_private, opts.deadline_s, opts.tls);
 
         return .{
             .alloc = alloc,
+            .io = opts.io,
             .transport = opts.transport,
             .host = host,
             .port = opts.port,
@@ -155,7 +166,7 @@ pub const Sender = struct {
 
     pub fn deinit(self: *Sender) void {
         if (self.tls_conn) |tc| tc.close();
-        self.hooks.close_socket(self.fd);
+        self.hooks.close_socket(self.io, self.fd);
         self.alloc.free(self.host);
         self.* = undefined;
     }
@@ -179,9 +190,9 @@ pub const Sender = struct {
     }
 
     fn refresh(self: *Sender) !void {
-        const conn = try openConn(self.hooks, self.alloc, self.host, self.port, self.transport, self.allow_private, self.deadline_s, self.tls_opts);
+        const conn = try openConn(self.hooks, self.alloc, self.io, self.host, self.port, self.transport, self.allow_private, self.deadline_s, self.tls_opts);
         if (self.tls_conn) |tc| tc.close();
-        self.hooks.close_socket(self.fd);
+        self.hooks.close_socket(self.io, self.fd);
         self.fd = conn.fd;
         self.addr = conn.addr;
         self.tls_conn = conn.tls_conn;
@@ -211,20 +222,20 @@ pub const Sender = struct {
 
 const Conn = struct {
     fd: std.posix.socket_t,
-    addr: std.net.Address,
+    addr: NetAddress,
     tls_conn: ?TlsConn,
 };
 
 /// Shared socket+connect+TLS logic used by both init and refresh.
-fn openConn(hooks: Hooks, alloc: std.mem.Allocator, host: []const u8, port: u16, transport: Transport, allow_private: bool, deadline_s: i64, tls_opts: TlsOpts) !Conn {
-    const addr = try hooks.resolve(alloc, host, port);
+fn openConn(hooks: Hooks, alloc: std.mem.Allocator, io: std.Io, host: []const u8, port: u16, transport: Transport, allow_private: bool, deadline_s: i64, tls_opts: TlsOpts) !Conn {
+    const addr = try hooks.resolve(alloc, io, host, port);
 
     if (!allow_private and policy.isBlockedNetAddr(addr))
         return error.PrivateAddr;
 
     const sock_transport: Transport = if (transport == .tls) .tcp else transport;
     const fd = try hooks.open_socket(addr, sock_transport);
-    errdefer hooks.close_socket(fd);
+    errdefer hooks.close_socket(io, fd);
 
     if (transport == .tcp or transport == .tls) {
         try hooks.connect(fd, addr);
@@ -233,7 +244,7 @@ fn openConn(hooks: Hooks, alloc: std.mem.Allocator, host: []const u8, port: u16,
 
     var tls_conn: ?TlsConn = null;
     if (transport == .tls) {
-        tls_conn = try hooks.tls_handshake(fd, host, tls_opts);
+        tls_conn = try hooks.tls_handshake(io, fd, host, tls_opts);
     }
 
     return .{ .fd = fd, .addr = addr, .tls_conn = tls_conn };
@@ -249,14 +260,14 @@ fn checkHostAllowed(host: []const u8, egress: policy.Policy, tool: ?[]const u8) 
 }
 
 const Hooks = struct {
-    resolve: *const fn (alloc: std.mem.Allocator, host: []const u8, port: u16) anyerror!std.net.Address = resolve,
-    open_socket: *const fn (addr: std.net.Address, transport: Transport) anyerror!std.posix.socket_t = openSocket,
-    connect: *const fn (fd: std.posix.socket_t, addr: std.net.Address) anyerror!void = connectSocket,
+    resolve: *const fn (alloc: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) anyerror!NetAddress = resolve,
+    open_socket: *const fn (addr: NetAddress, transport: Transport) anyerror!std.posix.socket_t = openSocket,
+    connect: *const fn (fd: std.posix.socket_t, addr: NetAddress) anyerror!void = connectSocket,
     set_deadlines: *const fn (fd: std.posix.socket_t, secs: i64) anyerror!void = setDeadlines,
-    send_udp: *const fn (fd: std.posix.socket_t, raw: []const u8, addr: std.net.Address) anyerror!void = sendUdpRaw,
+    send_udp: *const fn (fd: std.posix.socket_t, raw: []const u8, addr: NetAddress) anyerror!void = sendUdpRaw,
     send_tcp: *const fn (fd: std.posix.socket_t, raw: []const u8) anyerror!void = sendAll,
-    close_socket: *const fn (fd: std.posix.socket_t) void = closeSocket,
-    tls_handshake: *const fn (fd: std.posix.socket_t, host: []const u8, opts: TlsOpts) anyerror!TlsConn = tlsHandshake,
+    close_socket: *const fn (io: std.Io, fd: std.posix.socket_t) void = closeSocket,
+    tls_handshake: *const fn (io: std.Io, fd: std.posix.socket_t, host: []const u8, opts: TlsOpts) anyerror!TlsConn = tlsHandshake,
 };
 
 const udp_max_len: usize = 1024;
@@ -400,11 +411,11 @@ fn splitFrame(raw: []const u8) !FrameView {
 }
 
 pub fn encodeAlloc(alloc: std.mem.Allocator, msg: Message) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
 
-    try write(out.writer(alloc), msg);
-    return try out.toOwnedSlice(alloc);
+    try write(&out.writer, msg);
+    return try out.toOwnedSlice();
 }
 
 pub fn write(writer: anytype, msg: Message) !void {
@@ -434,32 +445,114 @@ pub fn write(writer: anytype, msg: Message) !void {
     }
 }
 
-fn resolve(alloc: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
-    const addrs = try std.net.getAddressList(alloc, host, port);
-    defer addrs.deinit();
+const SockAddr = union(enum) {
+    ip4: std.posix.sockaddr.in,
+    ip6: std.posix.sockaddr.in6,
 
-    if (addrs.addrs.len == 0) return error.UnknownHostName;
-    return addrs.addrs[0];
+    fn init(addr: NetAddress) SockAddr {
+        return switch (addr) {
+            .ip4 => |ip4| .{ .ip4 = .{
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            } },
+            .ip6 => |ip6| .{ .ip6 = .{
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            } },
+        };
+    }
+
+    fn ptr(self: *const SockAddr) *const std.posix.sockaddr {
+        return switch (self.*) {
+            .ip4 => |*addr| @ptrCast(addr),
+            .ip6 => |*addr| @ptrCast(addr),
+        };
+    }
+
+    fn len(self: *const SockAddr) std.c.socklen_t {
+        return switch (self.*) {
+            .ip4 => @sizeOf(std.posix.sockaddr.in),
+            .ip6 => @sizeOf(std.posix.sockaddr.in6),
+        };
+    }
+};
+
+fn addrFamily(addr: NetAddress) std.posix.sa_family_t {
+    return switch (addr) {
+        .ip4 => std.posix.AF.INET,
+        .ip6 => std.posix.AF.INET6,
+    };
 }
 
-fn openSocket(addr: std.net.Address, transport: Transport) !std.posix.socket_t {
-    const kind: u32 = switch (transport) {
+fn netIp4(bytes: [4]u8, port: u16) NetAddress {
+    return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+}
+
+fn resolve(_: std.mem.Allocator, io: std.Io, host: []const u8, port: u16) !NetAddress {
+    if (NetAddress.parse(host, port)) |addr| return addr else |_| {}
+
+    const host_name = std.Io.net.HostName{ .bytes = host };
+    try std.Io.net.HostName.validate(host_name.bytes);
+    var canonical_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    var lookup_buffer: [32]std.Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+    try std.Io.net.HostName.lookup(host_name, io, &lookup_queue, .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    });
+
+    while (lookup_queue.getOne(io)) |result| {
+        switch (result) {
+            .address => |addr| return addr,
+            .canonical_name => continue,
+        }
+    } else |err| switch (err) {
+        error.Closed => {},
+        else => return err,
+    }
+
+    return error.UnknownHostName;
+}
+
+fn openSocket(addr: NetAddress, transport: Transport) !std.posix.socket_t {
+    const kind: c_uint = switch (transport) {
         .udp => std.posix.SOCK.DGRAM,
         .tcp, .tls => std.posix.SOCK.STREAM,
     };
-    const proto: u32 = switch (transport) {
-        .udp => std.posix.IPPROTO.UDP,
-        .tcp, .tls => std.posix.IPPROTO.TCP,
+    const proto: c_uint = switch (transport) {
+        .udp => @intFromEnum(std.Io.net.Protocol.udp),
+        .tcp, .tls => @intFromEnum(std.Io.net.Protocol.tcp),
     };
-    return try std.posix.socket(addr.any.family, kind | std.posix.SOCK.CLOEXEC, proto);
+    const fd = socket(@intCast(addrFamily(addr)), kind, proto);
+    if (fd < 0) return switch (std.posix.errno(fd)) {
+        .ACCES => error.AccessDenied,
+        .AFNOSUPPORT => error.AddressFamilyNotSupported,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .PROTONOSUPPORT => error.ProtocolNotSupported,
+        .PROTOTYPE => error.ProtocolWrongTypeForSocket,
+        else => error.SocketOpenFailed,
+    };
+    errdefer _ = std.c.close(fd);
+
+    const flags = std.c.fcntl(fd, @as(c_int, std.posix.F.GETFD), @as(c_int, 0));
+    if (flags == -1) return error.SocketOpenFailed;
+    if (std.c.fcntl(fd, @as(c_int, std.posix.F.SETFD), flags | @as(c_int, std.posix.FD_CLOEXEC)) == -1) {
+        return error.SocketOpenFailed;
+    }
+    return @intCast(fd);
 }
 
-fn connectSocket(fd: std.posix.socket_t, addr: std.net.Address) !void {
-    try std.posix.connect(fd, &addr.any, addr.getOsSockLen());
+fn connectSocket(fd: std.posix.socket_t, addr: NetAddress) !void {
+    var sa = SockAddr.init(addr);
+    if (std.c.connect(fd, sa.ptr(), sa.len()) != 0) return error.ConnectFailed;
 }
 
-fn closeSocket(fd: std.posix.socket_t) void {
-    (std.net.Stream{ .handle = fd }).close();
+fn closeSocket(io: std.Io, fd: std.posix.socket_t) void {
+    const sock = std.Io.net.Socket{ .handle = fd, .address = undefined };
+    sock.close(io);
 }
 
 /// Apply SO_SNDTIMEO and SO_RCVTIMEO so TCP/TLS syslog connections
@@ -471,27 +564,30 @@ fn setDeadlines(fd: std.posix.socket_t, secs: i64) !void {
     try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, tv_bytes);
 }
 
-fn sendUdpRaw(fd: std.posix.socket_t, raw: []const u8, addr: std.net.Address) !void {
-    const sent = try std.posix.sendto(fd, raw, 0, &addr.any, addr.getOsSockLen());
+fn sendUdpRaw(fd: std.posix.socket_t, raw: []const u8, addr: NetAddress) !void {
+    var sa = SockAddr.init(addr);
+    const sent = std.c.sendto(fd, raw.ptr, raw.len, 0, sa.ptr(), sa.len());
+    if (sent < 0) return error.SendFailed;
     if (sent != raw.len) return error.ShortWrite;
 }
 
 fn sendAll(fd: std.posix.socket_t, raw: []const u8) !void {
     var off: usize = 0;
     while (off < raw.len) {
-        const sent = try std.posix.send(fd, raw[off..], 0);
+        const sent = std.c.send(fd, raw[off..].ptr, raw.len - off, 0);
+        if (sent < 0) return error.SendFailed;
         if (sent == 0) return error.ShortWrite;
-        off += sent;
+        off += @intCast(sent);
     }
 }
 
 const TlsState = struct {
     client: std.crypto.tls.Client,
-    stream: std.net.Stream,
-    reader: std.net.Stream.Reader,
-    writer: std.net.Stream.Writer,
-    read_buf: [16384]u8,
-    write_buf: [4096]u8,
+    stream: std.Io.net.Stream,
+    reader: std.Io.net.Stream.Reader,
+    writer: std.Io.net.Stream.Writer,
+    read_buf: [std.crypto.tls.Client.min_buffer_len]u8,
+    write_buf: [std.crypto.tls.Client.min_buffer_len]u8,
 };
 
 pub const MockTls = struct {
@@ -527,34 +623,45 @@ pub const TlsConn = union(enum) {
     }
 };
 
-fn tlsHandshake(fd: std.posix.socket_t, host: []const u8, opts: TlsOpts) !TlsConn {
+fn tlsHandshake(io: std.Io, fd: std.posix.socket_t, host: []const u8, opts: TlsOpts) !TlsConn {
     const alloc = std.heap.page_allocator;
-    const stream = std.net.Stream{ .handle = fd };
+    const stream = std.Io.net.Stream{ .socket = .{ .handle = fd, .address = undefined } };
 
-    var ca_bundle: std.crypto.Certificate.Bundle = .{};
+    var ca_bundle: std.crypto.Certificate.Bundle = .empty;
     defer ca_bundle.deinit(alloc);
+    const now = std.Io.Clock.real.now(io);
     if (opts.ca_file) |path| {
-        ca_bundle.addCertsFromFilePathAbsolute(alloc, path) catch return error.TlsHandshakeFailed;
+        ca_bundle.addCertsFromFilePathAbsolute(alloc, io, now, path) catch return error.TlsHandshakeFailed;
     } else {
-        ca_bundle.rescan(alloc) catch return error.TlsHandshakeFailed;
+        ca_bundle.rescan(alloc, io, now) catch return error.TlsHandshakeFailed;
     }
+    var ca_bundle_lock: std.Io.RwLock = .init;
+    var random_buffer: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+    io.randomSecure(&random_buffer) catch return error.TlsHandshakeFailed;
 
     const state = alloc.create(TlsState) catch return error.OutOfMemory;
     errdefer alloc.destroy(state);
     state.stream = stream;
     state.read_buf = undefined;
     state.write_buf = undefined;
-    state.reader = stream.reader(&state.read_buf);
-    state.writer = stream.writer(&state.write_buf);
+    state.reader = stream.reader(io, &state.read_buf);
+    state.writer = stream.writer(io, &state.write_buf);
 
     state.client = std.crypto.tls.Client.init(
-        state.reader.interface(),
+        &state.reader.interface,
         &state.writer.interface,
         .{
             .host = .{ .explicit = host },
-            .ca = .{ .bundle = ca_bundle },
+            .ca = .{ .bundle = .{
+                .gpa = alloc,
+                .io = io,
+                .lock = &ca_bundle_lock,
+                .bundle = &ca_bundle,
+            } },
             .write_buffer = &state.write_buf,
             .read_buffer = &state.read_buf,
+            .entropy = &random_buffer,
+            .realtime_now = now,
         },
     ) catch return error.TlsHandshakeFailed;
     return .{ .real = state };
@@ -709,6 +816,7 @@ test "udp sender emits datagram to local collector" {
     const t = try collector.spawn();
 
     var sender = try Sender.init(std.testing.allocator, .{
+        .io = defaultIo(),
         .transport = .udp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -749,6 +857,7 @@ test "tcp sender emits octet-counted frame to local collector" {
     const t = try collector.spawn();
 
     var sender = try Sender.init(std.testing.allocator, .{
+        .io = defaultIo(),
         .transport = .tcp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -781,6 +890,7 @@ test "udp sender truncates only the payload and annotates metadata" {
     const t = try collector.spawn();
 
     var sender = try Sender.init(std.testing.allocator, .{
+        .io = defaultIo(),
         .transport = .udp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -826,6 +936,7 @@ test "tcp sender preserves the full payload for large messages" {
     const t = try collector.spawn();
 
     var sender = try Sender.init(std.testing.allocator, .{
+        .io = defaultIo(),
         .transport = .tcp,
         .host = "127.0.0.1",
         .port = collector.port(),
@@ -870,20 +981,20 @@ test "udp sender re-resolves hostname after send failure" {
             sent_port: u16 = 0,
         }{};
 
-        fn resolve(raw_alloc: std.mem.Allocator, _: []const u8, _: u16) !std.net.Address {
+        fn resolve(raw_alloc: std.mem.Allocator, _: std.Io, _: []const u8, _: u16) !NetAddress {
             _ = raw_alloc;
             const self = &h;
             self.resolve_ct += 1;
-            return std.net.Address.parseIp("127.0.0.1", if (self.resolve_ct == 1) 4011 else 4012);
+            return NetAddress.parse("127.0.0.1", if (self.resolve_ct == 1) 4011 else 4012);
         }
 
-        fn openSocket(_: std.net.Address, _: Transport) !std.posix.socket_t {
+        fn openSocket(_: NetAddress, _: Transport) !std.posix.socket_t {
             return 0;
         }
 
-        fn connect(_: std.posix.socket_t, _: std.net.Address) !void {}
+        fn connect(_: std.posix.socket_t, _: NetAddress) !void {}
 
-        fn sendUdp(_: std.posix.socket_t, raw: []const u8, addr: std.net.Address) !void {
+        fn sendUdp(_: std.posix.socket_t, raw: []const u8, addr: NetAddress) !void {
             _ = raw;
             if (addr.getPort() == 4011) return error.NetworkUnreachable;
             h.sent_port = addr.getPort();
@@ -891,7 +1002,7 @@ test "udp sender re-resolves hostname after send failure" {
 
         fn sendTcp(_: std.posix.socket_t, _: []const u8) !void {}
 
-        fn closeSocket(_: std.posix.socket_t) void {}
+        fn closeSocket(_: std.Io, _: std.posix.socket_t) void {}
     };
 
     var sender = try Sender.init(std.testing.allocator, .{
@@ -932,7 +1043,7 @@ test "sender init rejects host absent from policy" {
         .egress = .{ .rules = &rules },
         .hooks = .{
             .resolve = struct {
-                fn f(_: std.mem.Allocator, _: []const u8, _: u16) !std.net.Address {
+                fn f(_: std.mem.Allocator, _: std.Io, _: []const u8, _: u16) !NetAddress {
                     return error.TestUnexpectedResult;
                 }
             }.f,
@@ -944,20 +1055,20 @@ test "sender init accepts host allowed by policy" {
     const Wrap = struct {
         var resolved = false;
 
-        fn resolve(_: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
+        fn resolve(_: std.mem.Allocator, _: std.Io, host: []const u8, port: u16) !NetAddress {
             resolved = true;
             try std.testing.expectEqualStrings("Audit.EXAMPLE.com", host);
-            return std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+            return netIp4(.{ 127, 0, 0, 1 }, port);
         }
 
-        fn openSocket(_: std.net.Address, _: Transport) !std.posix.socket_t {
+        fn openSocket(_: NetAddress, _: Transport) !std.posix.socket_t {
             return 0;
         }
 
-        fn connect(_: std.posix.socket_t, _: std.net.Address) !void {}
-        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: std.net.Address) !void {}
+        fn connect(_: std.posix.socket_t, _: NetAddress) !void {}
+        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: NetAddress) !void {}
         fn sendTcp(_: std.posix.socket_t, _: []const u8) !void {}
-        fn closeSocket(_: std.posix.socket_t) void {}
+        fn closeSocket(_: std.Io, _: std.posix.socket_t) void {}
     };
     const rules = [_]policy.Rule{
         .{ .pattern = "runtime/syslog/audit.example.com", .effect = .allow, .tool = "syslog" },
@@ -986,8 +1097,8 @@ test "sender rejects private address after resolution" {
         .host = "private.example.com",
         .hooks = .{
             .resolve = struct {
-                fn f(_: std.mem.Allocator, _: []const u8, port: u16) !std.net.Address {
-                    return std.net.Address.initIp4(.{ 10, 0, 0, 1 }, port);
+                fn f(_: std.mem.Allocator, _: std.Io, _: []const u8, port: u16) !NetAddress {
+                    return netIp4(.{ 10, 0, 0, 1 }, port);
                 }
             }.f,
         },
@@ -996,14 +1107,16 @@ test "sender rejects private address after resolution" {
 
 test "sender allows private address when allow_private set" {
     const Wrap = struct {
-        fn resolve(_: std.mem.Allocator, _: []const u8, port: u16) !std.net.Address {
-            return std.net.Address.initIp4(.{ 192, 168, 1, 1 }, port);
+        fn resolve(_: std.mem.Allocator, _: std.Io, _: []const u8, port: u16) !NetAddress {
+            return netIp4(.{ 192, 168, 1, 1 }, port);
         }
-        fn openSocket(_: std.net.Address, _: Transport) !std.posix.socket_t { return 0; }
-        fn connect(_: std.posix.socket_t, _: std.net.Address) !void {}
-        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: std.net.Address) !void {}
+        fn openSocket(_: NetAddress, _: Transport) !std.posix.socket_t {
+            return 0;
+        }
+        fn connect(_: std.posix.socket_t, _: NetAddress) !void {}
+        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: NetAddress) !void {}
         fn sendTcp(_: std.posix.socket_t, _: []const u8) !void {}
-        fn closeSocket(_: std.posix.socket_t) void {}
+        fn closeSocket(_: std.Io, _: std.posix.socket_t) void {}
     };
 
     var sender = try Sender.init(std.testing.allocator, .{
@@ -1026,16 +1139,18 @@ test "tls sender invokes handshake and send hooks" {
         var handshake_ct: usize = 0;
         var closed: bool = false;
 
-        fn resolve(_: std.mem.Allocator, _: []const u8, port: u16) !std.net.Address {
-            return std.net.Address.initIp4(.{ 34, 117, 59, 81 }, port);
+        fn resolve(_: std.mem.Allocator, _: std.Io, _: []const u8, port: u16) !NetAddress {
+            return netIp4(.{ 34, 117, 59, 81 }, port);
         }
-        fn openSocket(_: std.net.Address, _: Transport) !std.posix.socket_t { return 0; }
-        fn connect(_: std.posix.socket_t, _: std.net.Address) !void {}
-        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: std.net.Address) !void {}
+        fn openSocket(_: NetAddress, _: Transport) !std.posix.socket_t {
+            return 0;
+        }
+        fn connect(_: std.posix.socket_t, _: NetAddress) !void {}
+        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: NetAddress) !void {}
         fn sendTcp(_: std.posix.socket_t, _: []const u8) !void {}
-        fn closeSocket(_: std.posix.socket_t) void {}
+        fn closeSocket(_: std.Io, _: std.posix.socket_t) void {}
 
-        fn handshake(_: std.posix.socket_t, _: []const u8, _: TlsOpts) !TlsConn {
+        fn handshake(_: std.Io, _: std.posix.socket_t, _: []const u8, _: TlsOpts) !TlsConn {
             handshake_ct += 1;
             return .{ .mock = .{ .close_fn = mockClose } };
         }
@@ -1075,16 +1190,18 @@ test "tls sender re-handshakes on refresh" {
         var send_fail: bool = true;
         var closed_ct: usize = 0;
 
-        fn resolve(_: std.mem.Allocator, _: []const u8, port: u16) !std.net.Address {
-            return std.net.Address.initIp4(.{ 34, 117, 59, 81 }, port);
+        fn resolve(_: std.mem.Allocator, _: std.Io, _: []const u8, port: u16) !NetAddress {
+            return netIp4(.{ 34, 117, 59, 81 }, port);
         }
-        fn openSocket(_: std.net.Address, _: Transport) !std.posix.socket_t { return 0; }
-        fn connect(_: std.posix.socket_t, _: std.net.Address) !void {}
-        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: std.net.Address) !void {}
+        fn openSocket(_: NetAddress, _: Transport) !std.posix.socket_t {
+            return 0;
+        }
+        fn connect(_: std.posix.socket_t, _: NetAddress) !void {}
+        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: NetAddress) !void {}
         fn sendTcp(_: std.posix.socket_t, _: []const u8) !void {}
-        fn closeSocket(_: std.posix.socket_t) void {}
+        fn closeSocket(_: std.Io, _: std.posix.socket_t) void {}
 
-        fn handshake(_: std.posix.socket_t, _: []const u8, _: TlsOpts) !TlsConn {
+        fn handshake(_: std.Io, _: std.posix.socket_t, _: []const u8, _: TlsOpts) !TlsConn {
             handshake_ct += 1;
             return .{ .mock = .{ .send_fn = mockSend, .close_fn = mockClose } };
         }
@@ -1140,18 +1257,20 @@ test "private address check on refresh after re-resolution" {
             resolve_ct: usize = 0,
         }{};
 
-        fn resolve(_: std.mem.Allocator, _: []const u8, port: u16) !std.net.Address {
+        fn resolve(_: std.mem.Allocator, _: std.Io, _: []const u8, port: u16) !NetAddress {
             h.resolve_ct += 1;
-            if (h.resolve_ct == 1) return std.net.Address.initIp4(.{ 34, 117, 59, 81 }, port);
-            return std.net.Address.initIp4(.{ 10, 0, 0, 1 }, port);
+            if (h.resolve_ct == 1) return netIp4(.{ 34, 117, 59, 81 }, port);
+            return netIp4(.{ 10, 0, 0, 1 }, port);
         }
-        fn openSocket(_: std.net.Address, _: Transport) !std.posix.socket_t { return 0; }
-        fn connect(_: std.posix.socket_t, _: std.net.Address) !void {}
-        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: std.net.Address) !void {
+        fn openSocket(_: NetAddress, _: Transport) !std.posix.socket_t {
+            return 0;
+        }
+        fn connect(_: std.posix.socket_t, _: NetAddress) !void {}
+        fn sendUdp(_: std.posix.socket_t, _: []const u8, _: NetAddress) !void {
             return error.NetworkUnreachable;
         }
         fn sendTcp(_: std.posix.socket_t, _: []const u8) !void {}
-        fn closeSocket(_: std.posix.socket_t) void {}
+        fn closeSocket(_: std.Io, _: std.posix.socket_t) void {}
     };
 
     Wrap.h = .{};

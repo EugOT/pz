@@ -5,6 +5,12 @@ const sid_path = @import("path.zig");
 const fs_secure = @import("../fs_secure.zig");
 
 pub const Event = schema.Event;
+const Dir = std.Io.Dir;
+const File = std.Io.File;
+
+fn defaultIo() std.Io {
+    return @import("../rt_io.zig").default();
+}
 
 pub const Opts = struct {
     max_line_bytes: usize = 1024 * 1024,
@@ -12,7 +18,7 @@ pub const Opts = struct {
 
 pub const ReplayReader = struct {
     alloc: std.mem.Allocator,
-    file: std.fs.File,
+    file: File,
     io_buf: [8192]u8 = undefined,
     io_pos: usize = 0,
     io_len: usize = 0,
@@ -23,7 +29,7 @@ pub const ReplayReader = struct {
     max_line_bytes: usize,
     line_no: usize = 0,
 
-    pub fn init(alloc: std.mem.Allocator, dir: std.fs.Dir, sid: []const u8, opts: Opts) !ReplayReader {
+    pub fn init(alloc: std.mem.Allocator, dir: Dir, sid: []const u8, opts: Opts) !ReplayReader {
         if (opts.max_line_bytes == 0) return error.InvalidMaxLineBytes;
 
         const path = try sid_path.sidJsonlAlloc(alloc, sid);
@@ -57,7 +63,10 @@ pub const ReplayReader = struct {
                     return error.TornReplayLine;
                 }
 
-                self.io_len = try self.file.read(&self.io_buf);
+                self.io_len = self.file.readStreaming(defaultIo(), &.{self.io_buf[0..]}) catch |err| switch (err) {
+                    error.EndOfStream => 0,
+                    else => return err,
+                };
                 self.io_pos = 0;
                 if (self.io_len == 0) {
                     self.eof = true;
@@ -91,7 +100,7 @@ pub const ReplayReader = struct {
     pub fn deinit(self: *ReplayReader) void {
         self.arena.deinit();
         self.line_buf.deinit(self.alloc);
-        self.file.close();
+        self.file.close(defaultIo());
     }
 
     fn appendLinePart(self: *ReplayReader, part: []const u8) !void {
@@ -138,12 +147,12 @@ fn freeJsonRows(alloc: std.mem.Allocator, rows: [][]u8) void {
     alloc.free(rows);
 }
 
-fn encodeLine(file: std.fs.File, ev: Event) !void {
+fn encodeLine(file: File, ev: Event) !void {
     const raw = try schema.encodeAlloc(std.testing.allocator, ev);
     defer std.testing.allocator.free(raw);
 
-    try file.writeAll(raw);
-    try file.writeAll("\n");
+    try file.writeStreamingAll(std.testing.io, raw);
+    try file.writeStreamingAll(std.testing.io, "\n");
 }
 
 fn textEvent(at_ms: i64, text: []const u8) Event {
@@ -206,8 +215,8 @@ test "jsonl replay preserves event stream exactly" {
     };
 
     {
-        const file = try tmp.dir.createFile("s1.jsonl", .{});
-        defer file.close();
+        const file = try tmp.dir.createFile(std.testing.io, "s1.jsonl", .{});
+        defer file.close(std.testing.io);
         for (events) |ev| try encodeLine(file, ev);
     }
 
@@ -266,8 +275,8 @@ test "nextDup keeps prior event stable across later reads" {
     };
 
     {
-        const file = try tmp.dir.createFile("own.jsonl", .{});
-        defer file.close();
+        const file = try tmp.dir.createFile(std.testing.io, "own.jsonl", .{});
+        defer file.close(std.testing.io);
         for (events) |ev| try encodeLine(file, ev);
     }
 
@@ -301,7 +310,7 @@ test "nextDup keeps prior event stable across later reads" {
     ).expectEqual(ReplaySnap{ .rows = rows.items });
 }
 
-fn expectMalformedReplay(dir: std.fs.Dir) !void {
+fn expectMalformedReplay(dir: std.Io.Dir) !void {
     var rdr = try ReplayReader.init(std.testing.allocator, dir, "bad", .{});
     defer rdr.deinit();
 
@@ -316,8 +325,8 @@ test "jsonl replay fails malformed line deterministically" {
     defer tmp.cleanup();
 
     {
-        const file = try tmp.dir.createFile("bad.jsonl", .{});
-        defer file.close();
+        const file = try tmp.dir.createFile(std.testing.io, "bad.jsonl", .{});
+        defer file.close(std.testing.io);
 
         try encodeLine(file, .{
             .at_ms = 1,
@@ -325,7 +334,7 @@ test "jsonl replay fails malformed line deterministically" {
                 .text = .{ .text = "ok" },
             },
         });
-        try file.writeAll("{\"version\":1,\"at_ms\":2,\"data\":{\"text\":{\"text\":\"oops\"}}\n");
+        try file.writeStreamingAll(std.testing.io, "{\"version\":1,\"at_ms\":2,\"data\":{\"text\":{\"text\":\"oops\"}}\n");
         try encodeLine(file, .{
             .at_ms = 3,
             .data = .{
@@ -343,9 +352,9 @@ test "jsonl replay rejects unsupported event version" {
     defer tmp.cleanup();
 
     {
-        const file = try tmp.dir.createFile("ver.jsonl", .{});
-        defer file.close();
-        try file.writeAll("{\"version\":7,\"at_ms\":1,\"data\":{\"noop\":{}}}\n");
+        const file = try tmp.dir.createFile(std.testing.io, "ver.jsonl", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "{\"version\":7,\"at_ms\":1,\"data\":{\"noop\":{}}}\n");
     }
 
     var rdr = try ReplayReader.init(std.testing.allocator, tmp.dir, "ver", .{});
@@ -389,8 +398,8 @@ test "jsonl replay rejects final line without trailing newline" {
     defer tmp.cleanup();
 
     {
-        const file = try tmp.dir.createFile("tail.jsonl", .{});
-        defer file.close();
+        const file = try tmp.dir.createFile(std.testing.io, "tail.jsonl", .{});
+        defer file.close(std.testing.io);
         const ev = Event{
             .at_ms = 1,
             .data = .{
@@ -399,7 +408,7 @@ test "jsonl replay rejects final line without trailing newline" {
         };
         const raw = try schema.encodeAlloc(std.testing.allocator, ev);
         defer std.testing.allocator.free(raw);
-        try file.writeAll(raw); // no trailing '\n'
+        try file.writeStreamingAll(std.testing.io, raw); // no trailing '\n'
     }
 
     var rdr = try ReplayReader.init(std.testing.allocator, tmp.dir, "tail", .{});
@@ -428,11 +437,11 @@ test "jsonl replay keeps committed rows and rejects torn tail" {
     defer std.testing.allocator.free(raw);
 
     {
-        const file = try tmp.dir.createFile("tail2.jsonl", .{});
-        defer file.close();
-        try file.writeAll(raw);
-        try file.writeAll("\n");
-        try file.writeAll(raw[0 .. raw.len / 2]);
+        const file = try tmp.dir.createFile(std.testing.io, "tail2.jsonl", .{});
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, raw);
+        try file.writeStreamingAll(std.testing.io, "\n");
+        try file.writeStreamingAll(std.testing.io, raw[0 .. raw.len / 2]);
     }
 
     var rdr = try ReplayReader.init(std.testing.allocator, tmp.dir, "tail2", .{});
@@ -458,14 +467,14 @@ test "jsonl replay enforces max line bytes in streaming mode" {
     defer tmp.cleanup();
 
     {
-        const file = try tmp.dir.createFile("long.jsonl", .{});
-        defer file.close();
+        const file = try tmp.dir.createFile(std.testing.io, "long.jsonl", .{});
+        defer file.close(std.testing.io);
         // Write a line that is definitely larger than max_line_bytes.
-        try file.writeAll("{\"version\":1,\"at_ms\":1,\"data\":{\"text\":{\"text\":\"");
+        try file.writeStreamingAll(std.testing.io, "{\"version\":1,\"at_ms\":1,\"data\":{\"text\":{\"text\":\"");
         var pad: [256]u8 = undefined;
         @memset(&pad, 'a');
-        try file.writeAll(&pad);
-        try file.writeAll("\"}}}\n");
+        try file.writeStreamingAll(std.testing.io, &pad);
+        try file.writeStreamingAll(std.testing.io, "\"}}}\n");
     }
 
     var rdr = try ReplayReader.init(std.testing.allocator, tmp.dir, "long", .{
@@ -503,8 +512,8 @@ test "jsonl replay property preserves text stream across io buffer splits" {
             };
 
             {
-                const file = tmp.dir.createFile("prop.jsonl", .{}) catch return false;
-                defer file.close();
+                const file = tmp.dir.createFile(std.testing.io, "prop.jsonl", .{}) catch return false;
+                defer file.close(std.testing.io);
                 for (events) |ev| encodeLine(file, ev) catch return false;
             }
 
@@ -543,10 +552,10 @@ test "jsonl replay property rejects encoded lines above max bytes" {
             defer alloc.free(raw);
 
             {
-                const file = tmp.dir.createFile("over.jsonl", .{}) catch return false;
-                defer file.close();
-                file.writeAll(raw) catch return false;
-                file.writeAll("\n") catch return false;
+                const file = tmp.dir.createFile(std.testing.io, "over.jsonl", .{}) catch return false;
+                defer file.close(std.testing.io);
+                file.writeStreamingAll(std.testing.io, raw) catch return false;
+                file.writeStreamingAll(std.testing.io, "\n") catch return false;
             }
 
             const delta = 1 + @as(usize, args.slack % 8);
@@ -584,13 +593,13 @@ test "jsonl replay property survives crap-and-mutate of valid rows" {
             defer alloc.free(mut);
 
             {
-                const file = tmp.dir.createFile("mut.jsonl", .{}) catch return false;
-                defer file.close();
+                const file = tmp.dir.createFile(std.testing.io, "mut.jsonl", .{}) catch return false;
+                defer file.close(std.testing.io);
                 var buf = alloc.alloc(u8, mut.len + 1) catch return false;
                 defer alloc.free(buf);
                 for (mut, 0..) |b, i| buf[i] = if (b == '\n') '!' else b;
                 buf[mut.len] = '\n';
-                file.writeAll(buf) catch return false;
+                file.writeStreamingAll(std.testing.io, buf) catch return false;
             }
 
             var rdr = ReplayReader.init(alloc, tmp.dir, "mut", .{}) catch return false;
@@ -615,18 +624,20 @@ test "jsonl replay property survives crap-and-mutate of valid rows" {
 
 test "fuzz session reader survives arbitrary JSONL lines" {
     try std.testing.fuzz({}, struct {
-        fn f(_: void, input: []const u8) anyerror!void {
+        fn f(_: void, smith: *std.testing.Smith) anyerror!void {
+            var input_buf: [1024]u8 = undefined;
+            const input = input_buf[0..smith.slice(&input_buf)];
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             {
-                const file = try tmp.dir.createFile("fz.jsonl", .{});
-                defer file.close();
-                try file.writeAll(input);
+                const file = try tmp.dir.createFile(std.testing.io, "fz.jsonl", .{});
+                defer file.close(std.testing.io);
+                try file.writeStreamingAll(std.testing.io, input);
                 // Ensure trailing newline so reader doesn't see a torn line
                 if (input.len == 0 or input[input.len - 1] != '\n')
-                    try file.writeAll("\n");
+                    try file.writeStreamingAll(std.testing.io, "\n");
             }
 
             var rdr = ReplayReader.init(alloc, tmp.dir, "fz", .{}) catch return;
@@ -663,8 +674,8 @@ test "P0-1 regression: no UAF across multi-event compaction replay" {
     };
 
     {
-        const file = try tmp.dir.createFile("uaf.jsonl", .{});
-        defer file.close();
+        const file = try tmp.dir.createFile(std.testing.io, "uaf.jsonl", .{});
+        defer file.close(std.testing.io);
         for (events) |ev| try encodeLine(file, ev);
     }
 
@@ -685,8 +696,8 @@ test "P0-1 regression: no UAF across multi-event compaction replay" {
 
     // Also verify nextDup produces stable, independently-owned copies.
     {
-        const file2 = try tmp.dir.createFile("uaf2.jsonl", .{});
-        defer file2.close();
+        const file2 = try tmp.dir.createFile(std.testing.io, "uaf2.jsonl", .{});
+        defer file2.close(std.testing.io);
         for (events) |ev| try encodeLine(file2, ev);
     }
 

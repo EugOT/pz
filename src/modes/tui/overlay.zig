@@ -506,7 +506,7 @@ fn rowSegmentsAlloc(alloc: std.mem.Allocator, row: []const u8) ![]u8 {
         }
         if (!first) try out.appendSlice(alloc, " | ");
         first = false;
-        try std.fmt.format(out.writer(alloc), "@{d}:", .{x});
+        try out.print(alloc, "@{d}:", .{x});
         const start = x;
         while (x < row.len and row[x] != ' ') : (x += 1) {}
         try out.appendSlice(alloc, row[start..x]);
@@ -546,7 +546,7 @@ fn trimmedBoxSegmentsAlloc(alloc: std.mem.Allocator, frm: *const Frame) ![]u8 {
         const row = try rowAscii(frm, y, buf);
         const segs = try rowSegmentsAlloc(alloc, row[x0.? .. x1 + 1]);
         defer alloc.free(segs);
-        try std.fmt.format(out.writer(alloc), "row{d} {s}", .{ y - y0.?, segs });
+        try out.print(alloc, "row{d} {s}", .{ y - y0.?, segs });
     }
     return out.toOwnedSlice(alloc);
 }

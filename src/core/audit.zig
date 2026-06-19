@@ -329,11 +329,12 @@ pub const OverflowPolicy = enum {
 
 pub const ForwardOpts = struct {
     connector: *Connector,
+    io: std.Io = std.Io.failing,
     buf_cap: usize = 64,
     backoff_min_ms: u32 = 100,
     backoff_max_ms: u32 = 5_000,
     overflow: OverflowPolicy = .drop_oldest,
-    spool_dir: ?std.fs.Dir = null,
+    spool_dir: ?std.Io.Dir = null,
 };
 
 pub const SendState = enum {
@@ -383,15 +384,17 @@ const Ring = struct {
     len: usize = 0,
     dropped: u64 = 0,
     overflow: OverflowPolicy = .drop_oldest,
-    spool_dir: ?std.fs.Dir = null,
+    io: std.Io = std.Io.failing,
+    spool_dir: ?std.Io.Dir = null,
     spool_seq: u64 = 0,
 
-    fn init(alloc: Allocator, cap: usize, overflow: OverflowPolicy, spool_dir: ?std.fs.Dir) !Ring {
+    fn init(alloc: Allocator, io: std.Io, cap: usize, overflow: OverflowPolicy, spool_dir: ?std.Io.Dir) !Ring {
         if (cap == 0) {
             return .{
                 .alloc = alloc,
                 .slots = &[_]?[]u8{},
                 .overflow = overflow,
+                .io = io,
                 .spool_dir = spool_dir,
             };
         }
@@ -402,6 +405,7 @@ const Ring = struct {
             .alloc = alloc,
             .slots = slots,
             .overflow = overflow,
+            .io = io,
             .spool_dir = spool_dir,
         };
 
@@ -477,9 +481,9 @@ const Ring = struct {
         var name_buf: [32]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "{d:0>16}.spool", .{self.spool_seq}) catch return error.SpoolName;
         self.spool_seq += 1;
-        const f = dir.createFile(name, .{ .truncate = true }) catch return error.SpoolCreate;
-        defer f.close();
-        f.writeAll(raw) catch return error.SpoolWrite;
+        const f = dir.createFile(self.io, name, .{ .truncate = true }) catch return error.SpoolCreate;
+        defer f.close(self.io);
+        f.writeStreamingAll(self.io, raw) catch return error.SpoolWrite;
     }
 
     fn removeSpool(self: *Ring, slot_idx: usize) void {
@@ -494,7 +498,7 @@ const Ring = struct {
         const seq = base_seq + age;
         var name_buf: [32]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "{d:0>16}.spool", .{seq}) catch unreachable; // 20 digits + 6 = 26 < 32
-        dir.deleteFile(name) catch {}; // cleanup: propagation impossible
+        dir.deleteFile(self.io, name) catch {}; // cleanup: propagation impossible
     }
 
     const SpoolEntry = struct { seq: u64, name: [32]u8, len: usize };
@@ -508,7 +512,7 @@ const Ring = struct {
         defer list.deinit(self.alloc);
 
         var it = dir.iterate();
-        while (try it.next()) |ent| {
+        while (try it.next(self.io)) |ent| {
             if (!std.mem.endsWith(u8, ent.name, ".spool")) continue;
             const stem = ent.name[0 .. ent.name.len - 6];
             const seq = std.fmt.parseInt(u64, stem, 10) catch continue; // malformed filename, skip
@@ -529,7 +533,7 @@ const Ring = struct {
         for (list.items) |item| {
             if (self.len >= self.slots.len) break;
             const name = item.name[0..item.len];
-            const data = dir.readFileAlloc(self.alloc, name, 64 * 1024) catch |err| switch (err) {
+            const data = dir.readFileAlloc(self.io, name, self.alloc, .limited(64 * 1024)) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => continue, // I/O error on individual spool file, skip
             };
@@ -559,7 +563,7 @@ pub const ReconnSender = struct {
         return .{
             .alloc = alloc,
             .connr = opts.connector,
-            .ring = try Ring.init(alloc, opts.buf_cap, opts.overflow, opts.spool_dir),
+            .ring = try Ring.init(alloc, opts.io, opts.buf_cap, opts.overflow, opts.spool_dir),
             .backoff_min_ms = opts.backoff_min_ms,
             .backoff_max_ms = opts.backoff_max_ms,
             .backoff_ms = opts.backoff_min_ms,
@@ -820,10 +824,10 @@ pub fn encodeFrameBodyAlloc(alloc: Allocator, opts: FrameOpts, hdr: FrameHdr, bo
 }
 
 pub fn encodeAlloc(alloc: Allocator, ent: Entry) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    try writeEntry(buf.writer(alloc), ent);
-    return try buf.toOwnedSlice(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+    try writeEntry(&buf.writer, ent);
+    return try buf.toOwnedSlice();
 }
 
 pub fn sealAlloc(
@@ -1079,7 +1083,9 @@ var proc_rkey_init = false;
 fn procKey() RedactKey {
     if (!proc_rkey_init) {
         var seed: [signing.rkey_len]u8 = undefined;
-        std.crypto.random.bytes(&seed);
+        @import("rt_io.zig").default().randomSecure(&seed) catch |err| {
+            std.debug.panic("secure randomness unavailable: {s}", .{@errorName(err)});
+        };
         proc_rkey = .{ .bytes = seed };
         proc_rkey_init = true;
     }
@@ -2076,7 +2082,7 @@ test "ctrl needsRedact detects masked target and detail" {
 }
 
 test "fail_closed overflow rejects push when ring full" {
-    var ring = try Ring.init(testing.allocator, 2, .fail_closed, null);
+    var ring = try Ring.init(testing.allocator, testing.io, 2, .fail_closed, null);
     defer ring.deinit();
 
     const r1 = try ring.push("a");
@@ -2095,7 +2101,7 @@ test "durable spool persists and restores events" {
 
     // Write events into a ring with spool
     {
-        var ring = try Ring.init(testing.allocator, 4, .drop_oldest, tmp.dir);
+        var ring = try Ring.init(testing.allocator, testing.io, 4, .drop_oldest, tmp.dir);
         defer ring.deinit();
 
         _ = try ring.push("event-0");
@@ -2106,7 +2112,7 @@ test "durable spool persists and restores events" {
 
     // Restore into a new ring from same spool dir
     {
-        var ring = try Ring.init(testing.allocator, 4, .drop_oldest, tmp.dir);
+        var ring = try Ring.init(testing.allocator, testing.io, 4, .drop_oldest, tmp.dir);
         defer ring.deinit();
 
         try testing.expectEqual(@as(usize, 3), ring.len);
@@ -2126,7 +2132,7 @@ test "durable spool restores only up to ring capacity" {
 
     // Write 5 events into a ring with cap 8
     {
-        var ring = try Ring.init(testing.allocator, 8, .drop_oldest, tmp.dir);
+        var ring = try Ring.init(testing.allocator, testing.io, 8, .drop_oldest, tmp.dir);
         defer ring.deinit();
         var i: u8 = 0;
         while (i < 5) : (i += 1) {
@@ -2139,7 +2145,7 @@ test "durable spool restores only up to ring capacity" {
 
     // Restore into a ring with cap 3 -- should load only 3
     {
-        var ring = try Ring.init(testing.allocator, 3, .drop_oldest, tmp.dir);
+        var ring = try Ring.init(testing.allocator, testing.io, 3, .drop_oldest, tmp.dir);
         defer ring.deinit();
         try testing.expectEqual(@as(usize, 3), ring.len);
         try testing.expectEqualStrings("msg-0", ring.peek().?);
@@ -2226,14 +2232,11 @@ test "e2e: denied cmd → seal → syslog frame → udp mock → verify HMAC + r
     defer collector.deinit();
     const recv_thread = try collector.spawn();
 
-    const send_fd = try std.posix.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
-        std.posix.IPPROTO.UDP,
-    );
-    defer (std.net.Stream{ .handle = send_fd }).close();
-    var dest = try std.net.Address.parseIp("127.0.0.1", collector.port());
-    _ = try std.posix.sendto(send_fd, frame, 0, &dest.any, dest.getOsSockLen());
+    const bind_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const socket = try bind_addr.bind(testing.io, .{ .mode = .dgram, .protocol = .udp });
+    defer socket.close(testing.io);
+    var dest = try std.Io.net.IpAddress.parse("127.0.0.1", collector.port());
+    try socket.send(testing.io, &dest, frame);
 
     // 5. Receive from collector
     recv_thread.join();

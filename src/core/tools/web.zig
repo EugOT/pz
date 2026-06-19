@@ -2,8 +2,31 @@
 const std = @import("std");
 const policy_mod = @import("../policy.zig");
 const event_loop = @import("../event_loop.zig");
+const core_time = @import("../time.zig");
 const EventLoop = event_loop.EventLoop;
 const http_mock = @import("../../test/http_mock.zig");
+const NetAddress = std.Io.net.IpAddress;
+
+fn defaultIo() std.Io {
+    return @import("../rt_io.zig").default();
+}
+
+fn fdWrite(fd: std.posix.fd_t, bytes: []const u8) !usize {
+    while (true) {
+        const rc = std.c.write(fd, bytes.ptr, bytes.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn fdWriteAll(fd: std.posix.fd_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) off += try fdWrite(fd, bytes[off..]);
+}
 
 pub const Method = enum {
     GET,
@@ -52,7 +75,7 @@ pub fn hasCredentialHeaders(req: Request) bool {
 
 /// Strip credential-bearing headers, returning a new slice from `alloc`.
 fn stripCredentialHeaders(alloc: std.mem.Allocator, headers: []const Header) error{OutOfMemory}![]const Header {
-    var out: std.ArrayListUnmanaged(Header) = .{};
+    var out: std.ArrayListUnmanaged(Header) = .empty;
     try out.ensureTotalCapacity(alloc, headers.len);
     for (headers) |hdr| {
         if (!isCredentialHeader(hdr.name)) out.appendAssumeCapacity(hdr);
@@ -148,8 +171,8 @@ pub const ResolveErr = ParseErr || error{
 };
 
 const ResolveFns = struct {
-    resolve: *const fn (alloc: std.mem.Allocator, host: []const u8, port: u16) anyerror![]std.net.Address = resolveAddrsAlloc,
-    free: *const fn (alloc: std.mem.Allocator, addrs: []std.net.Address) void = freeAddrsAlloc,
+    resolve: *const fn (alloc: std.mem.Allocator, host: []const u8, port: u16) anyerror![]NetAddress = resolveAddrsAlloc,
+    free: *const fn (alloc: std.mem.Allocator, addrs: []NetAddress) void = freeAddrsAlloc,
 };
 
 pub const ParsedUrl = struct {
@@ -209,7 +232,7 @@ pub const Deadline = struct {
     }
 
     fn milliTimestamp() i64 {
-        return std.time.milliTimestamp();
+        return core_time.milliTimestamp();
     }
 };
 
@@ -264,7 +287,7 @@ pub fn resolveConnectAddrAlloc(
     alloc: std.mem.Allocator,
     raw_url: []const u8,
     policy: RedirectPolicy,
-) ResolveErr!std.net.Address {
+) ResolveErr!NetAddress {
     return resolveConnectAddrWith(alloc, try parseUrl(raw_url), policy, .{});
 }
 
@@ -273,7 +296,7 @@ fn resolveConnectAddrWith(
     parsed: ParsedUrl,
     policy: RedirectPolicy,
     fns: ResolveFns,
-) ResolveErr!std.net.Address {
+) ResolveErr!NetAddress {
     try validateEgressHost(parsed.host, policy);
     const addrs = fns.resolve(alloc, parsed.host, parsed.port) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -381,13 +404,14 @@ fn renderUrlAlloc(alloc: std.mem.Allocator, uri: std.Uri) error{OutOfMemory}![]u
     })});
 }
 
-fn resolveAddrsAlloc(alloc: std.mem.Allocator, host: []const u8, port: u16) ![]std.net.Address {
-    const list = try std.net.getAddressList(alloc, host, port);
-    defer list.deinit();
-    return try alloc.dupe(std.net.Address, list.addrs);
+fn resolveAddrsAlloc(alloc: std.mem.Allocator, host: []const u8, port: u16) ![]NetAddress {
+    const out = try alloc.alloc(NetAddress, 1);
+    errdefer alloc.free(out);
+    out[0] = try NetAddress.resolve(defaultIo(), host, port);
+    return out;
 }
 
-fn freeAddrsAlloc(alloc: std.mem.Allocator, addrs: []std.net.Address) void {
+fn freeAddrsAlloc(alloc: std.mem.Allocator, addrs: []NetAddress) void {
     alloc.free(addrs);
 }
 
@@ -395,6 +419,10 @@ const TestAddr = struct {
     host: []const u8,
     ip: [4]u8,
 };
+
+fn netIp4(ip: [4]u8, port: u16) NetAddress {
+    return .{ .ip4 = .{ .bytes = ip, .port = port } };
+}
 
 const ChainResult = struct {
     status: u16,
@@ -413,11 +441,11 @@ fn resolveTestAddrsAlloc(
     host: []const u8,
     port: u16,
     addrs: []const TestAddr,
-) ![]std.net.Address {
+) ![]NetAddress {
     for (addrs) |item| {
         if (std.mem.eql(u8, item.host, host)) {
-            const out = try alloc.alloc(std.net.Address, 1);
-            out[0] = std.net.Address.initIp4(item.ip, port);
+            const out = try alloc.alloc(NetAddress, 1);
+            out[0] = netIp4(item.ip, port);
             return out;
         }
     }
@@ -470,14 +498,18 @@ fn sendLocalRequestAlloc(
     headers: []const Header,
     parsed: ParsedUrl,
 ) ![]u8 {
-    var addr = try std.net.Address.parseIp("127.0.0.1", parsed.port);
-    const fd = try std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
-    defer (std.net.Stream{ .handle = fd }).close();
-    try std.posix.connect(fd, &addr.any, addr.getOsSockLen());
+    var addr = try NetAddress.parse("127.0.0.1", parsed.port);
+    var stream = try addr.connect(defaultIo(), .{ .mode = .stream });
+    defer stream.close(defaultIo());
+    const fd = stream.socket.handle;
 
     // Set nonblocking for event-loop-driven reads.
-    const cur = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
-    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, cur | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+    const cur = std.c.fcntl(fd, @as(c_int, std.posix.F.GETFL), @as(c_int, 0));
+    if (cur == -1) return std.posix.unexpectedErrno(std.posix.errno(-1));
+    const nonblock: c_int = @bitCast(@as(std.posix.O, .{ .NONBLOCK = true }));
+    if (std.c.fcntl(fd, @as(c_int, std.posix.F.SETFL), cur | nonblock) == -1) {
+        return std.posix.unexpectedErrno(std.posix.errno(-1));
+    }
 
     var el = try EventLoop.init();
     defer el.deinit();
@@ -504,7 +536,7 @@ fn sendLocalRequestAlloc(
         ));
     }
     try req_buf.appendSlice(alloc, "\r\n");
-    _ = try std.posix.write(fd, req_buf.items);
+    try fdWriteAll(fd, req_buf.items);
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(alloc);
@@ -753,14 +785,14 @@ test "resolveRedirectAlloc blocks unsafe redirects by default" {
 
 test "resolveConnectAddrAlloc blocks resolved private targets by default" {
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, _: []const u8, port: u16) ![]std.net.Address {
-            const out = try alloc.alloc(std.net.Address, 2);
-            out[0] = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-            out[1] = std.net.Address.initIp4(.{ 34, 117, 59, 81 }, port);
+        fn resolve(alloc: std.mem.Allocator, _: []const u8, port: u16) ![]NetAddress {
+            const out = try alloc.alloc(NetAddress, 2);
+            out[0] = netIp4(.{ 127, 0, 0, 1 }, port);
+            out[1] = netIp4(.{ 34, 117, 59, 81 }, port);
             return out;
         }
 
-        fn free(alloc: std.mem.Allocator, addrs: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, addrs: []NetAddress) void {
             alloc.free(addrs);
         }
     };
@@ -779,13 +811,13 @@ test "resolveConnectAddrAlloc blocks resolved private targets by default" {
 
 test "resolveConnectAddrAlloc allows private targets when opted in" {
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, _: []const u8, port: u16) ![]std.net.Address {
-            const out = try alloc.alloc(std.net.Address, 1);
-            out[0] = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+        fn resolve(alloc: std.mem.Allocator, _: []const u8, port: u16) ![]NetAddress {
+            const out = try alloc.alloc(NetAddress, 1);
+            out[0] = netIp4(.{ 127, 0, 0, 1 }, port);
             return out;
         }
 
-        fn free(alloc: std.mem.Allocator, addrs: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, addrs: []NetAddress) void {
             alloc.free(addrs);
         }
     };
@@ -803,21 +835,22 @@ test "resolveConnectAddrAlloc allows private targets when opted in" {
         },
         .{ .resolve = Mock.resolve, .free = Mock.free },
     );
-    try std.testing.expect(std.net.Address.eql(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 443), addr));
+    const want = netIp4(.{ 127, 0, 0, 1 }, 443);
+    try std.testing.expect(want.eql(&addr));
 }
 
 test "redirect hops revalidate resolved target addresses" {
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, host: []const u8, port: u16) ![]std.net.Address {
-            const out = try alloc.alloc(std.net.Address, 1);
+        fn resolve(alloc: std.mem.Allocator, host: []const u8, port: u16) ![]NetAddress {
+            const out = try alloc.alloc(NetAddress, 1);
             out[0] = if (std.mem.eql(u8, host, "svc.local"))
-                std.net.Address.initIp4(.{ 34, 117, 59, 81 }, port)
+                netIp4(.{ 34, 117, 59, 81 }, port)
             else
-                std.net.Address.initIp4(.{ 10, 0, 0, 7 }, port);
+                netIp4(.{ 10, 0, 0, 7 }, port);
             return out;
         }
 
-        fn free(alloc: std.mem.Allocator, addrs: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, addrs: []NetAddress) void {
             alloc.free(addrs);
         }
     };
@@ -847,11 +880,11 @@ test "redirect hops revalidate resolved target addresses" {
 
 test "resolveConnectAddrWith denies hosts not explicitly allowed" {
     const Mock = struct {
-        fn resolve(_: std.mem.Allocator, _: []const u8, _: u16) ![]std.net.Address {
+        fn resolve(_: std.mem.Allocator, _: []const u8, _: u16) ![]NetAddress {
             return error.ShouldNotResolve;
         }
 
-        fn free(_: std.mem.Allocator, _: []std.net.Address) void {}
+        fn free(_: std.mem.Allocator, _: []NetAddress) void {}
     };
 
     const url = try parseUrl("https://svc.local/api");
@@ -928,11 +961,11 @@ test "redirect e2e allows public redirect chains over local mock sockets" {
         .{ .host = "cdn.test", .ip = .{ 151, 101, 1, 69 } },
     };
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, host: []const u8, req_port: u16) ![]std.net.Address {
+        fn resolve(alloc: std.mem.Allocator, host: []const u8, req_port: u16) ![]NetAddress {
             return resolveTestAddrsAlloc(alloc, host, req_port, &addrs);
         }
 
-        fn free(alloc: std.mem.Allocator, items: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, items: []NetAddress) void {
             freeAddrsAlloc(alloc, items);
         }
     };
@@ -1032,11 +1065,11 @@ test "redirect e2e denies redirect hosts not in policy" {
         .{ .host = "deny.test", .ip = .{ 151, 101, 1, 69 } },
     };
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, host: []const u8, req_port: u16) ![]std.net.Address {
+        fn resolve(alloc: std.mem.Allocator, host: []const u8, req_port: u16) ![]NetAddress {
             return resolveTestAddrsAlloc(alloc, host, req_port, &addrs);
         }
 
-        fn free(alloc: std.mem.Allocator, items: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, items: []NetAddress) void {
             freeAddrsAlloc(alloc, items);
         }
     };
@@ -1101,11 +1134,11 @@ test "redirect e2e blocks literal private redirect targets" {
         .{ .host = "127.0.0.1", .ip = .{ 127, 0, 0, 1 } },
     };
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, host: []const u8, req_port: u16) ![]std.net.Address {
+        fn resolve(alloc: std.mem.Allocator, host: []const u8, req_port: u16) ![]NetAddress {
             return resolveTestAddrsAlloc(alloc, host, req_port, &addrs);
         }
 
-        fn free(alloc: std.mem.Allocator, items: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, items: []NetAddress) void {
             freeAddrsAlloc(alloc, items);
         }
     };
@@ -1170,11 +1203,11 @@ test "redirect e2e blocks rebound redirect targets" {
         .{ .host = "rebound.test", .ip = .{ 10, 0, 0, 7 } },
     };
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, host: []const u8, req_port: u16) ![]std.net.Address {
+        fn resolve(alloc: std.mem.Allocator, host: []const u8, req_port: u16) ![]NetAddress {
             return resolveTestAddrsAlloc(alloc, host, req_port, &addrs);
         }
 
-        fn free(alloc: std.mem.Allocator, items: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, items: []NetAddress) void {
             freeAddrsAlloc(alloc, items);
         }
     };
@@ -1236,11 +1269,11 @@ test "UX10: fetchRedirectChainAlloc follows 302 and returns final body" {
         .{ .host = "redir.test", .ip = .{ 34, 117, 59, 81 } },
     };
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, h: []const u8, p: u16) ![]std.net.Address {
+        fn resolve(alloc: std.mem.Allocator, h: []const u8, p: u16) ![]NetAddress {
             return resolveTestAddrsAlloc(alloc, h, p, &addrs);
         }
 
-        fn free(alloc: std.mem.Allocator, items: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, items: []NetAddress) void {
             freeAddrsAlloc(alloc, items);
         }
     };
@@ -1342,10 +1375,10 @@ test "D15: cross-origin redirect strips credential headers" {
         .{ .host = "host-b.test", .ip = .{ 34, 117, 59, 82 } },
     };
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, h: []const u8, port: u16) ![]std.net.Address {
+        fn resolve(alloc: std.mem.Allocator, h: []const u8, port: u16) ![]NetAddress {
             return resolveTestAddrsAlloc(alloc, h, port, &addrs);
         }
-        fn free(alloc: std.mem.Allocator, items: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, items: []NetAddress) void {
             freeAddrsAlloc(alloc, items);
         }
     };
@@ -1414,10 +1447,10 @@ test "same-origin redirect preserves credential headers" {
         .{ .host = "same.test", .ip = .{ 34, 117, 59, 81 } },
     };
     const Mock = struct {
-        fn resolve(alloc: std.mem.Allocator, h: []const u8, port: u16) ![]std.net.Address {
+        fn resolve(alloc: std.mem.Allocator, h: []const u8, port: u16) ![]NetAddress {
             return resolveTestAddrsAlloc(alloc, h, port, &addrs);
         }
-        fn free(alloc: std.mem.Allocator, items: []std.net.Address) void {
+        fn free(alloc: std.mem.Allocator, items: []NetAddress) void {
             freeAddrsAlloc(alloc, items);
         }
     };

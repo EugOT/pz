@@ -12,6 +12,7 @@ pub const changelog = build_options.changelog;
 pub const ParseError = Args.ParseError || config.Err;
 
 pub const Run = struct {
+    io: std.Io = std.Io.failing,
     mode: Args.Mode,
     prompt: ?[]const u8,
     cfg: config.Config,
@@ -21,6 +22,7 @@ pub const Run = struct {
     xdg_state_home: ?[]const u8 = null,
     session: Args.SessionSel = .auto,
     no_session: bool = false,
+    no_config: bool = false,
     tool_mask: u16 = @import("../core.zig").tools.builtin.mask_all,
     thinking: Args.ThinkingLevel = .adaptive,
     verbose: bool = false,
@@ -47,7 +49,8 @@ pub const Command = union(enum) {
 
 pub fn parse(
     alloc: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
     argv: []const []const u8,
     env: config.Env,
 ) ParseError!Command {
@@ -58,13 +61,14 @@ pub fn parse(
     if (parsed.show_changelog) return .{ .changelog = changelog_text };
     if (parsed.show_upgrade) return .upgrade;
 
-    var cfg = try config.discover(alloc, dir, parsed, env);
+    var cfg = try config.discover(alloc, io, dir, parsed, env);
     errdefer cfg.deinit(alloc);
     const mode = selectMode(parsed, cfg);
     if (mode == .print and parsed.prompt == null) return error.MissingPrintPrompt;
 
     return .{
         .run = .{
+            .io = io,
             .mode = mode,
             .prompt = parsed.prompt,
             .cfg = cfg,
@@ -74,6 +78,7 @@ pub fn parse(
             .xdg_state_home = env.xdg_state_home,
             .session = parsed.session,
             .no_session = parsed.no_session,
+            .no_config = parsed.cfg == .off,
             .tool_mask = parsed.tool_mask,
             .thinking = parsed.thinking,
             .verbose = parsed.verbose,
@@ -134,14 +139,14 @@ test "cli returns help and version commands" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var help_cmd = try parse(std.testing.allocator, tmp.dir, &.{"--help"}, .{});
+    var help_cmd = try parse(std.testing.allocator, std.testing.io, tmp.dir, &.{"--help"}, .{});
     defer help_cmd.deinit(std.testing.allocator);
     switch (help_cmd) {
         .help => |txt| try std.testing.expect(std.mem.indexOf(u8, txt, "Usage: pz") != null),
         else => return error.TestUnexpectedResult,
     }
 
-    var ver_cmd = try parse(std.testing.allocator, tmp.dir, &.{"--version"}, .{});
+    var ver_cmd = try parse(std.testing.allocator, std.testing.io, tmp.dir, &.{"--version"}, .{});
     defer ver_cmd.deinit(std.testing.allocator);
     switch (ver_cmd) {
         .version => |txt| try std.testing.expectEqualStrings(version_text, txt),
@@ -153,7 +158,7 @@ test "cli returns upgrade command" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var cmd = try parse(std.testing.allocator, tmp.dir, &.{"--upgrade"}, .{});
+    var cmd = try parse(std.testing.allocator, std.testing.io, tmp.dir, &.{"--upgrade"}, .{});
     defer cmd.deinit(std.testing.allocator);
     try std.testing.expect(cmd == .upgrade);
 }
@@ -162,13 +167,13 @@ test "cli mode dispatch uses config mode when mode flag absent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = config.auto_cfg_path,
         .data = "{\"mode\":\"print\"}",
     });
 
-    var cmd = try parse(std.testing.allocator, tmp.dir, &.{ "--prompt", "ship" }, .{});
+    var cmd = try parse(std.testing.allocator, std.testing.io, tmp.dir, &.{ "--prompt", "ship" }, .{});
     defer cmd.deinit(std.testing.allocator);
 
     switch (cmd) {
@@ -185,13 +190,13 @@ test "cli config-driven json mode does not require prompt" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = config.auto_cfg_path,
         .data = "{\"mode\":\"json\",\"model\":\"cfg-model\",\"provider\":\"cfg-provider\"}",
     });
 
-    var cmd = try parse(std.testing.allocator, tmp.dir, &.{}, .{});
+    var cmd = try parse(std.testing.allocator, std.testing.io, tmp.dir, &.{}, .{});
     defer cmd.deinit(std.testing.allocator);
 
     switch (cmd) {
@@ -209,13 +214,13 @@ test "cli mode dispatch applies mode flag over config and env" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = config.auto_cfg_path,
         .data = "{\"mode\":\"print\"}",
     });
 
-    var cmd = try parse(std.testing.allocator, tmp.dir, &.{"--tui"}, .{
+    var cmd = try parse(std.testing.allocator, std.testing.io, tmp.dir, &.{"--tui"}, .{
         .mode = "print",
     });
     defer cmd.deinit(std.testing.allocator);
@@ -230,7 +235,7 @@ test "cli propagates session and tool selections to run command" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var cmd = try parse(std.testing.allocator, tmp.dir, &.{ "--continue", "--tools", "read,bash" }, .{});
+    var cmd = try parse(std.testing.allocator, std.testing.io, tmp.dir, &.{ "--continue", "--tools", "read,bash" }, .{});
     defer cmd.deinit(std.testing.allocator);
 
     switch (cmd) {
@@ -251,13 +256,13 @@ test "cli parse carries ca_file from config" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".pz");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = config.auto_cfg_path,
         .data = "{\"ca_file\":\"/etc/pz/cli.pem\"}",
     });
 
-    var cmd = try parse(std.testing.allocator, tmp.dir, &.{}, .{});
+    var cmd = try parse(std.testing.allocator, std.testing.io, tmp.dir, &.{}, .{});
     defer cmd.deinit(std.testing.allocator);
 
     switch (cmd) {

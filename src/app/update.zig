@@ -34,6 +34,10 @@ const update_policy_tool = "upgrade";
 const update_pk_hex = "2d6f7455d97b4a3a10d7293909d1a4f2058cb9a370e43fa8154bb280db839083";
 const dev_pk_hex = update_pk_hex;
 
+fn defaultIo() std.Io {
+    return @import("../core/rt_io.zig").default();
+}
+
 const HeaderMode = enum {
     full,
     wgetish,
@@ -41,8 +45,10 @@ const HeaderMode = enum {
 };
 
 const HttpDeps = struct {
-    init_client: *const fn (?*anyopaque, std.mem.Allocator) anyerror!std.http.Client = initHttpClientRuntime,
+    init_client: *const fn (?*anyopaque, std.mem.Allocator, std.Io) anyerror!std.http.Client = initHttpClientRuntime,
     init_client_ctx: ?*anyopaque = null,
+    io: std.Io = std.Io.failing,
+    environ_map: ?*const std.process.Environ.Map = null,
 };
 
 pub const Outcome = struct {
@@ -86,17 +92,31 @@ const HttpResult = union(enum) {
     }
 };
 
-fn initHttpClientRuntime(_: ?*anyopaque, alloc: std.mem.Allocator) !std.http.Client {
-    return try app_tls.initRuntimeClient(alloc, null);
+fn initHttpClientRuntime(_: ?*anyopaque, alloc: std.mem.Allocator, io: std.Io) !std.http.Client {
+    return try app_tls.initRuntimeClient(alloc, io, null);
 }
 
-pub fn run(alloc: std.mem.Allocator, home: ?[]const u8) ![]u8 {
-    const out = try runOutcome(alloc, home);
+pub fn run(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    home: ?[]const u8,
+) ![]u8 {
+    const out = try runOutcome(alloc, io, environ_map, home);
     return out.msg;
 }
 
-pub fn runOutcome(alloc: std.mem.Allocator, home: ?[]const u8) !Outcome {
-    return runOutcomeWith(alloc, .{ .home = home });
+pub fn runOutcome(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    environ_map: *const std.process.Environ.Map,
+    home: ?[]const u8,
+) !Outcome {
+    return runOutcomeWith(alloc, .{
+        .io = io,
+        .http_deps = .{ .io = io, .environ_map = environ_map },
+        .home = home,
+    });
 }
 
 pub fn runOutcomeAudited(alloc: std.mem.Allocator, hooks: AuditHooks) !Outcome {
@@ -104,19 +124,35 @@ pub fn runOutcomeAudited(alloc: std.mem.Allocator, hooks: AuditHooks) !Outcome {
 }
 
 pub const AuditHooks = struct {
-    http_get: *const fn (std.mem.Allocator, []const u8, []const u8, usize) anyerror!HttpResult = httpGetResult,
-    self_exe_path: *const fn (std.mem.Allocator) anyerror![]u8 = std.fs.selfExePathAlloc,
-    install_binary: *const fn (std.mem.Allocator, []const u8, []const u8) anyerror!void = installBinary,
-    check_update_allowed: *const fn (std.mem.Allocator, ?[]const u8) anyerror!void = checkUpdateAllowed,
-    check_update_host: *const fn (std.mem.Allocator, []const u8, ?[]const u8) anyerror!void = checkUpdateHostAllowed,
+    io: std.Io = std.Io.failing,
+    environ_map: ?*const std.process.Environ.Map = null,
+    http_deps: HttpDeps = .{},
+    http_get: ?*const fn (std.mem.Allocator, []const u8, []const u8, usize) anyerror!HttpResult = null,
+    self_exe_path: *const fn (std.mem.Allocator, std.Io) anyerror![]u8 = selfExePathAlloc,
+    install_binary: *const fn (std.mem.Allocator, std.Io, []const u8, []const u8) anyerror!void = installBinary,
+    check_update_allowed: *const fn (std.mem.Allocator, std.Io, ?[]const u8) anyerror!void = checkUpdateAllowed,
+    check_update_host: *const fn (std.mem.Allocator, std.Io, []const u8, ?[]const u8) anyerror!void = checkUpdateHostAllowed,
     check_default_key: *const fn () bool = checkDefaultKeyRelease,
-    resolve_release_url: *const fn (std.mem.Allocator, ?[]const u8) anyerror![]const u8 = resolveReleaseUrl,
+    resolve_release_url: *const fn (std.mem.Allocator, std.Io, ?[]const u8) anyerror![]const u8 = resolveReleaseUrl,
     home: ?[]const u8 = null,
     audit_emitter: ?*core.audit.Emitter = null,
-    now_ms: *const fn () i64 = std.time.milliTimestamp,
+    now_ms: ?*const fn () i64 = null,
 };
 
 const Hooks = AuditHooks;
+
+fn currentTimeMs(io: std.Io) i64 {
+    return std.Io.Clock.real.now(io).toMilliseconds();
+}
+
+fn hookTimeMs(hooks: Hooks) i64 {
+    if (hooks.now_ms) |f| return f();
+    return currentTimeMs(hooks.io);
+}
+
+fn selfExePathAlloc(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
+    return try std.process.executablePathAlloc(io, alloc);
+}
 
 fn runOutcomeWith(alloc: std.mem.Allocator, hooks: Hooks) !Outcome {
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -143,7 +179,7 @@ fn runOutcomeWith(alloc: std.mem.Allocator, hooks: Hooks) !Outcome {
 
     try emitUpdateAudit(alloc, hooks, 1, .ok, .info, .{ .text = "upgrade start", .vis = .@"pub" }, null);
 
-    hooks.check_update_allowed(alloc, hooks.home) catch |err| {
+    hooks.check_update_allowed(alloc, hooks.io, hooks.home) catch |err| {
         if (err == error.OutOfMemory) return err;
         return try auditOutcome(
             alloc,
@@ -158,14 +194,14 @@ fn runOutcomeWith(alloc: std.mem.Allocator, hooks: Hooks) !Outcome {
     };
 
     // Resolve release channel URL from policy or use default
-    const release_url = hooks.resolve_release_url(ar, hooks.home) catch default_release_url;
+    const release_url = hooks.resolve_release_url(ar, hooks.io, hooks.home) catch default_release_url;
     const release_url_is_alloc = !std.mem.eql(u8, @as([]const u8, release_url), default_release_url);
     _ = release_url_is_alloc; // arena owns it
 
     if (try checkUpdateUrlOrAudit(alloc, hooks, release_url, "metadata host denied")) |out| {
         return out;
     }
-    const release_http = hooks.http_get(alloc, release_url, release_accept, release_limit) catch |err| {
+    const release_http = fetchHttp(alloc, hooks, release_url, release_accept, release_limit) catch |err| {
         if (err == error.OutOfMemory) return err;
         return try auditOutcome(
             alloc,
@@ -279,7 +315,7 @@ fn runOutcomeWith(alloc: std.mem.Allocator, hooks: Hooks) !Outcome {
     if (try checkUpdateUrlOrAudit(alloc, hooks, asset_url, "archive host denied")) |out| {
         return out;
     }
-    const archive_http = hooks.http_get(alloc, asset_url, asset_accept, asset_limit) catch |err| {
+    const archive_http = fetchHttp(alloc, hooks, asset_url, asset_accept, asset_limit) catch |err| {
         if (err == error.OutOfMemory) return err;
         return try auditOutcome(
             alloc,
@@ -336,7 +372,7 @@ fn runOutcomeWith(alloc: std.mem.Allocator, hooks: Hooks) !Outcome {
     if (try checkUpdateUrlOrAudit(alloc, hooks, sig_url, "signature host denied")) |out| {
         return out;
     }
-    const sig_http = hooks.http_get(alloc, sig_url, any_accept, core.signing.Manifest.max_len) catch |err| {
+    const sig_http = fetchHttp(alloc, hooks, sig_url, any_accept, core.signing.Manifest.max_len) catch |err| {
         if (err == error.OutOfMemory) return err;
         return try auditOutcome(
             alloc,
@@ -400,9 +436,9 @@ fn runOutcomeWith(alloc: std.mem.Allocator, hooks: Hooks) !Outcome {
     };
     defer alloc.free(next_bin);
 
-    const exe_path = try hooks.self_exe_path(alloc);
+    const exe_path = try hooks.self_exe_path(alloc, hooks.io);
     defer alloc.free(exe_path);
-    hooks.install_binary(alloc, exe_path, next_bin) catch |err| {
+    hooks.install_binary(alloc, hooks.io, exe_path, next_bin) catch |err| {
         if (err == error.OutOfMemory) return err;
         return try auditOutcome(
             alloc,
@@ -433,7 +469,7 @@ fn runOutcomeWith(alloc: std.mem.Allocator, hooks: Hooks) !Outcome {
 }
 
 fn checkUpdateUrlOrAudit(alloc: std.mem.Allocator, hooks: Hooks, url: []const u8, msg: []const u8) !?Outcome {
-    hooks.check_update_host(alloc, url, hooks.home) catch |err| {
+    hooks.check_update_host(alloc, hooks.io, url, hooks.home) catch |err| {
         if (err == error.OutOfMemory) return err;
         return try auditOutcome(
             alloc,
@@ -476,7 +512,7 @@ fn emitUpdateAudit(
     argv: ?core.audit.Str,
 ) !void {
     if (hooks.audit_emitter) |e| try e.emit(alloc, .{
-        .ts_ms = hooks.now_ms(),
+        .ts_ms = hookTimeMs(hooks),
         .sid = "upgrade",
         .seq = seq,
         .outcome = out,
@@ -499,14 +535,14 @@ fn emitUpdateAudit(
 }
 
 /// Resolve release channel URL from policy, falling back to default GitHub URL.
-fn resolveReleaseUrl(alloc: std.mem.Allocator, home: ?[]const u8) ![]const u8 {
-    const cwd = std.fs.cwd().realpathAlloc(alloc, ".") catch return default_release_url;
+fn resolveReleaseUrl(alloc: std.mem.Allocator, io: std.Io, home: ?[]const u8) ![]const u8 {
+    const cwd = std.process.currentPathAlloc(io, alloc) catch return default_release_url;
     defer alloc.free(cwd);
-    return resolveFromPolicy(alloc, cwd, home);
+    return resolveFromPolicy(alloc, io, cwd, home);
 }
 
-fn resolveFromPolicy(alloc: std.mem.Allocator, cwd: []const u8, home: ?[]const u8) ![]const u8 {
-    const resolved = core.policy.loadResolved(alloc, cwd, home) catch return default_release_url;
+fn resolveFromPolicy(alloc: std.mem.Allocator, io: std.Io, cwd: []const u8, home: ?[]const u8) ![]const u8 {
+    const resolved = core.policy.loadResolved(alloc, io, cwd, home) catch return default_release_url;
     defer core.policy.deinitResolved(alloc, resolved);
     if (resolved.doc.release_url) |url| {
         return alloc.dupe(u8, url);
@@ -514,18 +550,18 @@ fn resolveFromPolicy(alloc: std.mem.Allocator, cwd: []const u8, home: ?[]const u
     return default_release_url;
 }
 
-fn checkUpdateAllowed(alloc: std.mem.Allocator, home: ?[]const u8) !void {
+fn checkUpdateAllowed(alloc: std.mem.Allocator, io: std.Io, home: ?[]const u8) !void {
     const cwd_path = update_policy_file;
-    try checkPolicyPath(alloc, cwd_path);
+    try checkPolicyPath(alloc, io, std.Io.Dir.cwd(), cwd_path);
 
     const h = home orelse return;
     const home_path = try std.fs.path.join(alloc, &.{ h, update_policy_file });
     defer alloc.free(home_path);
-    try checkPolicyPath(alloc, home_path);
+    try checkPolicyPath(alloc, io, std.Io.Dir.cwd(), home_path);
 }
 
-fn checkPolicyPath(alloc: std.mem.Allocator, path: []const u8) !void {
-    const raw = std.fs.cwd().readFileAlloc(alloc, path, 256 * 1024) catch |err| switch (err) {
+fn checkPolicyPath(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
+    const raw = dir.readFileAlloc(io, path, alloc, .limited(256 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidPolicy,
@@ -543,17 +579,17 @@ fn checkPolicyPath(alloc: std.mem.Allocator, path: []const u8) !void {
     }
 }
 
-fn checkUpdateHostAllowed(alloc: std.mem.Allocator, url: []const u8, home: ?[]const u8) !void {
-    try checkHostPolicyPath(alloc, update_policy_file, url);
+fn checkUpdateHostAllowed(alloc: std.mem.Allocator, io: std.Io, url: []const u8, home: ?[]const u8) !void {
+    try checkHostPolicyPath(alloc, io, std.Io.Dir.cwd(), update_policy_file, url);
 
     const h = home orelse return;
     const home_path = try std.fs.path.join(alloc, &.{ h, update_policy_file });
     defer alloc.free(home_path);
-    try checkHostPolicyPath(alloc, home_path, url);
+    try checkHostPolicyPath(alloc, io, std.Io.Dir.cwd(), home_path, url);
 }
 
-fn checkHostPolicyPath(alloc: std.mem.Allocator, path: []const u8, url: []const u8) !void {
-    const raw = std.fs.cwd().readFileAlloc(alloc, path, 256 * 1024) catch |err| switch (err) {
+fn checkHostPolicyPath(alloc: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, url: []const u8) !void {
+    const raw = dir.readFileAlloc(io, path, alloc, .limited(256 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return,
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidPolicy,
@@ -635,6 +671,20 @@ fn httpGetResult(
     return try httpGetResultWith(alloc, url, accept, limit, .{});
 }
 
+fn fetchHttp(
+    alloc: std.mem.Allocator,
+    hooks: Hooks,
+    url: []const u8,
+    accept: []const u8,
+    limit: usize,
+) !HttpResult {
+    if (hooks.http_get) |f| return try f(alloc, url, accept, limit);
+    var deps = hooks.http_deps;
+    deps.io = hooks.io;
+    deps.environ_map = hooks.environ_map;
+    return try httpGetResultWith(alloc, url, accept, limit, deps);
+}
+
 fn httpGetResultWith(
     alloc: std.mem.Allocator,
     url: []const u8,
@@ -677,11 +727,11 @@ fn httpGetResultOnceWith(
     mode: HeaderMode,
     deps: HttpDeps,
 ) !HttpResult {
-    var http = try deps.init_client(deps.init_client_ctx, alloc);
+    var http = try deps.init_client(deps.init_client_ctx, alloc, deps.io);
     defer http.deinit();
     var proxy_arena = std.heap.ArenaAllocator.init(alloc);
     defer proxy_arena.deinit();
-    try http.initDefaultProxies(proxy_arena.allocator());
+    if (deps.environ_map) |env| try http.initDefaultProxies(proxy_arena.allocator(), env);
 
     const uri = try std.Uri.parse(url);
     const ua = "pz/" ++ cli.version;
@@ -1043,37 +1093,40 @@ fn extractPzBinary(alloc: std.mem.Allocator, archive_gz: []const u8) ![]u8 {
     return error.ArchiveMissingBinary;
 }
 
-fn installBinary(alloc: std.mem.Allocator, exe_path: []const u8, binary: []const u8) !void {
+fn installBinary(alloc: std.mem.Allocator, io: std.Io, exe_path: []const u8, binary: []const u8) !void {
     const exe_dir = std.fs.path.dirname(exe_path) orelse return error.InvalidExecutablePath;
     const exe_base = std.fs.path.basename(exe_path);
 
     // Unique temp name: .<base>-update-<pid>-<timestamp>.tmp
     const pid = std.c.getpid();
-    const ts = @as(u64, @intCast(std.time.milliTimestamp()));
+    const ts = @as(u64, @intCast(currentTimeMs(io)));
     const tmp_name = try std.fmt.allocPrint(alloc, ".{s}-update-{d}-{d}.tmp", .{ exe_base, pid, ts });
     defer alloc.free(tmp_name);
     const tmp_path = try std.fs.path.join(alloc, &.{ exe_dir, tmp_name });
     defer alloc.free(tmp_path);
 
     var moved = false;
-    defer if (!moved) std.fs.deleteFileAbsolute(tmp_path) catch {}; // cleanup: propagation impossible
+    defer if (!moved) std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {}; // cleanup: propagation impossible
 
-    const f = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
-    defer f.close();
+    const f = try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true });
+    defer f.close(io);
 
-    try f.writeAll(binary);
-    if (std.fs.has_executable_bit) try f.chmod(0o755);
+    var write_buf: [16 * 1024]u8 = undefined;
+    var writer = f.writerStreaming(io, &write_buf);
+    try writer.interface.writeAll(binary);
+    try writer.interface.flush();
+    if (std.Io.File.Permissions.has_executable_bit) try f.setPermissions(io, .fromMode(0o755));
 
     // fsync data+metadata before rename for crash safety.
-    try f.sync();
+    try f.sync(io);
 
-    try std.fs.renameAbsolute(tmp_path, exe_path);
+    try std.Io.Dir.renameAbsolute(tmp_path, exe_path, io);
     moved = true;
 
     // fsync containing directory to persist the rename.
-    var dir = try std.fs.openDirAbsolute(exe_dir, .{});
-    defer dir.close();
-    try std.posix.fsync(dir.fd);
+    const dir = try std.Io.Dir.openDirAbsolute(io, exe_dir, .{});
+    defer dir.close(io);
+    if (std.c.fsync(dir.handle) != 0) return error.DirectorySyncFailed;
 }
 
 fn makeTarGzAlloc(alloc: std.mem.Allocator, name: []const u8, data: []const u8) ![]u8 {
@@ -1224,24 +1277,26 @@ test "installBinary atomically replaces executable bytes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "pz",
         .data = "old",
     });
-    const exe_path = try tmp.dir.realpathAlloc(std.testing.allocator, "pz");
+    const exe_path = try tmp.dir.realPathFileAlloc(std.testing.io, "pz", std.testing.allocator);
     defer std.testing.allocator.free(exe_path);
 
-    try installBinary(std.testing.allocator, exe_path, "new-binary");
+    try installBinary(std.testing.allocator, std.testing.io, exe_path, "new-binary");
 
-    const f = try std.fs.openFileAbsolute(exe_path, .{});
-    defer f.close();
-    const got = try f.readToEndAlloc(std.testing.allocator, 1024);
+    const f = try std.Io.Dir.openFileAbsolute(std.testing.io, exe_path, .{});
+    defer f.close(std.testing.io);
+    var read_buf: [1024]u8 = undefined;
+    var reader = f.readerStreaming(std.testing.io, &read_buf);
+    const got = try reader.interface.allocRemaining(std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("new-binary", got);
 }
 
 test "installBinary rejects non-path executable" {
-    try std.testing.expectError(error.InvalidExecutablePath, installBinary(std.testing.allocator, "pz", "x"));
+    try std.testing.expectError(error.InvalidExecutablePath, installBinary(std.testing.allocator, std.testing.io, "pz", "x"));
 }
 
 test "sanitizeSnippetAlloc normalizes binary text and truncates" {
@@ -1339,15 +1394,15 @@ test "checkUpdateHostAllowed rejects host absent from policy" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.makePath(".pz");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = update_policy_file,
         .data = "{\"version\":1,\"rules\":[{\"pattern\":\".pz/upgrade\",\"effect\":\"allow\",\"tool\":\"upgrade\"}]}",
     });
 
     try std.testing.expectError(
         error.UpdateHostDenied,
-        checkUpdateHostAllowed(std.testing.allocator, "https://api.github.com/repos/joelreymont/pz/releases/latest", null),
+        checkUpdateHostAllowed(std.testing.allocator, std.testing.io, "https://api.github.com/repos/joelreymont/pz/releases/latest", null),
     );
 }
 
@@ -1357,8 +1412,8 @@ test "checkUpdateHostAllowed accepts explicitly allowed host" {
     var cwd = try path_guard.CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.makePath(".pz");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = update_policy_file,
         .data =
         \\{"version":1,"rules":[
@@ -1368,7 +1423,7 @@ test "checkUpdateHostAllowed accepts explicitly allowed host" {
         ,
     });
 
-    try checkUpdateHostAllowed(std.testing.allocator, "https://api.github.com/repos/joelreymont/pz/releases/latest", null);
+    try checkUpdateHostAllowed(std.testing.allocator, std.testing.io, "https://api.github.com/repos/joelreymont/pz/releases/latest", null);
 }
 
 const UpdateFetchSnap = struct {
@@ -1386,12 +1441,12 @@ const UpdateClientTap = struct {
     no_ca_ct: usize = 0,
     rescan_ct: usize = 0,
 
-    fn init(ctx: ?*anyopaque, alloc: std.mem.Allocator) !std.http.Client {
+    fn init(ctx: ?*anyopaque, alloc: std.mem.Allocator, io: std.Io) !std.http.Client {
         const tap: *UpdateClientTap = @ptrCast(@alignCast(ctx.?));
-        var http = try app_tls.initRuntimeClient(alloc, null);
+        const http = try app_tls.initRuntimeClient(alloc, io, null);
         tap.fetch_ct += 1;
         if (http.ca_bundle.map.size == 0) tap.no_ca_ct += 1;
-        if (@atomicLoad(bool, &http.next_https_rescan_certs, .acquire)) tap.rescan_ct += 1;
+        if (http.now == null) tap.rescan_ct += 1;
         return http;
     }
 };
@@ -1459,7 +1514,7 @@ test "update uses runtime CA bundle for metadata archive and signature fetches" 
         var latest: []const u8 = undefined;
         var tap = UpdateClientTap{};
 
-        fn checkHost(_: std.mem.Allocator, url: []const u8, _: ?[]const u8) !void {
+        fn checkHost(_: std.mem.Allocator, _: std.Io, url: []const u8, _: ?[]const u8) !void {
             if (std.mem.eql(u8, url, default_release_url)) return;
             if (std.mem.startsWith(u8, url, base)) return;
             return error.TestUnexpectedResult;
@@ -1475,14 +1530,15 @@ test "update uses runtime CA bundle for metadata archive and signature fetches" 
             return httpGetResultWith(alloc, local_url, accept, limit, .{
                 .init_client = UpdateClientTap.init,
                 .init_client_ctx = &tap,
+                .io = std.testing.io,
             });
         }
 
-        fn selfExePath(_: std.mem.Allocator) ![]u8 {
+        fn selfExePath(_: std.mem.Allocator, _: std.Io) ![]u8 {
             return error.TestUnexpectedResult;
         }
 
-        fn installBinary(_: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+        fn installBinary(_: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8) !void {
             return error.TestUnexpectedResult;
         }
     };
@@ -1539,8 +1595,8 @@ test "update invalid runtime CA bundle fails before transport" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "bad.pem", .data = "-----BEGIN CERTIFICATE-----\nnot-base64\n" });
-    const bad_path = try tmp.dir.realpathAlloc(std.testing.allocator, "bad.pem");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.pem", .data = "-----BEGIN CERTIFICATE-----\nnot-base64\n" });
+    const bad_path = try tmp.dir.realPathFileAlloc(std.testing.io, "bad.pem", std.testing.allocator);
     defer std.testing.allocator.free(bad_path);
     try writeTestCfg(tmp, bad_path);
 
@@ -1559,7 +1615,7 @@ test "update invalid runtime CA bundle fails before transport" {
         var base: []const u8 = undefined;
         var latest: []const u8 = undefined;
 
-        fn checkHost(_: std.mem.Allocator, url: []const u8, _: ?[]const u8) !void {
+        fn checkHost(_: std.mem.Allocator, _: std.Io, url: []const u8, _: ?[]const u8) !void {
             if (std.mem.eql(u8, url, default_release_url)) return;
             if (std.mem.startsWith(u8, url, base)) return;
             return error.TestUnexpectedResult;
@@ -1572,7 +1628,7 @@ test "update invalid runtime CA bundle fails before transport" {
                 url
             else
                 return error.TestUnexpectedResult;
-            return httpGetResultWith(alloc, local_url, accept, limit, .{});
+            return httpGetResultWith(alloc, local_url, accept, limit, .{ .io = std.testing.io });
         }
     };
     BadHooks.base = base_url;
@@ -1631,7 +1687,7 @@ test "update audit emits start and deny entries on policy block" {
 
     const out = try runOutcomeWith(std.testing.allocator, .{
         .check_update_allowed = struct {
-            fn f(_: std.mem.Allocator, _: ?[]const u8) !void {
+            fn f(_: std.mem.Allocator, _: std.Io, _: ?[]const u8) !void {
                 return error.UpgradeDisabledByPolicy;
             }
         }.f,
@@ -1706,10 +1762,10 @@ test "update denies archive host before transport" {
 
     const out = try runOutcomeWith(std.testing.allocator, .{
         .check_update_allowed = struct {
-            fn f(_: std.mem.Allocator, _: ?[]const u8) !void {}
+            fn f(_: std.mem.Allocator, _: std.Io, _: ?[]const u8) !void {}
         }.f,
         .check_update_host = struct {
-            fn f(_: std.mem.Allocator, url: []const u8, _: ?[]const u8) !void {
+            fn f(_: std.mem.Allocator, _: std.Io, url: []const u8, _: ?[]const u8) !void {
                 if (std.mem.endsWith(u8, url, ".tar.gz")) return error.UpdateHostDenied;
             }
         }.f,
@@ -1832,7 +1888,7 @@ test "update e2e verify fail stays local and audits deterministically" {
             return clk.nowMs();
         }
 
-        fn checkHost(_: std.mem.Allocator, url: []const u8, _: ?[]const u8) !void {
+        fn checkHost(_: std.mem.Allocator, _: std.Io, url: []const u8, _: ?[]const u8) !void {
             if (std.mem.eql(u8, url, default_release_url)) return;
             if (std.mem.startsWith(u8, url, base)) return;
             return error.TestUnexpectedResult;
@@ -1845,14 +1901,14 @@ test "update e2e verify fail stays local and audits deterministically" {
                 url
             else
                 return error.TestUnexpectedResult;
-            return httpGetResult(alloc, local_url, accept, limit);
+            return httpGetResultWith(alloc, local_url, accept, limit, .{ .io = std.testing.io });
         }
 
-        fn selfExePath(_: std.mem.Allocator) ![]u8 {
+        fn selfExePath(_: std.mem.Allocator, _: std.Io) ![]u8 {
             return error.TestUnexpectedResult;
         }
 
-        fn installBinary(_: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+        fn installBinary(_: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8) !void {
             return error.TestUnexpectedResult;
         }
     };
@@ -1974,7 +2030,7 @@ test "update e2e verify success installs via local redirects and audits determin
             return clk.nowMs();
         }
 
-        fn checkHost(_: std.mem.Allocator, url: []const u8, _: ?[]const u8) !void {
+        fn checkHost(_: std.mem.Allocator, _: std.Io, url: []const u8, _: ?[]const u8) !void {
             if (std.mem.eql(u8, url, default_release_url)) return;
             if (std.mem.startsWith(u8, url, base)) return;
             return error.TestUnexpectedResult;
@@ -1987,14 +2043,14 @@ test "update e2e verify success installs via local redirects and audits determin
                 url
             else
                 return error.TestUnexpectedResult;
-            return httpGetResult(alloc, local_url, accept, limit);
+            return httpGetResultWith(alloc, local_url, accept, limit, .{ .io = std.testing.io });
         }
 
-        fn selfExePath(alloc: std.mem.Allocator) ![]u8 {
+        fn selfExePath(alloc: std.mem.Allocator, _: std.Io) ![]u8 {
             return alloc.dupe(u8, "/tmp/pz-self-test");
         }
 
-        fn installBinary(alloc: std.mem.Allocator, exe_path: []const u8, binary: []const u8) !void {
+        fn installBinary(alloc: std.mem.Allocator, _: std.Io, exe_path: []const u8, binary: []const u8) !void {
             installed_path = try alloc.dupe(u8, exe_path);
             installed_bin = try alloc.dupe(u8, binary);
         }
@@ -2109,7 +2165,7 @@ fn updateReleaseBodyAlloc(
 }
 
 fn joinRequestLinesAlloc(alloc: std.mem.Allocator, server: *const http_mock.Server) ![]u8 {
-    var lines = std.ArrayListUnmanaged([]const u8){};
+    var lines = std.ArrayListUnmanaged([]const u8).empty;
     defer lines.deinit(alloc);
     for (0..server.requestCount()) |i| {
         const raw = server.requestAt(i);
@@ -2183,12 +2239,12 @@ test "UX10: upgrade with signed manifest verification success" {
             return .{ .ok = try alloc.dupe(u8, s_archive) };
         }
 
-        fn noCheck(_: std.mem.Allocator, _: ?[]const u8) !void {}
-        fn noHostCheck(_: std.mem.Allocator, _: []const u8, _: ?[]const u8) !void {}
+        fn noCheck(_: std.mem.Allocator, _: std.Io, _: ?[]const u8) !void {}
+        fn noHostCheck(_: std.mem.Allocator, _: std.Io, _: []const u8, _: ?[]const u8) !void {}
         fn noDefaultKey() bool {
             return false;
         }
-        fn install(_: std.mem.Allocator, _: []const u8, _: []const u8) !void {}
+        fn install(_: std.mem.Allocator, _: std.Io, _: []const u8, _: []const u8) !void {}
     };
     Ctx.s_archive = archive;
     Ctx.s_manifest = manifest;
@@ -2202,7 +2258,7 @@ test "UX10: upgrade with signed manifest verification success" {
         .check_default_key = Ctx.noDefaultKey,
         .install_binary = Ctx.install,
         .self_exe_path = struct {
-            fn f(alloc: std.mem.Allocator) ![]u8 {
+            fn f(alloc: std.mem.Allocator, _: std.Io) ![]u8 {
                 return try alloc.dupe(u8, "/tmp/pz-verify-test");
             }
         }.f,
@@ -2244,8 +2300,8 @@ test "UX10: upgrade rejects invalid signed manifest" {
             return .{ .ok = try alloc.dupe(u8, s_archive) };
         }
 
-        fn noCheck(_: std.mem.Allocator, _: ?[]const u8) !void {}
-        fn noHostCheck(_: std.mem.Allocator, _: []const u8, _: ?[]const u8) !void {}
+        fn noCheck(_: std.mem.Allocator, _: std.Io, _: ?[]const u8) !void {}
+        fn noHostCheck(_: std.mem.Allocator, _: std.Io, _: []const u8, _: ?[]const u8) !void {}
         fn noDefaultKey() bool {
             return false;
         }
@@ -2284,7 +2340,7 @@ test "UX10: httpGetResult follows 302 redirect and returns final body" {
     defer std.testing.allocator.free(url);
 
     const thr = try server.spawn();
-    const res = try httpGetResult(std.testing.allocator, url, "text/plain", 4096);
+    const res = try httpGetResultWith(std.testing.allocator, url, "text/plain", 4096, .{ .io = std.testing.io });
     try server.join(thr);
     defer res.deinit(std.testing.allocator);
 
@@ -2305,13 +2361,13 @@ test "UX10: initClient with ca_file loads bundle and disables rescan" {
     const cert_path = try app_tls.writeTestCert(tmp.dir, "ca.pem");
     defer std.testing.allocator.free(cert_path);
 
-    var http = try app_tls.initClient(std.testing.allocator, cert_path);
+    var http = try app_tls.initClient(std.testing.allocator, defaultIo(), cert_path);
     defer http.deinit();
 
     // CA bundle loaded
     try std.testing.expect(http.ca_bundle.map.size != 0);
     // Rescan disabled (no ambient cert pickup)
-    try std.testing.expect(!@atomicLoad(bool, &http.next_https_rescan_certs, .acquire));
+    try std.testing.expect(http.now != null);
 }
 
 test "verifyArchiveManifest rejects downgrade" {

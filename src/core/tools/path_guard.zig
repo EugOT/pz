@@ -4,24 +4,41 @@ const std = @import("std");
 const posix = std.posix;
 
 const native_os = builtin.os.tag;
+const Dir = std.Io.Dir;
+const File = std.Io.File;
+
+fn defaultIo() std.Io {
+    return @import("../rt_io.zig").default();
+}
+
+fn setDirAsCwd(dir: Dir) !void {
+    switch (posix.errno(std.c.fchdir(dir.handle))) {
+        .SUCCESS => {},
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+fn closeFd(fd: posix.fd_t) void {
+    _ = std.c.close(fd);
+}
 
 pub const RaceHook = struct {
     vt: *const Vt,
 
     pub const Vt = struct {
-        after_open: *const fn (self: *RaceHook, dir: std.fs.Dir, path: []const u8) anyerror!void,
+        after_open: *const fn (self: *RaceHook, dir: Dir, path: []const u8) anyerror!void,
     };
 
-    pub fn call(self: *RaceHook, dir: std.fs.Dir, path: []const u8) !void {
+    pub fn call(self: *RaceHook, dir: Dir, path: []const u8) !void {
         return self.vt.after_open(self, dir, path);
     }
 
-    pub fn Bind(comptime T: type, comptime after_open_fn: fn (*T, std.fs.Dir, []const u8) anyerror!void) type {
+    pub fn Bind(comptime T: type, comptime after_open_fn: fn (*T, Dir, []const u8) anyerror!void) type {
         return struct {
             pub const vt = Vt{
                 .after_open = afterOpenFn,
             };
-            fn afterOpenFn(rh: *RaceHook, dir: std.fs.Dir, path: []const u8) anyerror!void {
+            fn afterOpenFn(rh: *RaceHook, dir: Dir, path: []const u8) anyerror!void {
                 const self_ptr: *T = @fieldParentPtr("race_hook", rh);
                 return after_open_fn(self_ptr, dir, path);
             }
@@ -29,31 +46,33 @@ pub const RaceHook = struct {
     }
 };
 
-var race_mu: std.Thread.Mutex = .{};
+var race_mu: std.Io.Mutex = .init;
 var race_hook: ?*RaceHook = null;
 
 pub const CwdGuard = struct {
-    prev: std.fs.Dir,
+    prev: Dir,
 
-    var mu: std.Thread.Mutex = .{};
+    var mu: std.Io.Mutex = .init;
 
-    pub fn enter(dir: std.fs.Dir) !CwdGuard {
-        mu.lock();
-        errdefer mu.unlock();
+    pub fn enter(dir: Dir) !CwdGuard {
+        const active_io = defaultIo();
+        mu.lockUncancelable(active_io);
+        errdefer mu.unlock(active_io);
 
-        var prev = try std.fs.cwd().openDir(".", .{});
-        errdefer prev.close();
+        var prev = try Dir.cwd().openDir(active_io, ".", .{});
+        errdefer prev.close(active_io);
 
-        try dir.setAsCwd();
+        try setDirAsCwd(dir);
         return .{ .prev = prev };
     }
 
     pub fn deinit(self: *CwdGuard) void {
-        self.prev.setAsCwd() catch |err| {
+        const active_io = defaultIo();
+        setDirAsCwd(self.prev) catch |err| {
             std.log.warn("CwdGuard: failed to restore cwd: {}", .{err});
         };
-        self.prev.close();
-        mu.unlock();
+        self.prev.close(active_io);
+        mu.unlock(active_io);
         self.* = undefined;
     }
 };
@@ -61,96 +80,98 @@ pub const CwdGuard = struct {
 pub const RaceGuard = struct {
     pub fn deinit(self: *RaceGuard) void {
         race_hook = null;
-        race_mu.unlock();
+        race_mu.unlock(defaultIo());
         self.* = undefined;
     }
 };
 
 pub fn installRaceHook(hook: *RaceHook) RaceGuard {
-    race_mu.lock();
+    race_mu.lockUncancelable(defaultIo());
     race_hook = hook;
     return .{};
 }
 
-pub fn openDir(path: []const u8, opts: std.fs.Dir.OpenOptions) !std.fs.Dir {
+pub fn openDir(path: []const u8, opts: Dir.OpenOptions) !Dir {
+    const active_io = defaultIo();
     const rel = try relPath(path);
-    if (rel.len == 0) return std.fs.cwd().openDir(".", opts);
+    if (rel.len == 0) return Dir.cwd().openDir(active_io, ".", opts);
 
     var parent = try openParentDir(rel);
-    errdefer parent.dir.close();
+    errdefer parent.dir.close(active_io);
 
     const leaf = parent.leaf orelse return error.FileNotFound;
-    const dir = parent.dir.openDir(leaf, noFollowDirOpts(opts)) catch |err|
+    const dir = parent.dir.openDir(active_io, leaf, noFollowDirOpts(opts)) catch |err|
         return mapParentDirErr(parent.dir, leaf, err);
-    parent.dir.close();
+    parent.dir.close(active_io);
     return dir;
 }
 
-pub fn openFile(path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
+pub fn openFile(path: []const u8, flags: Dir.OpenFileOptions) !File {
     const rel = try relPath(path);
     if (rel.len == 0) return error.FileNotFound;
 
     var parent = try openParentDir(rel);
-    defer parent.dir.close();
+    defer parent.dir.close(defaultIo());
 
     const leaf = parent.leaf orelse return error.FileNotFound;
     return switch (native_os) {
         .windows => error.AccessDenied,
-        else => openFileAt(parent.dir.fd, leaf, flags),
+        else => openFileAt(parent.dir.handle, leaf, flags),
     };
 }
 
-pub fn openFileInDir(dir: std.fs.Dir, name: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
+pub fn openFileInDir(dir: Dir, name: []const u8, flags: Dir.OpenFileOptions) !File {
     const leaf = try leafName(name);
     return switch (native_os) {
         .windows => error.AccessDenied,
-        else => openFileAt(dir.fd, leaf, flags),
+        else => openFileAt(dir.handle, leaf, flags),
     };
 }
 
-pub fn createFileInDir(dir: std.fs.Dir, name: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
+pub fn createFileInDir(dir: Dir, name: []const u8, flags: Dir.CreateFileOptions) !File {
     const leaf = try leafName(name);
     return switch (native_os) {
         .windows => error.AccessDenied,
-        else => createFileAt(dir.fd, leaf, flags),
+        else => createFileAt(dir.handle, leaf, flags),
     };
 }
 
-pub fn createFile(path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
+pub fn createFile(path: []const u8, flags: Dir.CreateFileOptions) !File {
     const rel = try relPath(path);
     if (rel.len == 0) return error.FileNotFound;
 
     var parent = try openParentDir(rel);
-    defer parent.dir.close();
+    defer parent.dir.close(defaultIo());
 
     const leaf = parent.leaf orelse return error.FileNotFound;
     return switch (native_os) {
         .windows => error.AccessDenied,
-        else => createFileAt(parent.dir.fd, leaf, flags),
+        else => createFileAt(parent.dir.handle, leaf, flags),
     };
 }
 
 const ParentDir = struct {
-    dir: std.fs.Dir,
+    dir: Dir,
     leaf: ?[]const u8,
 };
 
 fn openParentDir(rel_path: []const u8) !ParentDir {
-    var dir = try std.fs.cwd().openDir(".", .{ .access_sub_paths = true });
-    errdefer dir.close();
+    const active_io = defaultIo();
+    var dir = try Dir.cwd().openDir(active_io, ".", .{ .access_sub_paths = true });
+    errdefer dir.close(active_io);
 
-    var it = try std.fs.path.componentIterator(rel_path);
+    var it = std.fs.path.componentIterator(rel_path);
     var leaf: ?[]const u8 = null;
     while (it.next()) |part| {
         if (isDot(part.name)) continue;
         if (isDotDot(part.name)) return error.AccessDenied;
 
         if (leaf) |name| {
-            const next = dir.openDir(name, .{
+            const next = dir.openDir(active_io, name, .{
                 .access_sub_paths = true,
-                .no_follow = true,
+                .follow_symlinks = false,
             }) catch |err| return mapParentDirErr(dir, name, err);
-            dir.close();
+            dir.close(active_io);
             dir = next;
         }
         leaf = part.name;
@@ -162,11 +183,11 @@ fn openParentDir(rel_path: []const u8) !ParentDir {
     };
 }
 
-fn mapParentDirErr(dir: std.fs.Dir, name: []const u8, err: anyerror) anyerror {
+fn mapParentDirErr(dir: Dir, name: []const u8, err: anyerror) anyerror {
     if (err != error.NotDir) return err;
     if (native_os == .windows) return err;
 
-    const st = posix.fstatat(dir.fd, name, posix.AT.SYMLINK_NOFOLLOW) catch |stat_err| switch (stat_err) {
+    const st = fstatatNoFollow(dir.handle, name) catch |stat_err| switch (stat_err) {
         error.AccessDenied, error.PermissionDenied, error.SymLinkLoop => return error.AccessDenied,
         error.FileNotFound => return error.FileNotFound,
         else => return err,
@@ -175,11 +196,30 @@ fn mapParentDirErr(dir: std.fs.Dir, name: []const u8, err: anyerror) anyerror {
     return error.FileNotFound;
 }
 
+fn fstatatNoFollow(dir_fd: posix.fd_t, name: []const u8) !std.c.Stat {
+    var name_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (name.len >= name_buf.len) return error.NameTooLong;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+
+    var st: std.c.Stat = undefined;
+    switch (posix.errno(std.c.fstatat(dir_fd, name_buf[0..name.len :0].ptr, &st, std.c.AT.SYMLINK_NOFOLLOW))) {
+        .SUCCESS => return st,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .LOOP => return error.SymLinkLoop,
+        .NOENT => return error.FileNotFound,
+        .NOTDIR => return error.NotDir,
+        else => |errno| return posix.unexpectedErrno(errno),
+    }
+}
+
 fn relPath(path: []const u8) ![]const u8 {
     if (!std.fs.path.isAbsolute(path)) return path;
 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = try std.fs.cwd().realpath(".", &root_buf);
+    const root_len = try Dir.cwd().realPathFile(defaultIo(), ".", &root_buf);
+    const root = root_buf[0..root_len];
 
     if (path.len < root.len) return error.AccessDenied;
     if (!std.mem.eql(u8, path[0..root.len], root)) return error.AccessDenied;
@@ -191,9 +231,9 @@ fn relPath(path: []const u8) ![]const u8 {
     return rel;
 }
 
-fn noFollowDirOpts(opts: std.fs.Dir.OpenOptions) std.fs.Dir.OpenOptions {
+fn noFollowDirOpts(opts: Dir.OpenOptions) Dir.OpenOptions {
     var out = opts;
-    out.no_follow = true;
+    out.follow_symlinks = false;
     return out;
 }
 
@@ -238,9 +278,9 @@ fn setFlockOpenFlags(os_flags: *posix.O, lock: LockKind, nonblocking: bool) bool
 }
 
 fn applyFlock(fd: posix.fd_t, has_flock_open_flags: bool, lock: LockKind, nonblocking: bool) !void {
-    if (@TypeOf(posix.system.flock) != void and !has_flock_open_flags and lock != .none) {
-        const nb: i32 = if (nonblocking) posix.LOCK.NB else 0;
-        try posix.flock(fd, switch (lock) {
+    if (@TypeOf(std.c.flock) != void and !has_flock_open_flags and lock != .none) {
+        const nb: c_int = if (nonblocking) posix.LOCK.NB else 0;
+        try flockFd(fd, switch (lock) {
             .none => unreachable,
             .shared => posix.LOCK.SH | nb,
             .exclusive => posix.LOCK.EX | nb,
@@ -248,27 +288,35 @@ fn applyFlock(fd: posix.fd_t, has_flock_open_flags: bool, lock: LockKind, nonblo
     }
 
     if (has_flock_open_flags and nonblocking) {
-        var fl_flags = posix.fcntl(fd, posix.F.GETFL, 0) catch |err| switch (err) {
-            error.FileBusy => unreachable,
-            error.Locked => unreachable,
-            error.PermissionDenied => unreachable,
-            error.DeadLock => unreachable,
-            error.LockedRegionLimitExceeded => unreachable,
-            else => |e| return e,
-        };
-        fl_flags &= ~@as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK"));
-        _ = posix.fcntl(fd, posix.F.SETFL, fl_flags) catch |err| switch (err) {
-            error.FileBusy => unreachable,
-            error.Locked => unreachable,
-            error.PermissionDenied => unreachable,
-            error.DeadLock => unreachable,
-            error.LockedRegionLimitExceeded => unreachable,
-            else => |e| return e,
-        };
+        const cur = std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
+        switch (posix.errno(cur)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
+        const nonblock: c_int = @bitCast(posix.O{ .NONBLOCK = true });
+        const rc = std.c.fcntl(fd, posix.F.SETFL, cur & ~nonblock);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
     }
 }
 
-fn openFileAt(dir_fd: posix.fd_t, path: []const u8, flags: std.fs.File.OpenFlags) !std.fs.File {
+fn flockFd(fd: posix.fd_t, operation: c_int) !void {
+    while (true) {
+        switch (posix.errno(std.c.flock(fd, operation))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .BADF => unreachable,
+            .INVAL => unreachable,
+            .NOLCK => return error.SystemResources,
+            else => |errno| return posix.unexpectedErrno(errno),
+        }
+    }
+}
+
+fn openFileAt(dir_fd: posix.fd_t, path: []const u8, flags: Dir.OpenFileOptions) !File {
     var os_flags: posix.O = switch (native_os) {
         .wasi => .{
             .read = flags.mode != .write_only,
@@ -294,16 +342,16 @@ fn openFileAt(dir_fd: posix.fd_t, path: []const u8, flags: std.fs.File.OpenFlags
     const has_flock_open = setFlockOpenFlags(&os_flags, lock, flags.lock_nonblocking);
 
     const fd = try posix.openat(dir_fd, path, os_flags, 0);
-    errdefer posix.close(fd);
+    errdefer closeFd(fd);
 
     try applyFlock(fd, has_flock_open, lock, flags.lock_nonblocking);
     try maybeRace(dir_fd, path);
     try ensureStableFile(dir_fd, path, fd);
 
-    return .{ .handle = fd };
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
-fn createFileAt(dir_fd: posix.fd_t, path: []const u8, flags: std.fs.File.CreateFlags) !std.fs.File {
+fn createFileAt(dir_fd: posix.fd_t, path: []const u8, flags: Dir.CreateFileOptions) !File {
     var os_flags: posix.O = .{
         .ACCMODE = if (flags.read) .RDWR else .WRONLY,
         .CREAT = true,
@@ -320,32 +368,34 @@ fn createFileAt(dir_fd: posix.fd_t, path: []const u8, flags: std.fs.File.CreateF
     };
     const has_flock_open = setFlockOpenFlags(&os_flags, lock, flags.lock_nonblocking);
 
-    const fd = try posix.openat(dir_fd, path, os_flags, flags.mode);
-    errdefer posix.close(fd);
+    const fd = try posix.openat(dir_fd, path, os_flags, flags.permissions.toMode());
+    errdefer closeFd(fd);
 
     try applyFlock(fd, has_flock_open, lock, flags.lock_nonblocking);
     try maybeRace(dir_fd, path);
     try ensureStableFile(dir_fd, path, fd);
     if (flags.truncate) {
-        var file: std.fs.File = .{ .handle = fd };
-        try file.setEndPos(0);
+        switch (posix.errno(std.c.ftruncate(fd, 0))) {
+            .SUCCESS => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
     }
 
-    return .{ .handle = fd };
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
 fn maybeRace(dir_fd: posix.fd_t, path: []const u8) !void {
     if (race_hook) |hook| {
-        try hook.call(.{ .fd = dir_fd }, path);
+        try hook.call(.{ .handle = dir_fd }, path);
     }
 }
 
 fn ensureStableFile(dir_fd: posix.fd_t, path: []const u8, fd: posix.fd_t) !void {
-    const got = posix.fstat(fd) catch return error.AccessDenied;
+    const got = fstatFd(fd) catch return error.AccessDenied;
     if (!isReg(got.mode)) return error.AccessDenied;
     if (got.nlink != 1) return error.AccessDenied;
 
-    const want = posix.fstatat(dir_fd, path, posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+    const want = fstatatNoFollow(dir_fd, path) catch |err| switch (err) {
         error.FileNotFound,
         error.AccessDenied,
         error.PermissionDenied,
@@ -356,6 +406,17 @@ fn ensureStableFile(dir_fd: posix.fd_t, path: []const u8, fd: posix.fd_t) !void 
     if (!isReg(want.mode)) return error.AccessDenied;
     if (want.nlink != 1) return error.AccessDenied;
     if (!sameFile(got, want)) return error.AccessDenied;
+}
+
+fn fstatFd(fd: posix.fd_t) !std.c.Stat {
+    var st: std.c.Stat = undefined;
+    switch (posix.errno(std.c.fstat(fd, &st))) {
+        .SUCCESS => return st,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .BADF => return error.FileNotFound,
+        else => |errno| return posix.unexpectedErrno(errno),
+    }
 }
 
 fn isReg(mode: posix.mode_t) bool {
@@ -378,14 +439,15 @@ pub fn resolveConfined(
 
     // Normalize root to realpath
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const real_root = try std.fs.cwd().realpath(root, &root_buf);
+    const real_root_len = try Dir.cwd().realPathFile(defaultIo(), root, &root_buf);
+    const real_root = root_buf[0..real_root_len];
 
     // Build resolved path component by component
     var resolved: std.ArrayListUnmanaged(u8) = .empty;
     defer resolved.deinit(alloc);
     try resolved.appendSlice(alloc, real_root);
 
-    var it = try std.fs.path.componentIterator(path);
+    var it = std.fs.path.componentIterator(path);
     var hops: usize = 0;
     const max_hops: usize = 40; // symlink follow limit
 
@@ -416,14 +478,15 @@ pub fn resolveConfined(
 
         // Check if this component is a symlink
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const link_target = posix.readlinkat(
-            posix.AT.FDCWD,
+        const link_len = Dir.readLinkAbsolute(
+            defaultIo(),
             resolved.items,
             &link_buf,
         ) catch |err| switch (err) {
             error.NotLink => continue, // regular file/dir, keep going
             else => return error.AccessDenied,
         };
+        const link_target = link_buf[0..link_len];
 
         hops += 1;
         if (hops > max_hops) return error.AccessDenied;
@@ -445,8 +508,9 @@ pub fn resolveConfined(
 
         // Re-resolve to realpath to canonicalize
         var canon_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const canon = std.fs.cwd().realpath(resolved.items, &canon_buf) catch
+        const canon_len = Dir.cwd().realPathFile(defaultIo(), resolved.items, &canon_buf) catch
             return error.AccessDenied;
+        const canon = canon_buf[0..canon_len];
         resolved.clearRetainingCapacity();
         try resolved.appendSlice(alloc, canon);
 
@@ -457,8 +521,9 @@ pub fn resolveConfined(
 
     // Final confinement check
     var final_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const final_path = std.fs.cwd().realpath(resolved.items, &final_buf) catch
+    const final_len = Dir.cwd().realPathFile(defaultIo(), resolved.items, &final_buf) catch
         return error.AccessDenied;
+    const final_path = final_buf[0..final_len];
 
     if (!isConfined(final_path, real_root))
         return error.AccessDenied;
@@ -479,10 +544,10 @@ test "resolveConfined allows path within root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sub/deep");
-    try tmp.dir.writeFile(.{ .sub_path = "sub/deep/file.txt", .data = "ok" });
+    try tmp.dir.createDirPath(std.testing.io, "sub/deep");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sub/deep/file.txt", .data = "ok" });
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     const resolved = try resolveConfined(std.testing.allocator, root, "sub/deep/file.txt");
@@ -501,18 +566,18 @@ test "resolveConfined denies symlink chain escaping root" {
     defer tmp.cleanup();
 
     // Create root/jail and an outside directory
-    try tmp.dir.makePath("jail/sub");
-    try tmp.dir.makePath("outside");
-    try tmp.dir.writeFile(.{ .sub_path = "outside/secret.txt", .data = "stolen" });
+    try tmp.dir.createDirPath(std.testing.io, "jail/sub");
+    try tmp.dir.createDirPath(std.testing.io, "outside");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside/secret.txt", .data = "stolen" });
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, "jail");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "jail", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
-    const outside_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "outside");
+    const outside_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "outside", std.testing.allocator);
     defer std.testing.allocator.free(outside_abs);
 
     // Create symlink chain: jail/sub/link1 -> link2, jail/sub/link2 -> /outside
-    try tmp.dir.symLink(outside_abs, "jail/sub/escape", .{});
+    try tmp.dir.symLink(std.testing.io, outside_abs, "jail/sub/escape", .{});
 
     // Attempt to resolve through symlink that escapes
     try std.testing.expectError(
@@ -527,10 +592,10 @@ test "resolveConfined denies dotdot escape" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("jail/sub");
-    try tmp.dir.writeFile(.{ .sub_path = "outside.txt", .data = "secret" });
+    try tmp.dir.createDirPath(std.testing.io, "jail/sub");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside.txt", .data = "secret" });
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, "jail");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, "jail", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     // ../../outside.txt should be confined to root (dotdot stops at root)
@@ -549,8 +614,8 @@ test "openFile denies hardlinked leaf" {
     var cwd = try CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "base.txt", .data = "secret\n" });
-    try posix.linkat(tmp.dir.fd, "base.txt", tmp.dir.fd, "alias.txt", 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "base.txt", .data = "secret\n" });
+    try tmp.dir.hardLink("base.txt", tmp.dir, "alias.txt", std.testing.io, .{});
 
     try std.testing.expectError(error.AccessDenied, openFile("alias.txt", .{ .mode = .read_only }));
 }
@@ -563,11 +628,11 @@ test "createFile denies hardlinked leaf before truncation" {
     var cwd = try CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "base.txt", .data = "secret\n" });
-    try posix.linkat(tmp.dir.fd, "base.txt", tmp.dir.fd, "alias.txt", 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "base.txt", .data = "secret\n" });
+    try tmp.dir.hardLink("base.txt", tmp.dir, "alias.txt", std.testing.io, .{});
 
     try std.testing.expectError(error.AccessDenied, createFile("alias.txt", .{ .truncate = true }));
-    const kept = try tmp.dir.readFileAlloc(std.testing.allocator, "base.txt", 64);
+    const kept = try tmp.dir.readFileAlloc(std.testing.io, "base.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(kept);
     try std.testing.expectEqualStrings("secret\n", kept);
 }
@@ -577,9 +642,9 @@ test "openFile denies replaced leaf after open" {
 
     const Ctx = struct {
         race_hook: RaceHook = .{ .vt = &Bind.vt },
-        fn run(_: *@This(), dir: std.fs.Dir, path: []const u8) !void {
-            try dir.rename(path, "gone.txt");
-            try dir.rename("swap.txt", path);
+        fn run(_: *@This(), dir: Dir, path: []const u8) !void {
+            try dir.rename(path, dir, "gone.txt", std.testing.io);
+            try dir.rename("swap.txt", dir, path, std.testing.io);
         }
         const Bind = RaceHook.Bind(@This(), run);
     };
@@ -589,15 +654,15 @@ test "openFile denies replaced leaf after open" {
     var cwd = try CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "victim.txt", .data = "keep\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "swap.txt", .data = "swap\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "victim.txt", .data = "keep\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "swap.txt", .data = "swap\n" });
 
     var ctx = Ctx{};
     var guard = installRaceHook(&ctx.race_hook);
     defer guard.deinit();
 
     try std.testing.expectError(error.AccessDenied, openFile("victim.txt", .{ .mode = .read_only }));
-    const now = try tmp.dir.readFileAlloc(std.testing.allocator, "victim.txt", 64);
+    const now = try tmp.dir.readFileAlloc(std.testing.io, "victim.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(now);
     try std.testing.expectEqualStrings("swap\n", now);
 }
@@ -607,9 +672,9 @@ test "createFile denies replaced leaf before truncation" {
 
     const Ctx = struct {
         race_hook: RaceHook = .{ .vt = &Bind.vt },
-        fn run(_: *@This(), dir: std.fs.Dir, path: []const u8) !void {
-            try dir.rename(path, "gone.txt");
-            try dir.rename("swap.txt", path);
+        fn run(_: *@This(), dir: Dir, path: []const u8) !void {
+            try dir.rename(path, dir, "gone.txt", std.testing.io);
+            try dir.rename("swap.txt", dir, path, std.testing.io);
         }
         const Bind = RaceHook.Bind(@This(), run);
     };
@@ -619,15 +684,15 @@ test "createFile denies replaced leaf before truncation" {
     var cwd = try CwdGuard.enter(tmp.dir);
     defer cwd.deinit();
 
-    try tmp.dir.writeFile(.{ .sub_path = "victim.txt", .data = "keep\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "swap.txt", .data = "swap\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "victim.txt", .data = "keep\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "swap.txt", .data = "swap\n" });
 
     var ctx = Ctx{};
     var guard = installRaceHook(&ctx.race_hook);
     defer guard.deinit();
 
     try std.testing.expectError(error.AccessDenied, createFile("victim.txt", .{ .truncate = true }));
-    const now = try tmp.dir.readFileAlloc(std.testing.allocator, "victim.txt", 64);
+    const now = try tmp.dir.readFileAlloc(std.testing.io, "victim.txt", std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(now);
     try std.testing.expectEqualStrings("swap\n", now);
 }

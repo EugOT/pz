@@ -12,7 +12,7 @@ const replay_golden =
     \\
 ;
 
-fn replayJson(alloc: std.mem.Allocator, dir: std.fs.Dir, sid: []const u8) ![][]u8 {
+fn replayJson(alloc: std.mem.Allocator, dir: std.Io.Dir, sid: []const u8) ![][]u8 {
     var rdr = try reader.ReplayReader.init(alloc, dir, sid, .{});
     defer rdr.deinit();
 
@@ -37,7 +37,7 @@ fn freeRows(alloc: std.mem.Allocator, rows: [][]u8) void {
 test "session replay golden fixture is stable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "gold.jsonl",
         .data = replay_golden,
     });
@@ -59,7 +59,7 @@ test "session replay golden fixture is stable" {
 test "session replay golden fixture is deterministic across runs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "gold.jsonl",
         .data = replay_golden,
     });

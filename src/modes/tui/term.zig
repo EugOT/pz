@@ -34,7 +34,7 @@ pub fn pollResize() bool {
     return resized.swap(false, .acquire);
 }
 
-fn onWinch(_: c_int) callconv(.c) void {
+fn onWinch(_: std.posix.SIG) callconv(.c) void {
     resized.store(true, .release);
 }
 

@@ -10,12 +10,14 @@ const Err = types.Err;
 
 pub const Transport = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
     cmd: []u8,
     cwd: ?[]u8 = null,
     chunk_bytes: usize = 4096,
 
     pub const Init = struct {
         alloc: std.mem.Allocator,
+        io: std.Io = std.Io.failing,
         cmd: []const u8,
         cwd: ?[]const u8 = null,
         chunk_bytes: usize = 4096,
@@ -28,6 +30,7 @@ pub const Transport = struct {
 
         return .{
             .alloc = cfg.alloc,
+            .io = cfg.io,
             .cmd = try cfg.alloc.dupe(u8, cfg.cmd),
             .cwd = if (cfg.cwd) |cwd| try cfg.alloc.dupe(u8, cwd) else null,
             .chunk_bytes = cfg.chunk_bytes,
@@ -41,19 +44,21 @@ pub const Transport = struct {
     }
 
     pub fn start(self: *Transport, req_wire: []const u8) !ProcChunk {
-        return try ProcChunk.init(self.alloc, self.cmd, self.cwd, self.chunk_bytes, req_wire);
+        return try ProcChunk.init(self.alloc, self.io, self.cmd, self.cwd, self.chunk_bytes, req_wire);
     }
 };
 
 pub const ProcChunk = struct {
     alloc: std.mem.Allocator,
+    io: std.Io,
     child: std.process.Child,
-    stdout: std.fs.File,
+    stdout: std.Io.File,
     buf: []u8,
     done: bool = false,
 
     fn init(
         alloc: std.mem.Allocator,
+        io: std.Io,
         cmd: []const u8,
         cwd: ?[]const u8,
         chunk_bytes: usize,
@@ -65,40 +70,46 @@ pub const ProcChunk = struct {
             cmd,
         };
 
-        var env = std.process.getEnvMap(alloc) catch |err| return mapProcErr(err);
+        var env_len: usize = 0;
+        while (std.c.environ[env_len] != null) : (env_len += 1) {}
+        var env = std.process.Environ.createMap(.{
+            .block = .{ .slice = std.c.environ[0..env_len :null] },
+        }, alloc) catch |err| return mapProcErr(err);
         defer env.deinit();
         sandbox.scrubEnv(&env);
 
-        var child = std.process.Child.init(argv[0..], alloc);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        child.cwd = cwd;
-        child.env_map = &env;
-        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) child.pgid = 0;
-
-        child.spawn() catch |spawn_err| return mapProcErr(spawn_err);
+        var child = std.process.spawn(io, .{
+            .argv = argv[0..],
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+            .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+            .environ_map = &env,
+            .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        }) catch |spawn_err| return mapProcErr(spawn_err);
         errdefer {
-            killAndWait(&child) catch {}; // cleanup: propagation impossible
+            killAndWait(io, &child) catch {}; // cleanup: propagation impossible
         }
 
         var stdin = child.stdin orelse return error.Closed;
         child.stdin = null;
-        defer stdin.close();
-        stdin.writeAll(req_wire) catch |write_err| {
+        errdefer stdin.close(io);
+        stdin.writeStreamingAll(io, req_wire) catch |write_err| {
             return mapIoErr(write_err);
         };
+        stdin.close(io);
 
         const stdout = child.stdout orelse return error.Closed;
         child.stdout = null;
 
         const buf = alloc.alloc(u8, chunk_bytes) catch |alloc_err| {
-            stdout.close();
+            stdout.close(io);
             return alloc_err;
         };
 
         return .{
             .alloc = alloc,
+            .io = io,
             .child = child,
             .stdout = stdout,
             .buf = buf,
@@ -108,27 +119,30 @@ pub const ProcChunk = struct {
     pub fn next(self: *ProcChunk) anyerror!?[]const u8 {
         if (self.done) return null;
 
-        const n = self.stdout.read(self.buf) catch |read_err| return mapIoErr(read_err);
+        const n = self.stdout.readStreaming(self.io, &.{self.buf}) catch |read_err| switch (read_err) {
+            error.EndOfStream => 0,
+            else => return mapIoErr(read_err),
+        };
         if (n != 0) return self.buf[0..n];
 
-        self.stdout.close();
+        self.stdout.close(self.io);
 
-        const term = self.child.wait() catch |wait_err| return mapProcErr(wait_err);
+        const term = self.child.wait(self.io) catch |wait_err| return mapProcErr(wait_err);
         self.done = true;
 
         switch (term) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code == 0) return null;
                 return error.BadGateway;
             },
-            .Signal, .Stopped, .Unknown => return error.BadGateway,
+            .signal, .stopped, .unknown => return error.BadGateway,
         }
     }
 
     pub fn deinit(self: *ProcChunk) void {
         if (!self.done) {
-            self.stdout.close();
-            killAndWait(&self.child) catch {}; // cleanup: propagation impossible from deinit
+            self.stdout.close(self.io);
+            killAndWait(self.io, &self.child) catch {}; // cleanup: propagation impossible from deinit
             self.done = true;
         }
 
@@ -136,14 +150,15 @@ pub const ProcChunk = struct {
     }
 };
 
-fn killAndWait(child: *std.process.Child) !void {
-    const pid = child.id;
+fn killAndWait(io: std.Io, child: *std.process.Child) !void {
+    const pid = child.id orelse return;
+    const pgid = -pid;
 
     // TERM the process group first.
     if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        std.posix.kill(-pid, std.posix.SIG.TERM) catch |err| switch (err) {
+        std.posix.kill(pgid, std.posix.SIG.TERM) catch |err| switch (err) {
             error.ProcessNotFound => {
-                _ = child.wait() catch |wait_err| return mapProcErr(wait_err);
+                _ = child.wait(io) catch |wait_err| return mapProcErr(wait_err);
                 return;
             },
             else => return mapProcErr(err),
@@ -152,23 +167,33 @@ fn killAndWait(child: *std.process.Child) !void {
         // Poll with WNOHANG for ~150ms using posix poll.
         var polls: u32 = 0;
         while (polls < 15) : (polls += 1) {
-            const res = std.posix.waitpid(pid, std.c.W.NOHANG);
-            if (res.pid != 0) {
-                child.id = undefined;
-                return;
+            const res = std.c.waitpid(pid, null, std.c.W.NOHANG);
+            switch (std.posix.errno(res)) {
+                .SUCCESS => {
+                    if (res != 0) {
+                        child.id = null;
+                        return;
+                    }
+                },
+                .INTR => continue,
+                .CHILD => {
+                    child.id = null;
+                    return;
+                },
+                else => |err| return std.posix.unexpectedErrno(err),
             }
             // Use poll with empty fd set as a 10ms sleep replacement.
             _ = std.posix.poll(&.{}, 10) catch 0;
         }
 
         // Escalate to KILL on the process group.
-        std.posix.kill(-pid, std.posix.SIG.KILL) catch |err| switch (err) {
+        std.posix.kill(pgid, std.posix.SIG.KILL) catch |err| switch (err) {
             error.ProcessNotFound => {},
             else => return mapProcErr(err),
         };
     }
 
-    _ = child.wait() catch |wait_err| return mapProcErr(wait_err);
+    _ = child.wait(io) catch |wait_err| return mapProcErr(wait_err);
 }
 
 fn mapProcErr(err: anyerror) anyerror {
@@ -188,7 +213,7 @@ fn mapIoErr(err: anyerror) anyerror {
 // --- Request wire serialization ---
 
 pub fn buildReq(alloc: std.mem.Allocator, req: providers.Request) Err![]u8 {
-    var out: std.io.Writer.Allocating = .init(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
     var js: std.json.Stringify = .{
@@ -201,7 +226,7 @@ pub fn buildReq(alloc: std.mem.Allocator, req: providers.Request) Err![]u8 {
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
-fn writeReq(js: *std.json.Stringify, req: providers.Request) std.io.Writer.Error!void {
+fn writeReq(js: *std.json.Stringify, req: providers.Request) std.Io.Writer.Error!void {
     try js.beginObject();
 
     try js.objectField("model");
@@ -282,7 +307,7 @@ fn writeReq(js: *std.json.Stringify, req: providers.Request) std.io.Writer.Error
     try js.endObject();
 }
 
-fn writePart(js: *std.json.Stringify, part: providers.Part) std.io.Writer.Error!void {
+fn writePart(js: *std.json.Stringify, part: providers.Part) std.Io.Writer.Error!void {
     try js.beginObject();
 
     switch (part) {
@@ -328,6 +353,7 @@ fn expectSnap(comptime src: std.builtin.SourceLocation, got: []u8, comptime want
 test "proc transport streams stdout frames and exits cleanly" {
     var tr = try Transport.init(.{
         .alloc = std.testing.allocator,
+        .io = std.testing.io,
         .cmd = "cat >/dev/null; printf 'text:ok\\nstop:done\\n'",
         .chunk_bytes = 5,
     });
@@ -350,6 +376,7 @@ test "proc transport streams stdout frames and exits cleanly" {
 test "proc transport rejects protected commands" {
     try std.testing.expectError(error.InvalidCommand, Transport.init(.{
         .alloc = std.testing.allocator,
+        .io = std.testing.io,
         .cmd = "env FOO=1 bash -c 'cat ~/.pz/settings.json'",
     }));
 }
@@ -357,6 +384,7 @@ test "proc transport rejects protected commands" {
 test "proc transport reports bad gateway on non-zero exit" {
     var tr = try Transport.init(.{
         .alloc = std.testing.allocator,
+        .io = std.testing.io,
         .cmd = "cat >/dev/null; printf 'text:ok\\n'; exit 9",
     });
     defer tr.deinit();

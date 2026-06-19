@@ -19,7 +19,7 @@ pub const Cfg = struct {
     };
 
     pub fn ext_init() ExtFields {
-        return .{ .cache_write = 0, .tool_id = .{} };
+        return .{ .cache_write = 0, .tool_id = .empty };
     }
 
     pub fn ext_deinit(self: *Stream, alloc: std.mem.Allocator) void {
@@ -32,7 +32,7 @@ pub const Cfg = struct {
     }
 
     pub fn buildAuthHeaders(auth: *auth_mod.Result, ar: std.mem.Allocator) anyerror!std.ArrayListUnmanaged(std.http.Header) {
-        var hdrs = std.ArrayListUnmanaged(std.http.Header){};
+        var hdrs = std.ArrayListUnmanaged(std.http.Header).empty;
         try hdrs.append(ar, .{ .name = "content-type", .value = "application/json" });
         try hdrs.append(ar, .{ .name = "anthropic-version", .value = api_version });
 
@@ -271,7 +271,7 @@ fn buildBodyImpl(alloc: std.mem.Allocator, req: providers.Request, is_oauth: boo
     defer arena.deinit();
     const ar = arena.allocator();
 
-    var out: std.io.Writer.Allocating = .init(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
 
     var js: std.json.Stringify = .{
@@ -1120,7 +1120,9 @@ test "fuzz parseSseData survives arbitrary bytes" {
     defer stream.tool_args.deinit(testing.allocator);
 
     try std.testing.fuzz(&stream, struct {
-        fn f(s: *Stream, input: []const u8) anyerror!void {
+        fn f(s: *Stream, smith: *std.testing.Smith) anyerror!void {
+            var input_buf: [512]u8 = undefined;
+            const input = input_buf[0..smith.slice(&input_buf)];
             resetParserState(s);
             const ar = s.arena.allocator();
             const copy = try ar.dupe(u8, input);

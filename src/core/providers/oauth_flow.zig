@@ -3,6 +3,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oauth_callback = @import("oauth_callback.zig");
 const audit = @import("../audit.zig");
+const core_time = @import("../time.zig");
 const core_tls = @import("../tls.zig");
 const url_codec = @import("../url.zig");
 const auth = @import("auth.zig");
@@ -23,6 +24,14 @@ const providerName = auth.providerName;
 const emitAuthAudit = auth_load.emitAuthAudit;
 const resolveHome = auth_load.resolveHome;
 const saveOAuthForProviderWithHooks = auth_load.saveOAuthForProviderWithHooks;
+
+fn defaultIo() std.Io {
+    return @import("../rt_io.zig").default();
+}
+
+fn hasEnvVar(name: [*:0]const u8) bool {
+    return std.c.getenv(name) != null;
+}
 
 // ── Spec constants ─────────────────────────────────────────────────────
 
@@ -294,8 +303,9 @@ pub fn parseOAuthInput(alloc: std.mem.Allocator, input: []const u8) !OAuthCodeIn
 /// Launch URL in the user's default browser.
 /// Uses absolute paths to avoid PATH-resolved shellout attacks.
 pub fn openBrowser(alloc: std.mem.Allocator, url: []const u8) !void {
+    _ = alloc;
     if (builtin.is_test) return error.UnsupportedPlatform;
-    if (std.process.hasEnvVarConstant("PZ_DISABLE_BROWSER_OPEN")) return error.UnsupportedPlatform;
+    if (hasEnvVar("PZ_DISABLE_BROWSER_OPEN")) return error.UnsupportedPlatform;
 
     const argv: []const []const u8 = switch (builtin.os.tag) {
         .macos => &.{ "/usr/bin/open", url },
@@ -304,8 +314,9 @@ pub fn openBrowser(alloc: std.mem.Allocator, url: []const u8) !void {
                 "/usr/bin/xdg-open",
                 "/usr/local/bin/xdg-open",
             };
+            const io = defaultIo();
             for (candidates) |path| {
-                if (std.fs.cwd().access(path, .{})) |_| {
+                if (std.Io.Dir.cwd().access(io, path, .{})) |_| {
                     break :blk @as([]const []const u8, &.{ path, url });
                 } else |_| {}
             }
@@ -314,16 +325,15 @@ pub fn openBrowser(alloc: std.mem.Allocator, url: []const u8) !void {
         else => return error.UnsupportedPlatform,
     };
 
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
+    var child = std.process.spawn(defaultIo(), .{
         .argv = argv,
-        .max_output_bytes = 1024,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
     }) catch return error.BrowserOpenFailed;
-    defer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
 
-    switch (result.term) {
-        .Exited => |code| {
+    switch (child.wait(defaultIo()) catch return error.BrowserOpenFailed) {
+        .exited => |code| {
             if (code != 0) return error.BrowserOpenFailed;
         },
         else => return error.BrowserOpenFailed,
@@ -424,7 +434,7 @@ pub fn fetchRefreshedOAuthForProvider(alloc: std.mem.Allocator, provider: Provid
 
 fn pkceVerifier(alloc: std.mem.Allocator) ![]u8 {
     var raw: [32]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    try defaultIo().randomSecure(&raw);
     const enc_len = std.base64.url_safe_no_pad.Encoder.calcSize(raw.len);
     const out = try alloc.alloc(u8, enc_len);
     _ = std.base64.url_safe_no_pad.Encoder.encode(out, &raw);
@@ -434,7 +444,7 @@ fn pkceVerifier(alloc: std.mem.Allocator) ![]u8 {
 /// Independent CSRF token for OAuth state parameter (not reusing PKCE verifier).
 fn csrfToken(alloc: std.mem.Allocator) ![]u8 {
     var raw: [32]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    try defaultIo().randomSecure(&raw);
     const enc_len = std.base64.url_safe_no_pad.Encoder.calcSize(raw.len);
     const out = try alloc.alloc(u8, enc_len);
     _ = std.base64.url_safe_no_pad.Encoder.encode(out, &raw);
@@ -612,7 +622,7 @@ fn parseOAuthTokenResponse(
         .ignore_unknown_fields = true,
     }) catch return parse_err;
 
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = core_time.milliTimestamp();
     const expires = now_ms + parsed.value.expires_in * 1000 - 5 * 60 * 1000;
 
     const access = try alloc.dupe(u8, parsed.value.access_token);
@@ -698,7 +708,10 @@ pub fn exchangeAuthorizationCode(
 const auth_http_deadline_s = 30;
 
 pub fn initHttpClient(alloc: std.mem.Allocator, ca_file: ?[]const u8) !std.http.Client {
-    var http = std.http.Client{ .allocator = alloc };
+    var http = std.http.Client{
+        .allocator = alloc,
+        .io = std.Io.Threaded.global_single_threaded.io(),
+    };
     errdefer http.deinit();
     try core_tls.applyCaFile(&http, alloc, ca_file);
     return http;
@@ -707,7 +720,7 @@ pub fn initHttpClient(alloc: std.mem.Allocator, ca_file: ?[]const u8) !std.http.
 /// Apply SO_SNDTIMEO and SO_RCVTIMEO to the underlying socket so auth
 /// HTTP requests cannot hang indefinitely.
 fn setSocketDeadlines(conn: *std.http.Client.Connection) !void {
-    const fd = conn.stream_writer.getStream().handle;
+    const fd = conn.stream_writer.stream.socket.handle;
     const tv = std.posix.timeval{ .sec = auth_http_deadline_s, .usec = 0 };
     const tv_bytes: []const u8 = std.mem.asBytes(&tv);
     try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.c.SO.SNDTIMEO, tv_bytes);
@@ -1027,7 +1040,7 @@ test "completeOAuthWithHooks rejects empty verifier" {
 test "completeOAuthWithHooks uses provided verifier not state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     var got_verifier: []const u8 = "";
@@ -1144,7 +1157,7 @@ test "auth audit covers oauth login and persistence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     var rows = AuditRows{};
@@ -1196,7 +1209,7 @@ test "auth audit covers oauth refresh and persistence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     var rows = AuditRows{};
@@ -1241,7 +1254,7 @@ test "completeOAuthWithHooks passes ca_file to exchange_code" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     try completeOAuthWithHooks(std.testing.allocator, .anthropic, "code=abc&state=def", "test-pkce-verifier", .{
@@ -1264,7 +1277,7 @@ test "refreshOAuthForProviderWithHooks passes ca_file to refresh_fetch" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     const got = try refreshOAuthForProviderWithHooks(std.testing.allocator, .openai, .{
@@ -1295,8 +1308,8 @@ test "initHttpClient fails closed on invalid ca bundle" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "bad.pem", .data = "-----BEGIN CERTIFICATE-----\nnot-base64\n" });
-    const bad = try tmp.dir.realpathAlloc(std.testing.allocator, "bad.pem");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.pem", .data = "-----BEGIN CERTIFICATE-----\nnot-base64\n" });
+    const bad = try tmp.dir.realPathFileAlloc(std.testing.io, "bad.pem", std.testing.allocator);
     defer std.testing.allocator.free(bad);
 
     if (initHttpClient(std.testing.allocator, bad)) |h| {
@@ -1337,7 +1350,7 @@ test "completeOAuthWithHooks with mock exchange returns valid tokens and persist
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     try completeOAuthWithHooks(std.testing.allocator, .anthropic, "code=test_code&state=test_state", "pkce-v", .{
@@ -1393,7 +1406,7 @@ test "refreshOAuthForProviderWithHooks with mock 200 returns new tokens" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     const got = try refreshOAuthForProviderWithHooks(std.testing.allocator, .anthropic, .{
@@ -1477,7 +1490,7 @@ test "refreshOAuthForProviderWithHooks propagates network error" {
 test "proactive refresh triggers when now > expires" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(home);
 
     const Ctx = struct {

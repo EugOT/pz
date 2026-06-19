@@ -4,18 +4,26 @@ const pkg = @import("build.zig.zon");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const dep_opt = .{
-        .target = target,
-        .optimize = optimize,
-    };
     const policy_pk_hex = b.option(
         []const u8,
         "policy-pk-hex",
         "Trusted Ed25519 public key for policy bundles",
     ) orelse "2d6f7455d97b4a3a10d7293909d1a4f2058cb9a370e43fa8154bb280db839083";
     // zcheck's package build still shells out to git; import the module directly.
-    const zcheck_mod = depMod(b, "zcheck", "src/zcheck.zig", target, optimize);
-    const ohsnap_mod = if (b.lazyDependency("ohsnap", dep_opt)) |d| d.module("ohsnap") else null;
+    const zcheck_upstream_mod = depMod(b, "zcheck", "src/zcheck.zig", target, optimize);
+    const zcheck_mod = b.createModule(.{
+        .root_source_file = b.path("src/vendor/zcheck.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zcheck_mod.addImport("zcheck_upstream", zcheck_upstream_mod);
+    const ohsnap_upstream_mod = ohsnapMod(b, target, optimize);
+    const ohsnap_mod = b.createModule(.{
+        .root_source_file = b.path("src/vendor/ohsnap.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ohsnap_mod.addImport("ohsnap_upstream", ohsnap_upstream_mod);
 
     // Build options: version, VCS hash, changelog
     const options = b.addOptions();
@@ -50,9 +58,9 @@ pub fn build(b: *std.Build) void {
         const vcs_hash_raw = b.runAllowFail(
             &.{ "jj", "log", "--no-graph", "-r", "@", "-T", "commit_id.short()" },
             &code,
-            .Ignore,
+            .ignore,
         ) catch "dev";
-        const vcs_hash = std.mem.trimRight(u8, vcs_hash_raw, "\n\r ");
+        const vcs_hash = std.mem.trimEnd(u8, vcs_hash_raw, "\n\r ");
         addSharedOpt(opts_pair, []const u8, "git_hash", vcs_hash);
         // State tracker key: hash for dev (matches line-start in VCS log).
         addSharedOpt(opts_pair, []const u8, "build_id", vcs_hash);
@@ -68,9 +76,9 @@ pub fn build(b: *std.Build) void {
                 "commit_id.short() ++ \" \" ++ description.first_line() ++ \"\\n\"",
             },
             &code,
-            .Ignore,
+            .ignore,
         ) catch "";
-        const vcs_log = std.mem.trimRight(u8, vcs_log_raw, "\n\r ");
+        const vcs_log = std.mem.trimEnd(u8, vcs_log_raw, "\n\r ");
         addSharedOpt(opts_pair, []const u8, "changelog", vcs_log);
     }
     addSharedOpt(opts_pair, []const u8, "policy_pk_hex", policy_pk_hex);
@@ -197,13 +205,40 @@ fn addSharedOpt(
 
 fn configTestMod(
     mod: *std.Build.Module,
-    ohsnap_mod: ?*std.Build.Module,
+    ohsnap_mod: *std.Build.Module,
     zcheck_mod: *std.Build.Module,
     build_options: ?*std.Build.Step.Options,
 ) void {
-    if (ohsnap_mod) |m| mod.addImport("ohsnap", m);
+    mod.addImport("ohsnap", ohsnap_mod);
     mod.addImport("zcheck", zcheck_mod);
     if (build_options) |opts| mod.addOptions("build_options", opts);
+}
+
+fn ohsnapMod(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const options = b.addOptions();
+    const mod_names: []const []const u8 = b.option(
+        []const []const u8,
+        "module_name",
+        "Name of a module with a non-standard directory.",
+    ) orelse &.{};
+    const mod_dirs: []const []const u8 = b.option(
+        []const []const u8,
+        "root_directory",
+        "Non-standard directory in which the corresponding module_name is found.",
+    ) orelse &.{};
+    options.addOption([]const []const u8, "module_name", mod_names);
+    options.addOption([]const []const u8, "root_directory", mod_dirs);
+
+    const mod = depMod(b, "ohsnap", "src/ohsnap.zig", target, optimize);
+    mod.addOptions("config", options);
+    mod.addImport("pretty", depMod(b, "pretty", "src/pretty.zig", target, optimize));
+    mod.addImport("diffz", depMod(b, "muad_diff", "src/dmp.zig", target, optimize));
+    mod.addImport("mvzr", depMod(b, "mvzr", "src/mvzr.zig", target, optimize));
+    return mod;
 }
 
 fn depMod(

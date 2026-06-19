@@ -17,18 +17,18 @@ const ToolResultOut = struct {
 
 pub const Formatter = struct {
     alloc: std.mem.Allocator,
-    out: std.Io.AnyWriter,
+    out: *std.Io.Writer,
     verbose: bool = false,
     text_seen: bool = false,
     text_ended_nl: bool = false,
-    thinking: std.ArrayListUnmanaged([]const u8) = .{},
-    tool_calls: std.ArrayListUnmanaged(ToolCallOut) = .{},
-    tool_results: std.ArrayListUnmanaged(ToolResultOut) = .{},
-    errs: std.ArrayListUnmanaged([]const u8) = .{},
+    thinking: std.ArrayListUnmanaged([]const u8) = .empty,
+    tool_calls: std.ArrayListUnmanaged(ToolCallOut) = .empty,
+    tool_results: std.ArrayListUnmanaged(ToolResultOut) = .empty,
+    errs: std.ArrayListUnmanaged([]const u8) = .empty,
     usage: ?core.providers.Usage = null,
     stop: ?core.providers.StopReason = null,
 
-    pub fn init(alloc: std.mem.Allocator, out: std.Io.AnyWriter) Formatter {
+    pub fn init(alloc: std.mem.Allocator, out: *std.Io.Writer) Formatter {
         return .{
             .alloc = alloc,
             .out = out,
@@ -262,7 +262,7 @@ fn stopName(reason: core.providers.StopReason) []const u8 {
     };
 }
 
-fn writeQuoted(out: std.Io.AnyWriter, raw: []const u8) !void {
+fn writeQuoted(out: *std.Io.Writer, raw: []const u8) !void {
     try out.writeByte('"');
     for (raw) |ch| {
         switch (ch) {
@@ -354,15 +354,15 @@ pub fn sanitizeOutput(alloc: std.mem.Allocator, text: []const u8) ![]const u8 {
 
 fn expectFormatted(evs: []const core.providers.Event, want: []const u8) !void {
     var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    var formatter = Formatter.init(std.testing.allocator, fbs.writer().any());
+    var fbs: std.Io.Writer = .fixed(&buf);
+    var formatter = Formatter.init(std.testing.allocator, &fbs);
     formatter.verbose = true; // tests check full diagnostic output
     defer formatter.deinit();
 
     for (evs) |ev| try formatter.push(ev);
     try formatter.finish();
 
-    try std.testing.expectEqualStrings(want, fbs.getWritten());
+    try std.testing.expectEqualStrings(want, fbs.buffered());
 }
 
 test "formatter emits deterministic canonical output" {
@@ -479,14 +479,14 @@ test "formatter sanitizes ANSI in text output" {
 
 test "formatter redacts secrets in text output" {
     var buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    var formatter = Formatter.init(std.testing.allocator, fbs.writer().any());
+    var fbs: std.Io.Writer = .fixed(&buf);
+    var formatter = Formatter.init(std.testing.allocator, &fbs);
     defer formatter.deinit();
 
     try formatter.push(.{ .text = "key: sk-live-abc123" });
     try formatter.finish();
 
-    const written = fbs.getWritten();
+    const written = fbs.buffered();
     // Must not contain the raw secret
     try std.testing.expect(std.mem.indexOf(u8, written, "sk-live-abc123") == null);
     // Must contain redaction tag
@@ -495,8 +495,8 @@ test "formatter redacts secrets in text output" {
 
 test "formatter redacts secrets in verbose tool output" {
     var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    var formatter = Formatter.init(std.testing.allocator, fbs.writer().any());
+    var fbs: std.Io.Writer = .fixed(&buf);
+    var formatter = Formatter.init(std.testing.allocator, &fbs);
     formatter.verbose = true;
     defer formatter.deinit();
 
@@ -504,7 +504,7 @@ test "formatter redacts secrets in verbose tool output" {
     try formatter.push(.{ .tool_result = .{ .id = "c1", .output = "authorization: bearer sk-test-key", .is_err = false } });
     try formatter.finish();
 
-    const written = fbs.getWritten();
+    const written = fbs.buffered();
     // Secret in tool result must be redacted
     try std.testing.expect(std.mem.indexOf(u8, written, "sk-test-key") == null);
     // Path in tool args must be redacted

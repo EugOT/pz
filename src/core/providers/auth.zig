@@ -6,6 +6,7 @@
 const std = @import("std");
 const audit = @import("../audit.zig");
 const policy = @import("../policy.zig");
+const core_time = @import("../time.zig");
 
 // ── Submodules (pull in their tests) ───────────────────────────────────
 
@@ -60,12 +61,24 @@ pub const Hooks = struct {
     home_override: ?[]const u8 = null,
     ca_file: ?[]const u8 = null,
     lock: policy.Lock = .{},
-    get_home: *const fn (std.mem.Allocator, []const u8) anyerror![]u8 = std.process.getEnvVarOwned,
+    get_home: *const fn (std.mem.Allocator, []const u8) anyerror![]u8 = defaultGetHome,
     exchange_code: *const fn (std.mem.Allocator, *const OAuthSpec, []const u8, []const u8, []const u8, []const u8, Self) anyerror!OAuth = oauth_flow.exchangeAuthorizationCode,
     refresh_fetch: *const fn (std.mem.Allocator, Provider, OAuth, Self) anyerror!OAuth = oauth_flow.fetchRefreshedOAuthForProvider,
     audit_emitter: ?*audit.Emitter = null,
-    now_ms: *const fn () i64 = std.time.milliTimestamp,
+    now_ms: *const fn () i64 = core_time.milliTimestamp,
 };
+
+fn defaultGetHome(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
+    var env_len: usize = 0;
+    while (std.c.environ[env_len] != null) : (env_len += 1) {}
+    var env = try std.process.Environ.createMap(.{
+        .block = .{ .slice = std.c.environ[0..env_len :null] },
+    }, alloc);
+    defer env.deinit();
+
+    const value = env.get(name) orelse return error.EnvironmentVariableMissing;
+    return alloc.dupe(u8, value);
+}
 
 pub const OAuthTokenBody = enum {
     json_with_state,

@@ -63,23 +63,23 @@ run_case \
 run_case \
     "openai-tool-stop-on-completed" \
     "src/core/providers/openai.zig" \
-    "if (self.saw_tool_call and stop_reason == .done) stop_reason = .tool;" \
-    "if (self.saw_tool_call and stop_reason == .done) stop_reason = .done;" \
+    "if (self.ext.saw_tool_call and stop_reason == .done) stop_reason = .tool;" \
+    "if (self.ext.saw_tool_call and stop_reason == .done) stop_reason = .done;" \
     "zig test src/core/providers/openai.zig -O Debug"
 
 run_case \
     "auth-env-oauth-precedence" \
-    "src/core/providers/auth.zig" \
+    "src/core/providers/auth_load.zig" \
     "if (token.len > 0) return .{ .oauth = .{" \
     "if (token.len > 99999999) return .{ .oauth = .{" \
-    "zig test src/core/providers/auth.zig -O Debug"
+    "zig test src/core/providers/auth_load.zig -O Debug"
 
 run_case \
     "auth-oauth-file-type-map" \
-    "src/core/providers/auth.zig" \
+    "src/core/providers/auth_load.zig" \
     ".{ \"oauth\", .oauth }," \
     ".{ \"oauth\", .api_key }," \
-    "zig test src/core/providers/auth.zig -O Debug"
+    "zig test src/core/providers/auth_load.zig -O Debug"
 
 run_case \
     "stream-parse-stop-err-map" \

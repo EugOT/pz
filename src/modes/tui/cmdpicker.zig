@@ -266,11 +266,11 @@ pub const Picker = struct {
 fn snapAlloc(alloc: std.mem.Allocator, cp: Picker) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(alloc);
-    try std.fmt.format(buf.writer(alloc), "n={} sel={} scroll={}", .{ cp.n, cp.sel, cp.scroll });
+    try buf.print(alloc, "n={} sel={} scroll={}", .{ cp.n, cp.sel, cp.scroll });
     var i: usize = 0;
     while (i < cp.n) : (i += 1) {
         const name = if (cp.arg_src) |items| items[cp.matches[i]] else cmds[cp.matches[i]].name;
-        try std.fmt.format(buf.writer(alloc), "\n[{d}] {s}", .{ i, name });
+        try buf.print(alloc, "\n[{d}] {s}", .{ i, name });
     }
     return buf.toOwnedSlice(alloc);
 }

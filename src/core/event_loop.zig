@@ -2,6 +2,7 @@
 const std = @import("std");
 const posix = std.posix;
 
+const c = std.c;
 const native_os = @import("builtin").os.tag;
 const is_kqueue = native_os.isDarwin() or native_os == .freebsd or native_os == .netbsd or native_os == .openbsd;
 const is_epoll = native_os == .linux;
@@ -78,6 +79,58 @@ pub const TimerHandler = struct {
 
 const max_handlers = 64;
 
+pub fn makePipe() ![2]posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    if (@TypeOf(c.pipe2) != void) {
+        if (c.pipe2(&fds, .{ .NONBLOCK = true, .CLOEXEC = true }) != 0) {
+            return posix.unexpectedErrno(posix.errno(-1));
+        }
+        return fds;
+    }
+
+    if (c.pipe(&fds) != 0) return posix.unexpectedErrno(posix.errno(-1));
+    errdefer {
+        closeFd(fds[0]);
+        closeFd(fds[1]);
+    }
+    try setPipeFlags(fds[0]);
+    try setPipeFlags(fds[1]);
+    return fds;
+}
+
+fn setPipeFlags(fd: posix.fd_t) !void {
+    if (c.fcntl(fd, @as(c_int, posix.F.SETFD), @as(c_int, posix.FD_CLOEXEC)) == -1) {
+        return posix.unexpectedErrno(posix.errno(-1));
+    }
+    const flags = c.fcntl(fd, @as(c_int, posix.F.GETFL), @as(c_int, 0));
+    if (flags == -1) return posix.unexpectedErrno(posix.errno(-1));
+    const raw: c_int = @bitCast(@as(posix.O, .{ .NONBLOCK = true }));
+    if (c.fcntl(fd, @as(c_int, posix.F.SETFL), flags | raw) == -1) {
+        return posix.unexpectedErrno(posix.errno(-1));
+    }
+}
+
+fn closeFd(fd: posix.fd_t) void {
+    _ = c.close(fd);
+}
+
+fn fdWrite(fd: posix.fd_t, bytes: []const u8) !usize {
+    while (true) {
+        const rc = c.write(fd, bytes.ptr, bytes.len);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn fdWriteAll(fd: posix.fd_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) off += try fdWrite(fd, bytes[off..]);
+}
+
 const FdEntry = struct {
     fd: posix.fd_t,
     handler: *Handler,
@@ -100,13 +153,13 @@ pub const EventLoop = struct {
     sigchld_handler: ?*Handler = null,
 
     pub fn init() !EventLoop {
-        const pipe = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+        const pipe = try makePipe();
         errdefer {
-            posix.close(pipe[0]);
-            posix.close(pipe[1]);
+            closeFd(pipe[0]);
+            closeFd(pipe[1]);
         }
         const fd = try backendCreate();
-        errdefer posix.close(fd);
+        errdefer closeFd(fd);
         var self = EventLoop{
             .backend = fd,
             .wake_r = pipe[0],
@@ -135,7 +188,7 @@ pub const EventLoop = struct {
             _ = try kqueueWaitChanges(self.backend, &changelist, &.{}, null);
         } else {
             const tfd = timerfdCreate() catch return error.TimerCreateFailed;
-            errdefer posix.close(tfd);
+            errdefer closeFd(tfd);
             try timerfdSet(tfd, ms);
             var ev = std.os.linux.epoll_event{
                 .events = std.os.linux.EPOLL.IN,
@@ -143,7 +196,7 @@ pub const EventLoop = struct {
             };
             const rc = std.os.linux.epoll_ctl(@intCast(self.backend), std.os.linux.EPOLL.CTL_ADD, @intCast(tfd), &ev);
             if (std.posix.errno(rc) != .SUCCESS) {
-                posix.close(tfd);
+                closeFd(tfd);
                 return error.TimerCreateFailed;
             }
             self.timer_fds[id] = tfd;
@@ -166,7 +219,7 @@ pub const EventLoop = struct {
         } else {
             if (id < max_timers and self.timer_fds[id] >= 0) {
                 _ = std.os.linux.epoll_ctl(@intCast(self.backend), std.os.linux.EPOLL.CTL_DEL, @intCast(self.timer_fds[id]), null);
-                posix.close(self.timer_fds[id]);
+                closeFd(self.timer_fds[id]);
                 self.timer_fds[id] = -1;
             }
         }
@@ -225,7 +278,7 @@ pub const EventLoop = struct {
         if (is_kqueue) {
             // kqueue: use EVFILT_SIGNAL for SIGCHLD
             const changelist = [1]std.posix.Kevent{.{
-                .ident = std.posix.SIG.CHLD,
+                .ident = @intCast(@intFromEnum(posix.SIG.CHLD)),
                 .filter = std.posix.system.EVFILT.SIGNAL,
                 .flags = std.posix.system.EV.ADD,
                 .fflags = 0,
@@ -235,12 +288,12 @@ pub const EventLoop = struct {
             _ = try kqueueWaitChanges(self.backend, &changelist, &.{}, null);
             // Block SIGCHLD so kqueue gets the event instead of the default handler
             var mask = std.mem.zeroes(posix.sigset_t);
-            sigaddset(&mask, posix.SIG.CHLD);
+            sigaddset(&mask, @intCast(@intFromEnum(posix.SIG.CHLD)));
             _ = std.c.sigprocmask(posix.SIG.BLOCK, &mask, null);
         } else {
             // Linux: use signalfd
             var mask = std.mem.zeroes(posix.sigset_t);
-            sigaddset(&mask, posix.SIG.CHLD);
+            sigaddset(&mask, @intCast(@intFromEnum(posix.SIG.CHLD)));
             _ = std.c.sigprocmask(posix.SIG.BLOCK, &mask, null);
             const sfd = std.os.linux.signalfd(-1, &mask, std.os.linux.SFD.NONBLOCK | std.os.linux.SFD.CLOEXEC);
             if (std.posix.errno(sfd) != .SUCCESS) return error.SignalFdFailed;
@@ -254,18 +307,18 @@ pub const EventLoop = struct {
         // Unblock SIGCHLD if we blocked it via watchSigchld.
         if (self.sigchld_handler != null) {
             var mask = std.mem.zeroes(posix.sigset_t);
-            sigaddset(&mask, posix.SIG.CHLD);
+            sigaddset(&mask, @intCast(@intFromEnum(posix.SIG.CHLD)));
             _ = std.c.sigprocmask(posix.SIG.UNBLOCK, &mask, null);
         }
         if (is_epoll) {
             for (self.timer_fds) |tfd| {
-                if (tfd >= 0) posix.close(tfd);
+                if (tfd >= 0) closeFd(tfd);
             }
-            if (self.sigchld_fd >= 0) posix.close(self.sigchld_fd);
+            if (self.sigchld_fd >= 0) closeFd(self.sigchld_fd);
         }
-        posix.close(self.backend);
-        posix.close(self.wake_r);
-        posix.close(self.wake_w);
+        closeFd(self.backend);
+        closeFd(self.wake_r);
+        closeFd(self.wake_w);
         self.* = undefined;
     }
 
@@ -369,7 +422,7 @@ pub const EventLoop = struct {
 
     /// Interrupt a blocking wait() from another thread or signal handler.
     pub fn wake(self: *EventLoop) void {
-        _ = posix.write(self.wake_w, "\x01") catch return; // cleanup: propagation impossible
+        fdWriteAll(self.wake_w, "\x01") catch return; // cleanup: propagation impossible
     }
 
     fn findTimerId(self: *const EventLoop, fd: posix.fd_t) ?TimerId {
@@ -447,7 +500,13 @@ pub const EventLoop = struct {
 
 fn backendCreate() !posix.fd_t {
     if (is_kqueue) {
-        return try posix.kqueue();
+        const rc = c.kqueue();
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .MFILE, .NFILE => return error.ProcessFdQuotaExceeded,
+            .NOMEM => return error.OutOfMemory,
+            else => |e| return posix.unexpectedErrno(e),
+        }
     } else {
         const rc = std.os.linux.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
         switch (std.posix.errno(rc)) {
@@ -542,14 +601,14 @@ test "register pipe, write, wait returns ready" {
     defer el.deinit();
 
     // Create a pipe to monitor.
-    const pipe = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer posix.close(pipe[0]);
-    defer posix.close(pipe[1]);
+    const pipe = try makePipe();
+    defer closeFd(pipe[0]);
+    defer closeFd(pipe[1]);
 
     try el.register(pipe[0], .read);
 
     // Write to pipe so read end becomes ready.
-    _ = try posix.write(pipe[1], "x");
+    try fdWriteAll(pipe[1], "x");
 
     var buf: [max_events]Event = undefined;
     const events = try el.wait(1000, &buf);
@@ -574,7 +633,11 @@ test "wake interrupts blocking wait" {
     // Spawn thread that wakes after short delay.
     const t = try std.Thread.spawn(.{}, struct {
         fn run(loop: *EventLoop) void {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            std.Io.sleep(
+                std.Io.Threaded.global_single_threaded.io(),
+                .fromMilliseconds(10),
+                .awake,
+            ) catch return;
             loop.wake();
         }
     }.run, .{&el});
@@ -590,15 +653,15 @@ test "unregister removes fd" {
     var el = try EventLoop.init();
     defer el.deinit();
 
-    const pipe = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer posix.close(pipe[0]);
-    defer posix.close(pipe[1]);
+    const pipe = try makePipe();
+    defer closeFd(pipe[0]);
+    defer closeFd(pipe[1]);
 
     try el.register(pipe[0], .read);
     try el.unregister(pipe[0]);
 
     // Write to pipe — should NOT appear in events since unregistered.
-    _ = try posix.write(pipe[1], "y");
+    try fdWriteAll(pipe[1], "y");
 
     var buf: [max_events]Event = undefined;
     const events = try el.wait(0, &buf);
@@ -609,18 +672,18 @@ test "multiple fds" {
     var el = try EventLoop.init();
     defer el.deinit();
 
-    const p1 = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer posix.close(p1[0]);
-    defer posix.close(p1[1]);
-    const p2 = try posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer posix.close(p2[0]);
-    defer posix.close(p2[1]);
+    const p1 = try makePipe();
+    defer closeFd(p1[0]);
+    defer closeFd(p1[1]);
+    const p2 = try makePipe();
+    defer closeFd(p2[0]);
+    defer closeFd(p2[1]);
 
     try el.register(p1[0], .read);
     try el.register(p2[0], .read);
 
-    _ = try posix.write(p1[1], "a");
-    _ = try posix.write(p2[1], "b");
+    try fdWriteAll(p1[1], "a");
+    try fdWriteAll(p2[1], "b");
 
     var buf: [max_events]Event = undefined;
     const events = try el.wait(1000, &buf);

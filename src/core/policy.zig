@@ -4,6 +4,8 @@ const signing = @import("signing.zig");
 const build_options = @import("build_options");
 const testing = std.testing;
 
+const NetAddress = std.Io.net.IpAddress;
+
 pub const ver_current: u16 = 1;
 
 pub const Effect = enum {
@@ -229,12 +231,19 @@ pub fn isProtectedPath(path: []const u8) bool {
     return false;
 }
 
-pub fn isBlockedNetAddr(addr: std.net.Address) bool {
-    return switch (addr.any.family) {
-        std.posix.AF.INET => isBlockedIp4(@as(*const [4]u8, @ptrCast(&addr.in.sa.addr)).*),
-        std.posix.AF.INET6 => isBlockedIp6(addr.in6.sa.addr),
-        else => true,
+pub fn isBlockedNetAddr(addr: NetAddress) bool {
+    return switch (addr) {
+        .ip4 => |ip4| isBlockedIp4(ip4.bytes),
+        .ip6 => |ip6| isBlockedIp6(ip6.bytes),
     };
+}
+
+fn netIp4(bytes: [4]u8, port: u16) NetAddress {
+    return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+}
+
+fn netIp6(bytes: [16]u8, port: u16) NetAddress {
+    return .{ .ip6 = .{ .bytes = bytes, .port = port } };
 }
 
 pub fn isBlockedIp4(ip: [4]u8) bool {
@@ -367,13 +376,15 @@ pub const SignedDoc = struct {
 pub const GenerationState = struct {
     const state_rel = ".pz/policy-state.json";
 
-    pub fn load(alloc: std.mem.Allocator, home: ?[]const u8) !u64 {
+    pub fn load(alloc: std.mem.Allocator, io: std.Io, home: ?[]const u8) !u64 {
         const h = home orelse return error.NoHome;
         const path = try std.fs.path.join(alloc, &.{ h, state_rel });
         defer alloc.free(path);
-        const file = std.fs.openFileAbsolute(path, .{}) catch return 0;
-        defer file.close();
-        const raw = try file.readToEndAlloc(alloc, 4096);
+        const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return 0;
+        defer file.close(io);
+        var buf: [4096]u8 = undefined;
+        var reader = file.readerStreaming(io, &buf);
+        const raw = try reader.interface.allocRemaining(alloc, .limited(4096));
         defer alloc.free(raw);
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
         defer parsed.deinit();
@@ -385,11 +396,11 @@ pub const GenerationState = struct {
         };
     }
 
-    pub fn store(alloc: std.mem.Allocator, gen: u64, home: ?[]const u8) !void {
+    pub fn store(alloc: std.mem.Allocator, io: std.Io, gen: u64, home: ?[]const u8) !void {
         const h = home orelse return error.NoHome;
         const dir_path = try std.fs.path.join(alloc, &.{ h, ".pz" });
         defer alloc.free(dir_path);
-        std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        std.Io.Dir.createDirAbsolute(io, dir_path, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -397,16 +408,21 @@ pub const GenerationState = struct {
         defer alloc.free(path);
         var buf: [64]u8 = undefined;
         const payload = std.fmt.bufPrint(&buf, "{{\"generation\":{d}}}", .{gen}) catch return error.InvalidPolicy;
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(payload);
+        const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+        defer file.close(io);
+        var write_buf: [256]u8 = undefined;
+        var writer = file.writerStreaming(io, &write_buf);
+        try writer.interface.writeAll(payload);
+        try writer.interface.flush();
     }
 
     /// Load from an explicit path (for testing without HOME).
-    pub fn loadFrom(alloc: std.mem.Allocator, path: []const u8) !u64 {
-        const file = std.fs.openFileAbsolute(path, .{}) catch return 0;
-        defer file.close();
-        const raw = try file.readToEndAlloc(alloc, 4096);
+    pub fn loadFrom(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !u64 {
+        const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return 0;
+        defer file.close(io);
+        var buf: [4096]u8 = undefined;
+        var reader = file.readerStreaming(io, &buf);
+        const raw = try reader.interface.allocRemaining(alloc, .limited(4096));
         defer alloc.free(raw);
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
         defer parsed.deinit();
@@ -419,12 +435,15 @@ pub const GenerationState = struct {
     }
 
     /// Store to an explicit path (for testing without HOME).
-    pub fn storeTo(path: []const u8, gen: u64) !void {
+    pub fn storeTo(io: std.Io, path: []const u8, gen: u64) !void {
         var buf: [64]u8 = undefined;
         const payload = std.fmt.bufPrint(&buf, "{{\"generation\":{d}}}", .{gen}) catch return error.InvalidPolicy;
-        const file = try std.fs.createFileAbsolute(path, .{});
-        defer file.close();
-        try file.writeAll(payload);
+        const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+        defer file.close(io);
+        var write_buf: [256]u8 = undefined;
+        var writer = file.writerStreaming(io, &write_buf);
+        try writer.interface.writeAll(payload);
+        try writer.interface.flush();
     }
 };
 
@@ -467,12 +486,12 @@ pub const LoadError = error{
 /// Verify a signed policy bundle against the build-time trusted public key.
 /// Checks expiry (not_after) and generation rollback against stored state.
 /// Returns the parsed SignedDoc on success; caller must deinitSignedDoc.
-pub fn verifySignedPolicy(alloc: std.mem.Allocator, raw: []const u8, home: ?[]const u8) VerifyError!SignedDoc {
-    return verifySignedPolicyAt(alloc, raw, std.time.timestamp(), home);
+pub fn verifySignedPolicy(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, home: ?[]const u8) VerifyError!SignedDoc {
+    return verifySignedPolicyAt(alloc, io, raw, std.Io.Clock.real.now(io).toSeconds(), home);
 }
 
 /// Like verifySignedPolicy but accepts an explicit wall-clock for testing.
-pub fn verifySignedPolicyAt(alloc: std.mem.Allocator, raw: []const u8, now: i64, home: ?[]const u8) VerifyError!SignedDoc {
+pub fn verifySignedPolicyAt(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, now: i64, home: ?[]const u8) VerifyError!SignedDoc {
     const signed = parseSignedDoc(alloc, raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MissingSignature => return error.MissingSignature,
@@ -488,12 +507,12 @@ pub fn verifySignedPolicyAt(alloc: std.mem.Allocator, raw: []const u8, now: i64,
     }
 
     // Generation rollback check
-    const stored_gen = GenerationState.load(alloc, home) catch 0;
+    const stored_gen = GenerationState.load(alloc, io, home) catch 0;
     if (signed.doc.generation < stored_gen) return error.GenerationRollback;
 
     // Persist new high-water mark
     if (signed.doc.generation > stored_gen) {
-        GenerationState.store(alloc, signed.doc.generation, home) catch return error.GenerationPersistFailed;
+        GenerationState.store(alloc, io, signed.doc.generation, home) catch return error.GenerationPersistFailed;
     }
 
     return signed;
@@ -739,9 +758,9 @@ pub fn parseSignedDoc(alloc: std.mem.Allocator, json: []const u8) !SignedDoc {
 
 /// Serialize a policy document to JSON.
 pub fn encodeDoc(alloc: std.mem.Allocator, doc: Doc) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+    const w = &buf.writer;
 
     try w.writeAll("{\"version\":");
     try w.print("{d}", .{doc.version});
@@ -816,7 +835,7 @@ pub fn encodeDoc(alloc: std.mem.Allocator, doc: Doc) ![]u8 {
         try w.writeByte('}');
     }
     try w.writeAll("]}");
-    return try buf.toOwnedSlice(alloc);
+    return try buf.toOwnedSlice();
 }
 
 pub fn encodeSignedDoc(alloc: std.mem.Allocator, doc: Doc, kp: signing.KeyPair) ![]u8 {
@@ -830,9 +849,9 @@ pub fn encodeSignedDoc(alloc: std.mem.Allocator, doc: Doc, kp: signing.KeyPair) 
     const kid = signing.keyIdFromPk(pk);
     const kid_hex = std.fmt.bytesToHex(kid, .lower);
 
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(alloc);
-    const w = buf.writer(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+    const w = &buf.writer;
 
     try w.writeAll(payload[0 .. payload.len - 1]);
     try w.writeAll(",\"signature\":{\"alg\":\"ed25519\",\"key_id\":\"");
@@ -842,7 +861,7 @@ pub fn encodeSignedDoc(alloc: std.mem.Allocator, doc: Doc, kp: signing.KeyPair) 
     try w.writeAll("\",\"sig\":\"");
     try w.print("{s}", .{&sig_hex});
     try w.writeAll("\"}}");
-    return try buf.toOwnedSlice(alloc);
+    return try buf.toOwnedSlice();
 }
 
 pub fn hashDoc(alloc: std.mem.Allocator, doc: Doc) ![64]u8 {
@@ -854,7 +873,12 @@ pub fn hashDoc(alloc: std.mem.Allocator, doc: Doc) ![64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-pub fn loadResolved(alloc: std.mem.Allocator, cwd: ?[]const u8, home: ?[]const u8) LoadError!Resolved {
+pub fn loadResolved(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cwd: ?[]const u8,
+    home: ?[]const u8,
+) LoadError!Resolved {
     var docs: [2]?SignedDoc = .{ null, null };
     var doc_n: usize = 0;
     errdefer {
@@ -866,7 +890,7 @@ pub fn loadResolved(alloc: std.mem.Allocator, cwd: ?[]const u8, home: ?[]const u
     if (home) |home_path| {
         const path = try std.fs.path.join(alloc, &.{ home_path, policy_rel_path });
         defer alloc.free(path);
-        if (try loadSignedDocFile(alloc, path, home)) |doc| {
+        if (try loadSignedDocFile(alloc, io, path, home)) |doc| {
             docs[doc_n] = doc;
             doc_n += 1;
         }
@@ -874,7 +898,7 @@ pub fn loadResolved(alloc: std.mem.Allocator, cwd: ?[]const u8, home: ?[]const u
     if (cwd) |cwd_path| {
         const path = try std.fs.path.join(alloc, &.{ cwd_path, policy_rel_path });
         defer alloc.free(path);
-        if (try loadSignedDocFile(alloc, path, home)) |doc| {
+        if (try loadSignedDocFile(alloc, io, path, home)) |doc| {
             docs[doc_n] = doc;
             doc_n += 1;
         }
@@ -939,7 +963,10 @@ pub fn loadResolved(alloc: std.mem.Allocator, cwd: ?[]const u8, home: ?[]const u
     };
     errdefer deinitDoc(alloc, merged);
 
-    const hash_hex = try hashDoc(alloc, merged);
+    const hash_hex = hashDoc(alloc, merged) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPolicy,
+    };
 
     for (docs[0..doc_n]) |maybe_doc| {
         deinitSignedDoc(alloc, maybe_doc.?);
@@ -953,27 +980,34 @@ pub fn loadResolved(alloc: std.mem.Allocator, cwd: ?[]const u8, home: ?[]const u
     };
 }
 
-pub fn loadLock(alloc: std.mem.Allocator, cwd: ?[]const u8, home: ?[]const u8) LoadError!Lock {
-    const resolved = try loadResolved(alloc, cwd, home);
+pub fn loadLock(alloc: std.mem.Allocator, io: std.Io, cwd: ?[]const u8, home: ?[]const u8) LoadError!Lock {
+    const resolved = try loadResolved(alloc, io, cwd, home);
     defer deinitResolved(alloc, resolved);
     return resolved.doc.lock;
 }
 
-fn loadSignedDocFile(alloc: std.mem.Allocator, path: []const u8, home: ?[]const u8) LoadError!?SignedDoc {
+fn loadSignedDocFile(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    home: ?[]const u8,
+) LoadError!?SignedDoc {
     if (!std.fs.path.isAbsolute(path)) return error.InvalidPolicy;
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return error.InvalidPolicy,
     };
-    defer file.close();
+    defer file.close(io);
 
-    const raw = file.readToEndAlloc(alloc, 256 * 1024) catch |err| switch (err) {
+    var buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(io, &buf);
+    const raw = reader.interface.allocRemaining(alloc, .limited(256 * 1024)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidPolicy,
     };
     defer alloc.free(raw);
 
-    return verifySignedPolicyAt(alloc, raw, std.time.timestamp(), home) catch |err| switch (err) {
+    return verifySignedPolicyAt(alloc, io, raw, std.Io.Clock.real.now(io).toSeconds(), home) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.PolicyExpired => return error.PolicyExpired,
         error.GenerationRollback => return error.GenerationRollback,
@@ -990,19 +1024,24 @@ fn dupRule(alloc: std.mem.Allocator, rule: Rule) !Rule {
     };
 }
 
-pub fn loadApprovalBind(alloc: std.mem.Allocator, cwd: ?[]const u8, home: ?[]const u8) LoadError!ApprovalBind {
+pub fn loadApprovalBind(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    cwd: ?[]const u8,
+    home: ?[]const u8,
+) LoadError!ApprovalBind {
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
     var saw = false;
 
     if (home) |home_path| {
         const path = try std.fs.path.join(alloc, &.{ home_path, policy_rel_path });
         defer alloc.free(path);
-        saw = try hashPolicyFile(alloc, &sha, "home", path) or saw;
+        saw = try hashPolicyFile(alloc, io, &sha, "home", path) or saw;
     }
     if (cwd) |cwd_path| {
         const path = try std.fs.path.join(alloc, &.{ cwd_path, policy_rel_path });
         defer alloc.free(path);
-        saw = try hashPolicyFile(alloc, &sha, "cwd", path) or saw;
+        saw = try hashPolicyFile(alloc, io, &sha, "cwd", path) or saw;
     }
     if (!saw) return .{ .version = ver_current };
 
@@ -1015,18 +1054,21 @@ pub fn loadApprovalBind(alloc: std.mem.Allocator, cwd: ?[]const u8, home: ?[]con
 
 fn hashPolicyFile(
     alloc: std.mem.Allocator,
+    io: std.Io,
     sha: *std.crypto.hash.sha2.Sha256,
     tag: []const u8,
     path: []const u8,
 ) LoadError!bool {
     if (!std.fs.path.isAbsolute(path)) return error.InvalidPolicy;
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return error.InvalidPolicy,
     };
-    defer file.close();
+    defer file.close(io);
 
-    const raw = file.readToEndAlloc(alloc, 256 * 1024) catch |err| switch (err) {
+    var buf: [4096]u8 = undefined;
+    var reader = file.readerStreaming(io, &buf);
+    const raw = reader.interface.allocRemaining(alloc, .limited(256 * 1024)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidPolicy,
     };
@@ -1038,7 +1080,10 @@ fn hashPolicyFile(
     };
     defer deinitSignedDoc(alloc, doc);
 
-    const payload = try encodeDoc(alloc, doc.doc);
+    const payload = encodeDoc(alloc, doc.doc) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidPolicy,
+    };
     defer alloc.free(payload);
 
     sha.update(tag);
@@ -1575,7 +1620,7 @@ test "verifySignedPolicy accepts valid bundle" {
     const json = try encodeSignedDoc(testing.allocator, .{ .rules = &rules }, kp);
     defer testing.allocator.free(json);
 
-    const doc = try verifySignedPolicy(testing.allocator, json, null);
+    const doc = try verifySignedPolicy(testing.allocator, testing.io, json, null);
     defer deinitSignedDoc(testing.allocator, doc);
 
     try testing.expectEqual(@as(usize, 1), doc.doc.rules.len);
@@ -1593,7 +1638,7 @@ test "verifySignedPolicy rejects tampered bundle" {
     const idx = std.mem.indexOf(u8, mut, "src/*") orelse return error.TestUnexpectedResult;
     mut[idx] = 'X';
 
-    try testing.expectError(error.SigMismatch, verifySignedPolicy(testing.allocator, mut, null));
+    try testing.expectError(error.SigMismatch, verifySignedPolicy(testing.allocator, testing.io, mut, null));
 }
 
 test "verifySignedPolicy rejects unsigned doc" {
@@ -1601,25 +1646,25 @@ test "verifySignedPolicy rejects unsigned doc" {
     const json = try encodeDoc(testing.allocator, .{ .rules = &rules });
     defer testing.allocator.free(json);
 
-    try testing.expectError(error.MissingSignature, verifySignedPolicy(testing.allocator, json, null));
+    try testing.expectError(error.MissingSignature, verifySignedPolicy(testing.allocator, testing.io, json, null));
 }
 
 test "loadResolved sets locked when signed policy present" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("cwd/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "cwd/.pz");
     const kp = try testKeyPair();
     const raw = try encodeSignedDoc(testing.allocator, .{
         .rules = &.{.{ .pattern = "*", .effect = .allow }},
     }, kp);
     defer testing.allocator.free(raw);
-    try tmp.dir.writeFile(.{ .sub_path = "cwd/.pz/policy.json", .data = raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cwd/.pz/policy.json", .data = raw });
 
-    const cwd = try tmp.dir.realpathAlloc(testing.allocator, "cwd");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, "cwd", testing.allocator);
     defer testing.allocator.free(cwd);
 
-    const resolved = try loadResolved(testing.allocator, cwd, null);
+    const resolved = try loadResolved(testing.allocator, testing.io, cwd, null);
     defer deinitResolved(testing.allocator, resolved);
 
     try testing.expect(resolved.locked);
@@ -1627,7 +1672,7 @@ test "loadResolved sets locked when signed policy present" {
 }
 
 test "loadResolved not locked without policy files" {
-    const resolved = try loadResolved(testing.allocator, null, null);
+    const resolved = try loadResolved(testing.allocator, testing.io, null, null);
     defer deinitResolved(testing.allocator, resolved);
 
     try testing.expect(!resolved.locked);
@@ -1638,8 +1683,8 @@ test "loadResolved rejects unsigned file in lock mode" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("cwd/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "cwd/.pz");
 
     // Home has valid signed policy
     const kp = try testKeyPair();
@@ -1647,21 +1692,21 @@ test "loadResolved rejects unsigned file in lock mode" {
         .rules = &.{.{ .pattern = "*", .effect = .allow }},
     }, kp);
     defer testing.allocator.free(signed);
-    try tmp.dir.writeFile(.{ .sub_path = "home/.pz/policy.json", .data = signed });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pz/policy.json", .data = signed });
 
     // Cwd has unsigned policy - should fail
     const unsigned = try encodeDoc(testing.allocator, .{
         .rules = &.{.{ .pattern = "*.md", .effect = .deny }},
     });
     defer testing.allocator.free(unsigned);
-    try tmp.dir.writeFile(.{ .sub_path = "cwd/.pz/policy.json", .data = unsigned });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cwd/.pz/policy.json", .data = unsigned });
 
-    const home = try tmp.dir.realpathAlloc(testing.allocator, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", testing.allocator);
     defer testing.allocator.free(home);
-    const cwd = try tmp.dir.realpathAlloc(testing.allocator, "cwd");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, "cwd", testing.allocator);
     defer testing.allocator.free(cwd);
 
-    try testing.expectError(error.InvalidPolicy, loadResolved(testing.allocator, cwd, home));
+    try testing.expectError(error.InvalidPolicy, loadResolved(testing.allocator, testing.io, cwd, home));
 }
 
 fn testKeyPair() !signing.KeyPair {
@@ -1672,7 +1717,7 @@ fn testKeyPair() !signing.KeyPair {
 test "loadApprovalBind falls back to version without signed policy" {
     const OhSnap = @import("ohsnap");
     const oh = OhSnap{};
-    const bind = try loadApprovalBind(testing.allocator, null, null);
+    const bind = try loadApprovalBind(testing.allocator, testing.io, null, null);
     defer bind.deinit(testing.allocator);
 
     const Snap = struct {
@@ -1710,11 +1755,11 @@ test "loadApprovalBind hashes verified home and cwd policy docs" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("repo/.pz");
-    const home = try tmp.dir.realpathAlloc(testing.allocator, "home");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "repo/.pz");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", testing.allocator);
     defer testing.allocator.free(home);
-    const repo = try tmp.dir.realpathAlloc(testing.allocator, "repo");
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, "repo", testing.allocator);
     defer testing.allocator.free(repo);
 
     const kp = try testKeyPair();
@@ -1725,18 +1770,18 @@ test "loadApprovalBind hashes verified home and cwd policy docs" {
     defer testing.allocator.free(home_raw);
     const repo_raw_a = try encodeSignedDoc(testing.allocator, .{ .rules = &repo_rules_a }, kp);
     defer testing.allocator.free(repo_raw_a);
-    try tmp.dir.writeFile(.{ .sub_path = "home/.pz/policy.json", .data = home_raw });
-    try tmp.dir.writeFile(.{ .sub_path = "repo/.pz/policy.json", .data = repo_raw_a });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pz/policy.json", .data = home_raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.pz/policy.json", .data = repo_raw_a });
 
-    const bind_a = try loadApprovalBind(testing.allocator, repo, home);
+    const bind_a = try loadApprovalBind(testing.allocator, testing.io, repo, home);
     defer bind_a.deinit(testing.allocator);
 
     const repo_rules_b = [_]Rule{.{ .pattern = "*.txt", .effect = .deny }};
     const repo_raw_b = try encodeSignedDoc(testing.allocator, .{ .rules = &repo_rules_b }, kp);
     defer testing.allocator.free(repo_raw_b);
-    try tmp.dir.writeFile(.{ .sub_path = "repo/.pz/policy.json", .data = repo_raw_b });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.pz/policy.json", .data = repo_raw_b });
 
-    const bind_b = try loadApprovalBind(testing.allocator, repo, home);
+    const bind_b = try loadApprovalBind(testing.allocator, testing.io, repo, home);
     defer bind_b.deinit(testing.allocator);
 
     const Snap = struct {
@@ -1786,8 +1831,8 @@ test "loadResolved merges verified bundles and hashes effective doc" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("cwd/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "cwd/.pz");
 
     const kp = try testKeyPair();
     const home_raw = try encodeSignedDoc(testing.allocator, .{
@@ -1798,7 +1843,7 @@ test "loadResolved merges verified bundles and hashes effective doc" {
         .lock = .{ .cfg = true },
     }, kp);
     defer testing.allocator.free(home_raw);
-    try tmp.dir.writeFile(.{ .sub_path = "home/.pz/policy.json", .data = home_raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pz/policy.json", .data = home_raw });
 
     const cwd_raw = try encodeSignedDoc(testing.allocator, .{
         .rules = &.{
@@ -1808,14 +1853,14 @@ test "loadResolved merges verified bundles and hashes effective doc" {
         .lock = .{ .cli = true },
     }, kp);
     defer testing.allocator.free(cwd_raw);
-    try tmp.dir.writeFile(.{ .sub_path = "cwd/.pz/policy.json", .data = cwd_raw });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cwd/.pz/policy.json", .data = cwd_raw });
 
-    const home_abs = try tmp.dir.realpathAlloc(testing.allocator, "home");
+    const home_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "home", testing.allocator);
     defer testing.allocator.free(home_abs);
-    const cwd_abs = try tmp.dir.realpathAlloc(testing.allocator, "cwd");
+    const cwd_abs = try tmp.dir.realPathFileAlloc(std.testing.io, "cwd", testing.allocator);
     defer testing.allocator.free(cwd_abs);
 
-    const resolved = try loadResolved(testing.allocator, cwd_abs, home_abs);
+    const resolved = try loadResolved(testing.allocator, testing.io, cwd_abs, home_abs);
     defer deinitResolved(testing.allocator, resolved);
 
     const Snap = struct {
@@ -1866,7 +1911,7 @@ test "loadResolved merges verified bundles and hashes effective doc" {
 test "loadResolved returns stable empty effective hash" {
     const OhSnap = @import("ohsnap");
     const oh = OhSnap{};
-    const resolved = try loadResolved(testing.allocator, null, null);
+    const resolved = try loadResolved(testing.allocator, testing.io, null, null);
     defer deinitResolved(testing.allocator, resolved);
 
     const Snap = struct {
@@ -1914,7 +1959,7 @@ const empty_eff_hash = "6be6bac38f2d35217ca3cd98e36322f9e8fb6638564f5a87ff660589
 // ── Snapshot tests (ohsnap) ────────────────────────────────────────────
 
 fn snapEsc(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
 
     for (s) |c| switch (c) {
@@ -2195,9 +2240,9 @@ test "property: empty effective hash and bind stay stable" {
     const zc = @import("zcheck");
     try zc.check(struct {
         fn prop(_: struct { n: u8 }) bool {
-            const a = loadResolved(testing.allocator, null, null) catch return false;
+            const a = loadResolved(testing.allocator, testing.io, null, null) catch return false;
             defer deinitResolved(testing.allocator, a);
-            const b = loadResolved(testing.allocator, null, null) catch return false;
+            const b = loadResolved(testing.allocator, testing.io, null, null) catch return false;
             defer deinitResolved(testing.allocator, b);
 
             if (a.has_files or b.has_files) return false;
@@ -2231,22 +2276,22 @@ test "property: evaluate runtime tool rules honors exact tool filters" {
 }
 
 test "network policy blocks local and private ranges" {
-    try testing.expect(isBlockedNetAddr(std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 443)));
-    try testing.expect(isBlockedNetAddr(std.net.Address.initIp4(.{ 10, 1, 2, 3 }, 443)));
-    try testing.expect(isBlockedNetAddr(std.net.Address.initIp4(.{ 172, 16, 1, 9 }, 443)));
-    try testing.expect(isBlockedNetAddr(std.net.Address.initIp4(.{ 192, 168, 4, 5 }, 443)));
-    try testing.expect(isBlockedNetAddr(std.net.Address.initIp4(.{ 169, 254, 2, 9 }, 443)));
-    try testing.expect(isBlockedNetAddr(std.net.Address.initIp6(.{0} ** 15 ++ .{1}, 443, 0, 0)));
-    try testing.expect(isBlockedNetAddr(std.net.Address.initIp6(.{ 0xfe, 0x80 } ++ .{0} ** 14, 443, 0, 0)));
-    try testing.expect(isBlockedNetAddr(std.net.Address.initIp6(.{ 0xfc, 0 } ++ .{0} ** 14, 443, 0, 0)));
+    try testing.expect(isBlockedNetAddr(netIp4(.{ 127, 0, 0, 1 }, 443)));
+    try testing.expect(isBlockedNetAddr(netIp4(.{ 10, 1, 2, 3 }, 443)));
+    try testing.expect(isBlockedNetAddr(netIp4(.{ 172, 16, 1, 9 }, 443)));
+    try testing.expect(isBlockedNetAddr(netIp4(.{ 192, 168, 4, 5 }, 443)));
+    try testing.expect(isBlockedNetAddr(netIp4(.{ 169, 254, 2, 9 }, 443)));
+    try testing.expect(isBlockedNetAddr(netIp6(.{0} ** 15 ++ .{1}, 443)));
+    try testing.expect(isBlockedNetAddr(netIp6(.{ 0xfe, 0x80 } ++ .{0} ** 14, 443)));
+    try testing.expect(isBlockedNetAddr(netIp6(.{ 0xfc, 0 } ++ .{0} ** 14, 443)));
 }
 
 test "network policy allows public addresses" {
-    try testing.expect(!isBlockedNetAddr(std.net.Address.initIp4(.{ 34, 117, 59, 81 }, 443)));
-    try testing.expect(!isBlockedNetAddr(std.net.Address.initIp6(.{
+    try testing.expect(!isBlockedNetAddr(netIp4(.{ 34, 117, 59, 81 }, 443)));
+    try testing.expect(!isBlockedNetAddr(netIp6(.{
         0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0,    0,
         0,    0,    0,    0,    0,    0,    0x88, 0x88,
-    }, 443, 0, 0)));
+    }, 443)));
 }
 
 test "ApprovalBind hash dupe preserves payload" {
@@ -2299,8 +2344,8 @@ test "signed deny cannot be weakened by unsigned allow" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("home/.pz");
-    try tmp.dir.makePath("cwd/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "cwd/.pz");
 
     // Home: signed policy with deny *
     const kp = try testKeyPair();
@@ -2308,25 +2353,25 @@ test "signed deny cannot be weakened by unsigned allow" {
         .rules = &.{.{ .pattern = "*", .effect = .deny }},
     }, kp);
     defer testing.allocator.free(signed);
-    try tmp.dir.writeFile(.{ .sub_path = "home/.pz/policy.json", .data = signed });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pz/policy.json", .data = signed });
 
     // Cwd: unsigned policy with allow * — should be rejected (unsigned in signed context)
     const unsigned = try encodeDoc(testing.allocator, .{
         .rules = &.{.{ .pattern = "*", .effect = .allow }},
     });
     defer testing.allocator.free(unsigned);
-    try tmp.dir.writeFile(.{ .sub_path = "cwd/.pz/policy.json", .data = unsigned });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cwd/.pz/policy.json", .data = unsigned });
 
-    const home = try tmp.dir.realpathAlloc(testing.allocator, "home");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, "home", testing.allocator);
     defer testing.allocator.free(home);
-    const cwd = try tmp.dir.realpathAlloc(testing.allocator, "cwd");
+    const cwd = try tmp.dir.realPathFileAlloc(std.testing.io, "cwd", testing.allocator);
     defer testing.allocator.free(cwd);
 
     // Unsigned cwd policy fails to load alongside signed home policy
-    try testing.expectError(error.InvalidPolicy, loadResolved(testing.allocator, cwd, home));
+    try testing.expectError(error.InvalidPolicy, loadResolved(testing.allocator, testing.io, cwd, home));
 
     // Even if only home is loaded, deny * still denies everything
-    const resolved = try loadResolved(testing.allocator, null, home);
+    const resolved = try loadResolved(testing.allocator, testing.io, null, home);
     defer deinitResolved(testing.allocator, resolved);
 
     try testing.expectEqual(Effect.deny, evaluate(resolved.doc.rules, "any/path.zig", null));
@@ -2512,7 +2557,7 @@ test "expired policy rejected" {
     defer testing.allocator.free(json);
 
     // now=2000 > not_after=1000 → expired
-    try testing.expectError(error.PolicyExpired, verifySignedPolicyAt(testing.allocator, json, 2000, null));
+    try testing.expectError(error.PolicyExpired, verifySignedPolicyAt(testing.allocator, testing.io, json, 2000, null));
 }
 
 test "fresh policy accepted before expiry" {
@@ -2523,7 +2568,7 @@ test "fresh policy accepted before expiry" {
     defer testing.allocator.free(json);
 
     // now=3000 < not_after=5000 → accepted
-    const signed = try verifySignedPolicyAt(testing.allocator, json, 3000, null);
+    const signed = try verifySignedPolicyAt(testing.allocator, testing.io, json, 3000, null);
     defer deinitSignedDoc(testing.allocator, signed);
     try testing.expectEqual(@as(u64, 0), signed.doc.generation);
     try testing.expectEqual(@as(i64, 5000), signed.doc.not_after.?);
@@ -2534,24 +2579,24 @@ test "generation rollback rejected via GenerationState" {
     defer tmp.cleanup();
 
     // Write a state file with generation=10
-    try tmp.dir.makePath(".pz");
-    try tmp.dir.writeFile(.{ .sub_path = ".pz/policy-state.json", .data = "{\"generation\":10}" });
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".pz/policy-state.json", .data = "{\"generation\":10}" });
 
-    const state_path = try tmp.dir.realpathAlloc(testing.allocator, ".pz/policy-state.json");
+    const state_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".pz/policy-state.json", testing.allocator);
     defer testing.allocator.free(state_path);
 
     // Verify stored generation reads correctly
-    const gen = try GenerationState.loadFrom(testing.allocator, state_path);
+    const gen = try GenerationState.loadFrom(testing.allocator, testing.io, state_path);
     try testing.expectEqual(@as(u64, 10), gen);
 
     // Store a higher generation, verify it persists
-    try GenerationState.storeTo(state_path, 20);
-    const gen2 = try GenerationState.loadFrom(testing.allocator, state_path);
+    try GenerationState.storeTo(testing.io, state_path, 20);
+    const gen2 = try GenerationState.loadFrom(testing.allocator, testing.io, state_path);
     try testing.expectEqual(@as(u64, 20), gen2);
 }
 
 test "GenerationState loadFrom missing file returns 0" {
-    const gen = try GenerationState.loadFrom(testing.allocator, "/tmp/nonexistent-pz-policy-state.json");
+    const gen = try GenerationState.loadFrom(testing.allocator, testing.io, "/tmp/nonexistent-pz-policy-state.json");
     try testing.expectEqual(@as(u64, 0), gen);
 }
 

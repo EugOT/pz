@@ -2,10 +2,10 @@
 const std = @import("std");
 
 pub fn resultAlloc(alloc: std.mem.Allocator, res: anytype) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
 
-    const w = buf.writer(alloc);
+    const w = &buf.writer;
     try w.print("call={s}\nstart={}\nend={}\nout={}\n", .{
         res.call_id,
         res.started_at_ms,
@@ -26,13 +26,13 @@ pub fn resultAlloc(alloc: std.mem.Allocator, res: anytype) ![]u8 {
     try w.print("final={s}", .{@tagName(std.meta.activeTag(res.final))});
     switch (res.final) {
         .ok => |ok| try w.print("|{d}\n", .{ok.code}),
-        .failed => |failed| try w.print("|{s}|{s}|{}\n", .{
+        .failed => |failed| try w.print("|{s}|{s}|{?}\n", .{
             @tagName(failed.kind),
             failed.msg,
-            .{failed.code},
+            failed.code,
         }),
         .cancelled => |cancelled| try w.print("|{s}\n", .{@tagName(cancelled.reason)}),
         .timed_out => |timed_out| try w.print("|{d}\n", .{timed_out.limit_ms}),
     }
-    return buf.toOwnedSlice(alloc);
+    return try buf.toOwnedSlice();
 }

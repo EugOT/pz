@@ -2,11 +2,23 @@
     .name = .pz,
     .version = "0.1.8",
     .fingerprint = 0xde36f32b1b6b5635, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.16.0-dev.3142+5ccfeb926",
     .dependencies = .{
         .ohsnap = .{
-            .url = "https://github.com/mnemnion/ohsnap/archive/refs/tags/v0.4.2.tar.gz",
-            .hash = "ohsnap-0.4.2-iWxzyiGcAAAbUPJG3B6agP55LfeqGbtTOQ4PcgSGUb9-",
+            .url = "https://github.com/mnemnion/ohsnap/archive/refs/tags/v0.5.2.tar.gz",
+            .hash = "ohsnap-0.5.1-iWxzykCqAACOZm_M12yHTooq6IC4YrtKGoXzpcw629ct",
+        },
+        .pretty = .{
+            .url = "https://github.com/mnemnion/pretty/archive/refs/tags/zig0.16-shim-compat.tar.gz",
+            .hash = "pretty-0.10.6-Tm65ryN7AQD8lWCN6fUG-yCYLiqo_4Zwq8lFjFln2qw3",
+        },
+        .muad_diff = .{
+            .url = "https://github.com/mnemnion/muad-diff/archive/refs/tags/zig0.16-shim.tar.gz",
+            .hash = "muad_diff-0.0.1-p0-XobS2TgLOmAh3hjEU1k_MdmIeISn2y0U6tYibF4EW",
+        },
+        .mvzr = .{
+            .url = "https://github.com/mnemnion/mvzr/archive/refs/tags/v0.3.9.tar.gz",
+            .hash = "mvzr-0.3.9-ZSOky_lvAQDe3gx6pFgM_NG-jl9NO_83u5OI1MF8-2PC",
         },
         .zcheck = .{
             .url = "https://github.com/joelreymont/zcheck/archive/refs/heads/master.tar.gz",

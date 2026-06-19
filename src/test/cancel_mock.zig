@@ -24,7 +24,11 @@ pub const DelayTrip = struct {
     delay_ms: u64,
 
     pub fn run(self: *DelayTrip) void {
-        std.Thread.sleep(self.delay_ms * std.time.ns_per_ms);
+        std.Io.sleep(
+            std.Io.Threaded.global_single_threaded.io(),
+            .fromMilliseconds(@intCast(self.delay_ms)),
+            .awake,
+        ) catch return;
         self.flag.request();
     }
 };
