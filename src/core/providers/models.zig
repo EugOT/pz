@@ -16,20 +16,13 @@
 //!     callers may substitute them at request-build time. null means "use the
 //!     provider default from registry.zig" — never a silent host guess.
 const std = @import("std");
+const reg = @import("registry.zig");
 
-/// Canonical model-provider identity. Mirrors `registry.ProviderTag` so a model
-/// row can name any supported provider, not just the original two. The first
-/// two tags keep their original ordinal so existing `Provider.anthropic` /
-/// `Provider.openai` comparisons stay valid.
-pub const Provider = enum {
-    anthropic,
-    openai,
-    openrouter,
-    google,
-    mistral,
-    groq,
-    deepseek,
-};
+/// Canonical model-provider identity. Aliased to `registry.ProviderTag` so the
+/// provider tag has a single source of truth across auth + models. Avoids two
+/// structurally-identical enums whose ordinals coincide by accident — a
+/// cross-typed `@intFromEnum` cast would otherwise silently mis-map providers.
+pub const Provider = reg.ProviderTag;
 
 pub const ModelInfo = struct {
     name: []const u8,
@@ -131,12 +124,12 @@ pub fn findModel(name: []const u8) ?ModelInfo {
             best_len = m.name.len;
         }
     }
-    if (best != null) return best;
-    // Fallback: substring match (e.g. model contains "opus").
-    for (&registry) |*m| {
-        if (std.mem.indexOf(u8, name, m.name) != null) return m.*;
-    }
-    return null;
+    // Longest exact-prefix match only. No substring fallback: a flat namespace
+    // mixing provider-prefixed slugs (`anthropic/claude-sonnet-4`) with bare
+    // names (`claude-sonnet-4`) makes substring matching route to whichever row
+    // appears first in iteration order — i.e. the wrong provider. Safe failure
+    // (null) beats a silent mis-route; provider-scoped lookup lands in MP7.
+    return best;
 }
 
 pub fn contextWindow(name: []const u8) ?u32 {
