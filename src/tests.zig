@@ -48,4 +48,5 @@ comptime {
     _ = @import("test/api_e2e.zig");
     _ = @import("test/helpers.zig");
     _ = @import("test/tui_ast.zig");
+    _ = @import("test/provider_registry_test.zig");
 }
