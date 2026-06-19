@@ -1,5 +1,6 @@
 //! Provider API: request, event, and stream types.
 const std = @import("std");
+const registry = @import("registry.zig");
 const testing = std.testing;
 
 pub const Role = enum {
@@ -16,6 +17,67 @@ pub const Request = struct {
     tools: []const Tool = &.{},
     opts: Opts = .{},
 };
+
+// ── Provider dispatch (MP5) ─────────────────────────────────────────────────
+// A request must name exactly one provider, either explicitly via
+// `Request.provider` or implicitly via a `<model>:<provider>` model suffix.
+// The explicit field wins; the suffix is read only when the field is null.
+// There is NO silent fallback to a default provider: an absent or unknown
+// provider is a named, propagated error.
+
+/// Errors raised while resolving the provider a request targets.
+/// Named set (no `anyerror`): callers handle each case explicitly.
+pub const DispatchError = error{
+    /// Neither `Request.provider` nor a `model:provider` suffix was present.
+    NoProvider,
+    /// The named provider is not registered (registry.resolveProvider miss).
+    UnknownProvider,
+};
+
+/// A model string split into its bare model id and an optional provider tail.
+/// `"claude-sonnet-4:anthropic"` → `.{ .model = "claude-sonnet-4", .suffix = "anthropic" }`.
+/// `"gpt-5"` → `.{ .model = "gpt-5", .suffix = null }`.
+pub const ModelSpec = struct {
+    /// Model id with any `:provider` tail stripped.
+    model: []const u8,
+    /// Provider name parsed from the tail, or null when absent.
+    suffix: ?[]const u8,
+};
+
+/// Split a model string on its last `:` into model id + provider suffix.
+/// Pure and allocation-free: the returned slices alias `model`. A trailing or
+/// leading empty side yields a null suffix / unchanged model rather than an
+/// empty token, so `"m:"` and `":p"` never produce a zero-length provider.
+pub fn parseModelSpec(model: []const u8) ModelSpec {
+    const sep = std.mem.lastIndexOfScalar(u8, model, ':') orelse
+        return .{ .model = model, .suffix = null };
+    const head = model[0..sep];
+    const tail = model[sep + 1 ..];
+    if (head.len == 0 or tail.len == 0)
+        return .{ .model = model, .suffix = null };
+    return .{ .model = head, .suffix = tail };
+}
+
+/// The provider a request resolves to, plus the bare model id to send.
+pub const Dispatch = struct {
+    /// Registered provider name (a valid `registry.resolveProvider` key).
+    provider: []const u8,
+    /// Model id with any `:provider` suffix stripped.
+    model: []const u8,
+    /// Static registry metadata for the resolved provider.
+    info: registry.ProviderInfo,
+};
+
+/// Resolve which provider a request targets and validate it against the
+/// registry. Explicit `Request.provider` wins over a `model:provider` suffix.
+/// Returns a named error (never a silent default) when no provider is named or
+/// the named provider is unknown. Allocation-free: result slices alias `req`.
+pub fn resolveDispatch(req: Request) DispatchError!Dispatch {
+    const spec = parseModelSpec(req.model);
+    const name = req.provider orelse spec.suffix orelse return error.NoProvider;
+    const info = registry.resolveProvider(name) orelse return error.UnknownProvider;
+    return .{ .provider = name, .model = spec.model, .info = info };
+}
 
 pub const Msg = struct {
     role: Role,
@@ -395,6 +457,74 @@ pub const Stream = struct {
         };
     }
 };
+
+test "parseModelSpec splits on last colon into model and provider suffix" {
+    const spec = parseModelSpec("claude-sonnet-4:anthropic");
+    try testing.expectEqualStrings("claude-sonnet-4", spec.model);
+    try testing.expectEqualStrings("anthropic", spec.suffix.?);
+}
+
+test "parseModelSpec uses the last colon so model ids may contain colons" {
+    const spec = parseModelSpec("ns:model:openrouter");
+    try testing.expectEqualStrings("ns:model", spec.model);
+    try testing.expectEqualStrings("openrouter", spec.suffix.?);
+}
+
+test "parseModelSpec returns null suffix when no colon present" {
+    const spec = parseModelSpec("gpt-5");
+    try testing.expectEqualStrings("gpt-5", spec.model);
+    try testing.expect(spec.suffix == null);
+}
+
+test "parseModelSpec rejects empty tail or empty head (no zero-length token)" {
+    const trailing = parseModelSpec("m:");
+    try testing.expectEqualStrings("m:", trailing.model);
+    try testing.expect(trailing.suffix == null);
+
+    const leading = parseModelSpec(":p");
+    try testing.expectEqualStrings(":p", leading.model);
+    try testing.expect(leading.suffix == null);
+}
+
+test "resolveDispatch routes by explicit Request.provider field" {
+    const req: Request = .{ .model = "claude-sonnet-4", .provider = "anthropic", .msgs = &.{} };
+    const d = try resolveDispatch(req);
+    try testing.expectEqualStrings("anthropic", d.provider);
+    try testing.expectEqualStrings("claude-sonnet-4", d.model);
+    try testing.expectEqual(registry.ProviderTag.anthropic, d.info.provider_tag);
+}
+
+test "resolveDispatch routes by model suffix when provider field is null" {
+    const req: Request = .{ .model = "gpt-5:openai", .msgs = &.{} };
+    const d = try resolveDispatch(req);
+    try testing.expectEqualStrings("openai", d.provider);
+    try testing.expectEqualStrings("gpt-5", d.model);
+    try testing.expectEqual(registry.ProviderTag.openai, d.info.provider_tag);
+}
+
+test "resolveDispatch explicit provider field wins over model suffix" {
+    // Suffix says openai, but the explicit field selects openrouter.
+    const req: Request = .{ .model = "gpt-5:openai", .provider = "openrouter", .msgs = &.{} };
+    const d = try resolveDispatch(req);
+    try testing.expectEqualStrings("openrouter", d.provider);
+    // Suffix is still stripped from the model id sent to the backend.
+    try testing.expectEqualStrings("gpt-5", d.model);
+}
+
+test "resolveDispatch rejects unknown provider with named error (no fallback)" {
+    const req: Request = .{ .model = "m", .provider = "not-a-provider", .msgs = &.{} };
+    try testing.expectError(error.UnknownProvider, resolveDispatch(req));
+}
+
+test "resolveDispatch rejects unknown provider in model suffix" {
+    const req: Request = .{ .model = "m:nope", .msgs = &.{} };
+    try testing.expectError(error.UnknownProvider, resolveDispatch(req));
+}
+
+test "resolveDispatch errors when no provider is named (no silent default)" {
+    const req: Request = .{ .model = "bare-model", .msgs = &.{} };
+    try testing.expectError(error.NoProvider, resolveDispatch(req));
+}
 
 test "StopReason.rank returns priority order" {
     try testing.expectEqual(@as(u8, 0), StopReason.done.rank());
