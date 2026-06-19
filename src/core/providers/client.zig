@@ -220,9 +220,14 @@ pub const Router = struct {
         // Resolve + validate the target provider (named errors, no fallback).
         const dispatch = try providers.resolveDispatch(req);
         const backend = self.cfg.resolve(dispatch.provider) orelse return error.NoBackend;
-        // Forward the original request: the single wire allocation happens
-        // inside the backend's start; the router copies nothing.
-        return backend.start(req);
+        // Forward the request with the `:provider` suffix stripped from the
+        // model id. The backend serializes `req.model` straight to the wire, so
+        // it must receive the bare model (`gpt-5`), never the dispatch spec
+        // (`gpt-5:openai`). `dispatch.model` is a slice into the original model
+        // string — this copy adds no allocation.
+        var fwd = req;
+        fwd.model = dispatch.model;
+        return backend.start(fwd);
     }
 };
 
@@ -1076,10 +1081,10 @@ test "router dispatches by model suffix and forwards the bare model id" {
     var s = try router.provider.start(.{ .model = "gpt-5:openai", .msgs = &.{} });
     defer s.deinit();
     try std.testing.expectEqualStrings("O", try drainTag(s));
-    // Suffix stripped from model id, but the original (unmodified) request is
-    // forwarded; the resolver strips the suffix only in Dispatch.model. Here we
-    // assert the backend saw the full request model — the router copies nothing.
-    try std.testing.expectEqualStrings("gpt-5:openai", openai.seen_model);
+    // The `:openai` suffix selects the backend AND is stripped from the model
+    // before forwarding — the backend serializes `req.model` to the wire, so it
+    // must see the bare `gpt-5`, not the dispatch spec `gpt-5:openai`.
+    try std.testing.expectEqualStrings("gpt-5", openai.seen_model);
     try std.testing.expectEqual(@as(usize, 0), anthropic.started);
 }
 
