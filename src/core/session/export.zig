@@ -6,6 +6,7 @@ const fs_secure = @import("../fs_secure.zig");
 const reader_mod = @import("reader.zig");
 const sid_path = @import("path.zig");
 const core_time = @import("../time.zig");
+const Event = reader_mod.Event;
 const Dir = std.Io.Dir;
 const File = std.Io.File;
 
@@ -23,6 +24,17 @@ pub const AuditHooks = struct {
     now_ms: *const fn () i64 = nowMs,
 };
 
+/// Caller-supplied session metadata rendered into the export header.
+/// All fields are optional; an empty `Meta` reproduces the legacy output.
+pub const Meta = struct {
+    title: ?[]const u8 = null,
+    tags: []const []const u8 = &.{},
+    notes: ?[]const u8 = null,
+};
+
+/// Output document format selected by the export entry point.
+const Format = enum { markdown, html };
+
 /// Export a session to markdown.
 /// Returns the absolute path to the written file (caller owns).
 pub fn toMarkdown(
@@ -31,7 +43,7 @@ pub fn toMarkdown(
     sid: []const u8,
     out_path: ?[]const u8,
 ) ![]u8 {
-    return toMarkdownWith(alloc, dir, sid, out_path, .{});
+    return exportWith(alloc, dir, sid, out_path, .markdown, .{}, .{});
 }
 
 pub fn toMarkdownAudited(
@@ -41,14 +53,52 @@ pub fn toMarkdownAudited(
     out_path: ?[]const u8,
     hooks: AuditHooks,
 ) ![]u8 {
-    return toMarkdownWith(alloc, dir, sid, out_path, hooks);
+    return exportWith(alloc, dir, sid, out_path, .markdown, .{}, hooks);
 }
 
-fn toMarkdownWith(
+/// Export a session to markdown with a header built from `meta`
+/// (title/tags/notes are rendered only when present).
+pub fn toMarkdownMeta(
     alloc: std.mem.Allocator,
     dir: Dir,
     sid: []const u8,
     out_path: ?[]const u8,
+    meta: Meta,
+) ![]u8 {
+    return exportWith(alloc, dir, sid, out_path, .markdown, meta, .{});
+}
+
+/// Export a session to a self-contained HTML5 document. Metadata is
+/// placed in `<head>`; the transcript is rendered into `<body>`.
+/// Returns the absolute path to the written file (caller owns).
+pub fn toHtml(
+    alloc: std.mem.Allocator,
+    dir: Dir,
+    sid: []const u8,
+    out_path: ?[]const u8,
+    meta: Meta,
+) ![]u8 {
+    return exportWith(alloc, dir, sid, out_path, .html, meta, .{});
+}
+
+pub fn toHtmlAudited(
+    alloc: std.mem.Allocator,
+    dir: Dir,
+    sid: []const u8,
+    out_path: ?[]const u8,
+    meta: Meta,
+    hooks: AuditHooks,
+) ![]u8 {
+    return exportWith(alloc, dir, sid, out_path, .html, meta, hooks);
+}
+
+fn exportWith(
+    alloc: std.mem.Allocator,
+    dir: Dir,
+    sid: []const u8,
+    out_path: ?[]const u8,
+    format: Format,
+    meta: Meta,
     hooks: AuditHooks,
 ) ![]u8 {
     // Determine output path (resolve relative to cwd) before streaming.
@@ -60,7 +110,11 @@ fn toMarkdownWith(
         defer alloc.free(cwd);
         break :blk try std.fs.path.join(alloc, &.{ cwd, p });
     } else blk: {
-        const fname = try sid_path.sidExtAlloc(alloc, sid, ".md");
+        const ext: []const u8 = switch (format) {
+            .markdown => ".md",
+            .html => ".html",
+        };
+        const fname = try sid_path.sidExtAlloc(alloc, sid, ext);
         defer alloc.free(fname);
         // Write next to the session directory
         const real = try dir.realPathFileAlloc(defaultIo(), ".", alloc);
@@ -89,11 +143,13 @@ fn toMarkdownWith(
         },
     });
 
-    // Stream markdown incrementally via atomic temp file.
+    // Stream the document incrementally via atomic temp file.
     var stream_ctx = StreamCtx{
         .alloc = alloc,
         .session_dir = dir,
         .sid = sid,
+        .format = format,
+        .meta = meta,
     };
     atomicExportStream(dest, &stream_ctx, StreamCtx.write) catch |err| {
         try emitAudit(alloc, hooks, exportOutcomeAudit(sid, dest, hooks.now_ms(), .fail, @errorName(err)));
@@ -109,8 +165,17 @@ const StreamCtx = struct {
     alloc: std.mem.Allocator,
     session_dir: Dir,
     sid: []const u8,
+    format: Format = .markdown,
+    meta: Meta = .{},
 
     fn write(self: *StreamCtx, file: File) anyerror!void {
+        switch (self.format) {
+            .markdown => try self.writeMarkdown(file),
+            .html => try self.writeHtml(file),
+        }
+    }
+
+    fn writeMarkdown(self: *StreamCtx, file: File) anyerror!void {
         var rdr = try reader_mod.ReplayReader.init(self.alloc, self.session_dir, self.sid, .{});
         defer rdr.deinit();
 
@@ -118,6 +183,7 @@ const StreamCtx = struct {
         try writeAll(file, "# Session ");
         try writeAll(file, self.sid);
         try writeAll(file, "\n\n");
+        try self.writeMarkdownMeta(file);
 
         while (try rdr.next()) |ev| {
             switch (ev.data) {
@@ -158,6 +224,153 @@ const StreamCtx = struct {
                 },
                 .usage, .stop, .noop => {},
             }
+        }
+    }
+
+    /// Render title/tags/notes into the markdown header, but only the
+    /// fields that are present. Each value is redacted then fenced/escaped.
+    fn writeMarkdownMeta(self: *StreamCtx, file: File) anyerror!void {
+        if (self.meta.title) |title| {
+            try writeAll(file, "**Title:** ");
+            const safe = try redactLossyAlloc(self.alloc, title, .@"pub");
+            defer self.alloc.free(safe);
+            try writeAll(file, safe);
+            try writeAll(file, "\n\n");
+        }
+        if (self.meta.tags.len > 0) {
+            try writeAll(file, "**Tags:** ");
+            for (self.meta.tags, 0..) |tag, i| {
+                if (i > 0) try writeAll(file, ", ");
+                const safe = try redactLossyAlloc(self.alloc, tag, .@"pub");
+                defer self.alloc.free(safe);
+                try writeAll(file, safe);
+            }
+            try writeAll(file, "\n\n");
+        }
+        if (self.meta.notes) |notes| {
+            try writeAll(file, "**Notes:** ");
+            const safe = try redactLossyAlloc(self.alloc, notes, .@"pub");
+            defer self.alloc.free(safe);
+            try writeAll(file, safe);
+            try writeAll(file, "\n\n");
+        }
+    }
+
+    fn writeHtml(self: *StreamCtx, file: File) anyerror!void {
+        try writeAll(file, "<!doctype html>\n<html lang=\"en\">\n<head>\n");
+        try writeAll(file, "<meta charset=\"utf-8\">\n");
+        try writeAll(file, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+
+        // <title>: prefer the supplied meta title, else fall back to sid.
+        try writeAll(file, "<title>");
+        if (self.meta.title) |title| {
+            try writeHtmlEscaped(self.alloc, file, title, .@"pub");
+        } else {
+            try writeHtmlEscaped(self.alloc, file, self.sid, .@"pub");
+        }
+        try writeAll(file, "</title>\n");
+
+        try self.writeHtmlHeadMeta(file);
+
+        try writeAll(file, "</head>\n<body>\n");
+        try writeAll(file, "<h1>Session ");
+        try writeHtmlEscaped(self.alloc, file, self.sid, .@"pub");
+        try writeAll(file, "</h1>\n");
+
+        var rdr = try reader_mod.ReplayReader.init(self.alloc, self.session_dir, self.sid, .{});
+        defer rdr.deinit();
+
+        while (try rdr.next()) |ev| {
+            try self.writeHtmlEvent(file, ev);
+        }
+
+        try writeAll(file, "</body>\n</html>\n");
+    }
+
+    /// Emit `<meta>` elements for session metadata and git provenance.
+    /// Git provenance is read from the first event that carries `git_meta`
+    /// (the values are duped before the next reader pass invalidates them).
+    fn writeHtmlHeadMeta(self: *StreamCtx, file: File) anyerror!void {
+        for (self.meta.tags) |tag| {
+            try writeAll(file, "<meta name=\"keywords\" content=\"");
+            try writeHtmlAttr(self.alloc, file, tag, .@"pub");
+            try writeAll(file, "\">\n");
+        }
+        if (self.meta.notes) |notes| {
+            try writeAll(file, "<meta name=\"description\" content=\"");
+            try writeHtmlAttr(self.alloc, file, notes, .@"pub");
+            try writeAll(file, "\">\n");
+        }
+
+        // First-event scan for git provenance. Dupe the strings so they
+        // survive `rdr.deinit()` and remain valid while we write <head>.
+        var gscan = try reader_mod.ReplayReader.init(self.alloc, self.session_dir, self.sid, .{});
+        var git_meta: ?Event.GitMeta = null;
+        scan: while (try gscan.next()) |ev| {
+            if (ev.git_meta) |gm| {
+                git_meta = .{
+                    .repo = try self.alloc.dupe(u8, gm.repo),
+                    .branch = try self.alloc.dupe(u8, gm.branch),
+                    .commit = try self.alloc.dupe(u8, gm.commit),
+                };
+                break :scan;
+            }
+        }
+        gscan.deinit();
+
+        if (git_meta) |gm| {
+            defer {
+                self.alloc.free(gm.repo);
+                self.alloc.free(gm.branch);
+                self.alloc.free(gm.commit);
+            }
+            try self.writeGitMetaTag(file, "git-repo", gm.repo);
+            try self.writeGitMetaTag(file, "git-branch", gm.branch);
+            try self.writeGitMetaTag(file, "git-commit", gm.commit);
+        }
+    }
+
+    fn writeGitMetaTag(self: *StreamCtx, file: File, name: []const u8, value: []const u8) anyerror!void {
+        try writeAll(file, "<meta name=\"");
+        try writeAll(file, name);
+        try writeAll(file, "\" content=\"");
+        try writeHtmlAttr(self.alloc, file, value, .@"pub");
+        try writeAll(file, "\">\n");
+    }
+
+    fn writeHtmlEvent(self: *StreamCtx, file: File, ev: Event) anyerror!void {
+        switch (ev.data) {
+            .prompt => |p| try writeHtmlSection(self.alloc, file, "user", "User", p.text),
+            .text => |t| try writeHtmlSection(self.alloc, file, "assistant", "Assistant", t.text),
+            .thinking => |t| {
+                try writeAll(file, "<details class=\"thinking\"><summary>Thinking</summary>\n<pre>");
+                try writeHtmlEscaped(self.alloc, file, t.text, .@"pub");
+                try writeAll(file, "</pre>\n</details>\n");
+            },
+            .tool_call => |tc| {
+                try writeAll(file, "<section class=\"tool-call\">\n<h3>Tool: ");
+                try writeHtmlEscaped(self.alloc, file, tc.name, .@"pub");
+                try writeAll(file, "</h3>\n<pre>");
+                try writeHtmlEscaped(self.alloc, file, tc.args, .@"pub");
+                try writeAll(file, "</pre>\n</section>\n");
+            },
+            .tool_result => |tr| {
+                try writeAll(file, if (tr.is_err)
+                    "<section class=\"tool-result error\">\n<h4>Error</h4>\n<pre>"
+                else
+                    "<section class=\"tool-result\">\n<h4>Result</h4>\n<pre>");
+                const max_out = 2000;
+                const raw_out = if (tr.output.len > max_out) tr.output[0..max_out] else tr.output;
+                try writeHtmlEscaped(self.alloc, file, raw_out, .@"pub");
+                if (tr.output.len > max_out) {
+                    const trunc_msg = try std.fmt.allocPrint(self.alloc, "\n... ({d} bytes truncated)", .{tr.output.len - max_out});
+                    defer self.alloc.free(trunc_msg);
+                    try writeAll(file, trunc_msg);
+                }
+                try writeAll(file, "</pre>\n</section>\n");
+            },
+            .err => |e| try writeHtmlSection(self.alloc, file, "error", "Error", e.text),
+            .usage, .stop, .noop => {},
         }
     }
 };
@@ -215,6 +428,62 @@ fn redactLossyAlloc(alloc: std.mem.Allocator, txt: []const u8, vis: audit.Vis) !
     var safe = try utf8.Lossy.init(alloc, txt);
     defer safe.deinit(alloc);
     return audit.redactTextAlloc(alloc, safe.text, vis);
+}
+
+/// Write a titled HTML transcript block: `<section class="..."><h2>..</h2><pre>..</pre></section>`.
+fn writeHtmlSection(alloc: std.mem.Allocator, f: File, class: []const u8, title: []const u8, txt: []const u8) !void {
+    try writeAll(f, "<section class=\"");
+    try writeAll(f, class);
+    try writeAll(f, "\">\n<h2>");
+    try writeAll(f, title);
+    try writeAll(f, "</h2>\n<pre>");
+    try writeHtmlEscaped(alloc, f, txt, .@"pub");
+    try writeAll(f, "</pre>\n</section>\n");
+}
+
+/// Redact + lossy-sanitize, then HTML-escape `&<>` for text/`<pre>` content
+/// and stream the result. Keeps secrets masked and output valid UTF-8.
+fn writeHtmlEscaped(alloc: std.mem.Allocator, f: File, txt: []const u8, vis: audit.Vis) !void {
+    const safe = try redactLossyAlloc(alloc, txt, vis);
+    defer alloc.free(safe);
+    const escaped = try htmlEscapeAlloc(alloc, safe, .text);
+    defer alloc.free(escaped);
+    try writeAll(f, escaped);
+}
+
+/// Redact + lossy-sanitize, then HTML-escape for a double-quoted attribute
+/// value (also escapes `"` and `'`) and stream the result.
+fn writeHtmlAttr(alloc: std.mem.Allocator, f: File, txt: []const u8, vis: audit.Vis) !void {
+    const safe = try redactLossyAlloc(alloc, txt, vis);
+    defer alloc.free(safe);
+    const escaped = try htmlEscapeAlloc(alloc, safe, .attr);
+    defer alloc.free(escaped);
+    try writeAll(f, escaped);
+}
+
+const HtmlCtx = enum { text, attr };
+
+/// Escape HTML metacharacters. `.text` covers element content (`& < >`);
+/// `.attr` additionally escapes quotes for double-quoted attribute values.
+fn htmlEscapeAlloc(alloc: std.mem.Allocator, txt: []const u8, ctx: HtmlCtx) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (txt) |c| {
+        const rep: ?[]const u8 = switch (c) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => if (ctx == .attr) "&quot;" else null,
+            '\'' => if (ctx == .attr) "&#39;" else null,
+            else => null,
+        };
+        if (rep) |r| {
+            try out.appendSlice(alloc, r);
+        } else {
+            try out.append(alloc, c);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn fenceLen(txt: []const u8) usize {
@@ -545,7 +814,7 @@ test "export audit emits start and success entries" {
     const dest = try std.fs.path.join(std.testing.allocator, &.{ real, "audit.md" });
     defer std.testing.allocator.free(dest);
 
-    const path = try toMarkdownWith(std.testing.allocator, tmp.dir, "ex2", dest, .{
+    const path = try toMarkdownAudited(std.testing.allocator, tmp.dir, "ex2", dest, .{
         .audit_emitter = &cap.emitter,
         .now_ms = struct {
             fn f() i64 {
@@ -602,7 +871,7 @@ test "export audit emits failure entry on write failure" {
     const bad = try std.fs.path.join(std.testing.allocator, &.{ real, "missing", "audit.md" });
     defer std.testing.allocator.free(bad);
 
-    try std.testing.expectError(error.FileNotFound, toMarkdownWith(std.testing.allocator, tmp.dir, "ex3", bad, .{
+    try std.testing.expectError(error.FileNotFound, toMarkdownAudited(std.testing.allocator, tmp.dir, "ex3", bad, .{
         .audit_emitter = &cap.emitter,
         .now_ms = struct {
             fn f() i64 {
@@ -724,4 +993,185 @@ test "scrubExportAudit property: safe rows stay stable" {
             return std.mem.eql(u8, got, raw);
         }
     }.prop, .{ .iterations = 200 });
+}
+
+/// Read a written export file back into an owned buffer.
+fn readExport(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    const content = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_only });
+    defer content.close(std.testing.io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = content.readerStreaming(std.testing.io, &read_buf);
+    return reader.interface.allocRemaining(alloc, .limited(64 * 1024));
+}
+
+test "htmlEscapeAlloc escapes text and attribute contexts" {
+    const alloc = std.testing.allocator;
+    const txt = try htmlEscapeAlloc(alloc, "<b>a&b</b> \"q\" 'x'", .text);
+    defer alloc.free(txt);
+    // Text context leaves quotes alone but escapes & < >.
+    try std.testing.expectEqualStrings("&lt;b&gt;a&amp;b&lt;/b&gt; \"q\" 'x'", txt);
+
+    const at = try htmlEscapeAlloc(alloc, "<b>a&b</b> \"q\" 'x'", .attr);
+    defer alloc.free(at);
+    try std.testing.expectEqualStrings("&lt;b&gt;a&amp;b&lt;/b&gt; &quot;q&quot; &#39;x&#39;", at);
+}
+
+test "export session to html with metadata in head" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+    const writer_mod = @import("writer.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var wr = try writer_mod.Writer.init(std.testing.allocator, tmp.dir, .{
+        .flush = .{ .always = {} },
+    });
+
+    // First event carries git provenance; HTML <head> surfaces it.
+    try wr.append("h1", .{
+        .at_ms = 1,
+        .data = .{ .prompt = .{ .text = "hello <world>" } },
+        .git_meta = .{ .repo = "pz", .branch = "main", .commit = "414358b" },
+    });
+    try wr.append("h1", .{ .at_ms = 2, .data = .{ .text = .{ .text = "ok & done" } } });
+    try wr.append("h1", .{ .at_ms = 3, .data = .{ .tool_call = .{ .id = "c1", .name = "bash", .args = "echo <hi>" } } });
+    try wr.append("h1", .{ .at_ms = 4, .data = .{ .tool_result = .{ .id = "c1", .output = "out & <tag>", .is_err = false } } });
+    try wr.append("h1", .{ .at_ms = 5, .data = .{ .stop = .{ .reason = .done } } });
+
+    const real = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(real);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ real, "out.html" });
+    defer std.testing.allocator.free(dest);
+
+    const path = try toHtml(std.testing.allocator, tmp.dir, "h1", dest, .{
+        .title = "My Session",
+        .tags = &.{ "alpha", "beta & <c>" },
+        .notes = "free-form \"notes\"",
+    });
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqualStrings(dest, path);
+
+    const html = try readExport(std.testing.allocator, path);
+    defer std.testing.allocator.free(html);
+
+    try oh.snap(@src(),
+        \\[]u8
+        \\  "<!doctype html>
+        \\<html lang="en">
+        \\<head>
+        \\<meta charset="utf-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1">
+        \\<title>My Session</title>
+        \\<meta name="keywords" content="alpha">
+        \\<meta name="keywords" content="beta &amp; &lt;c&gt;">
+        \\<meta name="description" content="free-form &quot;notes&quot;">
+        \\<meta name="git-repo" content="pz">
+        \\<meta name="git-branch" content="main">
+        \\<meta name="git-commit" content="414358b">
+        \\</head>
+        \\<body>
+        \\<h1>Session h1</h1>
+        \\<section class="user">
+        \\<h2>User</h2>
+        \\<pre>hello &lt;world&gt;</pre>
+        \\</section>
+        \\<section class="assistant">
+        \\<h2>Assistant</h2>
+        \\<pre>ok &amp; done</pre>
+        \\</section>
+        \\<section class="tool-call">
+        \\<h3>Tool: bash</h3>
+        \\<pre>echo &lt;hi&gt;</pre>
+        \\</section>
+        \\<section class="tool-result">
+        \\<h4>Result</h4>
+        \\<pre>out &amp; &lt;tag&gt;</pre>
+        \\</section>
+        \\</body>
+        \\</html>
+        \\"
+    ).expectEqual(html);
+}
+
+test "export html without metadata falls back to sid title" {
+    const writer_mod = @import("writer.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var wr = try writer_mod.Writer.init(std.testing.allocator, tmp.dir, .{
+        .flush = .{ .always = {} },
+    });
+    try wr.append("h2", .{ .at_ms = 1, .data = .{ .text = .{ .text = "<script>alert(1)</script>" } } });
+
+    const path = try toHtml(std.testing.allocator, tmp.dir, "h2", null, .{});
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "h2.html"));
+
+    const html = try readExport(std.testing.allocator, path);
+    defer std.testing.allocator.free(html);
+
+    // Title defaults to sid; script tags are neutralized, no raw "<script".
+    try std.testing.expect(std.mem.indexOf(u8, html, "<title>h2</title>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "&lt;script&gt;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<script>alert(1)</script>") == null);
+    // No keywords/description meta when no metadata supplied.
+    try std.testing.expect(std.mem.indexOf(u8, html, "name=\"keywords\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "name=\"git-repo\"") == null);
+}
+
+test "export markdown header includes title tags and notes" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+    const writer_mod = @import("writer.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var wr = try writer_mod.Writer.init(std.testing.allocator, tmp.dir, .{
+        .flush = .{ .always = {} },
+    });
+    try wr.append("m1", .{ .at_ms = 1, .data = .{ .prompt = .{ .text = "q" } } });
+    try wr.append("m1", .{ .at_ms = 2, .data = .{ .text = .{ .text = "a" } } });
+
+    const real = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(real);
+    const dest = try std.fs.path.join(std.testing.allocator, &.{ real, "m1.md" });
+    defer std.testing.allocator.free(dest);
+
+    const path = try toMarkdownMeta(std.testing.allocator, tmp.dir, "m1", dest, .{
+        .title = "Demo",
+        .tags = &.{ "x", "y" },
+        .notes = "remember this",
+    });
+    defer std.testing.allocator.free(path);
+
+    const md = try readExport(std.testing.allocator, path);
+    defer std.testing.allocator.free(md);
+    const snap = try normalizeMd(std.testing.allocator, md);
+    defer std.testing.allocator.free(snap);
+
+    try oh.snap(@src(),
+        \\[]u8
+        \\  "# Session m1
+        \\
+        \\**Title:** Demo
+        \\
+        \\**Tags:** x, y
+        \\
+        \\**Notes:** remember this
+        \\
+        \\## User
+        \\
+        \\```
+        \\q
+        \\```
+        \\
+        \\## Assistant
+        \\
+        \\```
+        \\a
+        \\```"
+    ).expectEqual(snap);
 }
