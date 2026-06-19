@@ -8,9 +8,24 @@ const std = @import("std");
 const registry = @import("../core/providers/registry.zig");
 const compat = @import("../core/providers/compat.zig");
 
+// MP2 OpenAI-compatible provider Cfg modules. Referenced here (the MP1 provider
+// test aggregator) so their in-file `test {}` blocks are reachable from the
+// `src/tests.zig` root and run under `zig build test`. Still NOT wired into the
+// runtime (MP7 owns dispatch).
+const openrouter = @import("../core/providers/openrouter.zig");
+const google = @import("../core/providers/google.zig");
+const mistral = @import("../core/providers/mistral.zig");
+const groq = @import("../core/providers/groq.zig");
+const deepseek = @import("../core/providers/deepseek.zig");
+
 comptime {
     _ = registry;
     _ = compat;
+    _ = openrouter;
+    _ = google;
+    _ = mistral;
+    _ = groq;
+    _ = deepseek;
 }
 
 // A cross-module integration test that proves the registry and compat layer
