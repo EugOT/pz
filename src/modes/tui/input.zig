@@ -2,6 +2,7 @@
 const std = @import("std");
 const editor = @import("editor.zig");
 const mouse = @import("mouse.zig");
+const keybindings = @import("keybindings.zig");
 
 fn closeFd(fd: std.posix.fd_t) void {
     _ = std.c.close(fd);
@@ -68,9 +69,34 @@ pub const Reader = struct {
     in_paste: bool = false,
     notify_fd_a: ?std.posix.fd_t = null,
     notify_fd_b: ?std.posix.fd_t = null,
+    /// Optional dynamic keybindings. When set, every decoded `.key` event is
+    /// remapped through these rules before being returned. The remapped key
+    /// flows through the same `Event` path the runtime already audits, so
+    /// binding use is auditable without any new audit surface.
+    bindings: ?*const keybindings.Bindings = null,
 
     pub fn init(fd: std.posix.fd_t) Reader {
         return .{ .fd = fd };
+    }
+
+    /// Attach (or clear) borrowed keybindings used to remap keys.
+    /// The pointed-to `Bindings` (and its backing rule slice) is borrowed, not
+    /// owned: it MUST outlive every subsequent `next()`/`remap()` call until it
+    /// is replaced via another `setBindings(...)` or cleared with `null`.
+    /// Deinitializing the owning `ParseResult`/`Bindings` while still attached
+    /// is a use-after-free.
+    pub fn setBindings(self: *Reader, b: ?*const keybindings.Bindings) void {
+        self.bindings = b;
+    }
+
+    /// Remap a `.key` event through the attached bindings; other events pass
+    /// through unchanged.
+    fn remap(self: *const Reader, ev: Event) Event {
+        const b = self.bindings orelse return ev;
+        return switch (ev) {
+            .key => |k| .{ .key = b.apply(k) },
+            else => ev,
+        };
     }
 
     pub fn initWithNotify(fd: std.posix.fd_t, notify_fd: std.posix.fd_t) Reader {
@@ -104,7 +130,7 @@ pub const Reader = struct {
 
         // Try to parse from existing buffer first
         if (self.pos < self.len) {
-            if (self.parseOne()) |ev| return ev;
+            if (self.parseOne()) |ev| return self.remap(ev);
         }
 
         // Read more data
@@ -117,14 +143,14 @@ pub const Reader = struct {
             // Lone ESC with no follow-up data → standalone ESC key
             if (self.pos < self.len and self.buf[self.pos] == 0x1b and self.len - self.pos == 1) {
                 self.pos += 1;
-                return .{ .key = .esc };
+                return self.remap(.{ .key = .esc });
             }
             return .none;
         }
         if (n == read_notify) return .notify;
         self.len += n;
 
-        return self.parseOne() orelse .none;
+        return self.remap(self.parseOne() orelse .none);
     }
 
     const read_notify = std.math.maxInt(usize);
@@ -1047,4 +1073,69 @@ test "parse mixed ctrl keys and alt keys" {
     try expectKey(r.parseOne().?, .ctrl_a);
     try expectKey(r.parseOne().?, .alt_f);
     try expectKey(r.parseOne().?, .tab);
+}
+
+test "reader remaps key through bindings on next()" {
+    const in_pipe = try makePipe();
+    defer closeFd(in_pipe[0]);
+    defer closeFd(in_pipe[1]);
+
+    // ctrl_t (0x14) → ctrl_p
+    var result = try keybindings.parse(std.testing.allocator,
+        \\{ "ctrl_t": "ctrl_p" }
+    );
+    defer result.deinit(std.testing.allocator);
+
+    var r = Reader.init(in_pipe[0]);
+    r.setBindings(&result.bindings);
+
+    const b = [_]u8{0x14}; // ctrl_t
+    try fdWriteAll(in_pipe[1], &b);
+    try expectKey(r.next(), .ctrl_p);
+}
+
+test "reader passes unmapped key through unchanged" {
+    const in_pipe = try makePipe();
+    defer closeFd(in_pipe[0]);
+    defer closeFd(in_pipe[1]);
+
+    var result = try keybindings.parse(std.testing.allocator,
+        \\{ "ctrl_t": "ctrl_p" }
+    );
+    defer result.deinit(std.testing.allocator);
+
+    var r = Reader.init(in_pipe[0]);
+    r.setBindings(&result.bindings);
+
+    try fdWriteAll(in_pipe[1], "a"); // unmapped char
+    try expectKey(r.next(), .{ .char = 'a' });
+}
+
+test "reader without bindings is identity" {
+    const in_pipe = try makePipe();
+    defer closeFd(in_pipe[0]);
+    defer closeFd(in_pipe[1]);
+
+    var r = Reader.init(in_pipe[0]);
+    const b = [_]u8{0x14}; // ctrl_t
+    try fdWriteAll(in_pipe[1], &b);
+    try expectKey(r.next(), .ctrl_t);
+}
+
+test "reader remaps char to char via bindings" {
+    const in_pipe = try makePipe();
+    defer closeFd(in_pipe[0]);
+    defer closeFd(in_pipe[1]);
+
+    // char 'h' (104) → char 'x' (120)
+    var result = try keybindings.parse(std.testing.allocator,
+        \\{ "char:104": "char:120" }
+    );
+    defer result.deinit(std.testing.allocator);
+
+    var r = Reader.init(in_pipe[0]);
+    r.setBindings(&result.bindings);
+
+    try fdWriteAll(in_pipe[1], "h");
+    try expectKey(r.next(), .{ .char = 'x' });
 }
