@@ -10,6 +10,40 @@ pub const Event = struct {
     data: Data = .{
         .noop = {},
     },
+    /// Repository provenance for the moment the event was recorded.
+    /// Optional and defaults to null so older JSONL (written before this
+    /// field existed) still deserializes.
+    git_meta: ?GitMeta = null,
+    /// Session id this event's session was forked from, enabling
+    /// fork/tree reconstruction. Null for root sessions and for older
+    /// JSONL that predates this field.
+    parent_sid: ?[]const u8 = null,
+    /// Per-entry metadata: failure flags, originating tool, and process
+    /// exit codes. Optional for backward compatibility.
+    entry_meta: ?EntryMeta = null,
+
+    /// Repository state captured alongside a session event.
+    pub const GitMeta = struct {
+        repo: []const u8,
+        branch: []const u8,
+        commit: []const u8,
+    };
+
+    /// Additional per-entry annotations carried beside the event payload.
+    /// Every field is optional so partial metadata round-trips and so the
+    /// whole struct can be omitted from older JSONL.
+    pub const EntryMeta = struct {
+        /// Wall-clock timestamp in milliseconds, distinct from `at_ms`
+        /// (which is the logical event time). Lets exporters surface a
+        /// human timestamp without overloading the ordering key.
+        ts_ms: ?i64 = null,
+        /// True when this entry records an error condition.
+        is_err: ?bool = null,
+        /// Tool that produced this entry, when applicable.
+        tool: ?[]const u8 = null,
+        /// Process exit code associated with this entry, when applicable.
+        exit_code: ?i32 = null,
+    };
 
     pub const Data = union(Tag) {
         noop: void,
@@ -74,16 +108,69 @@ pub const Event = struct {
     /// Deep-copy all string slices into `alloc`. The result is fully
     /// independent of the source (e.g. a ReplayReader's per-call arena).
     pub fn dupe(self: Event, alloc: std.mem.Allocator) error{OutOfMemory}!Event {
+        const data = try dupeData(alloc, self.data);
+        errdefer freeData(alloc, data);
+
+        const git_meta = try dupeGitMeta(alloc, self.git_meta);
+        errdefer freeGitMeta(alloc, git_meta);
+
+        const parent_sid: ?[]const u8 = if (self.parent_sid) |p|
+            try alloc.dupe(u8, p)
+        else
+            null;
+        errdefer if (parent_sid) |p| alloc.free(p);
+
+        const entry_meta = try dupeEntryMeta(alloc, self.entry_meta);
+
         return .{
             .version = self.version,
             .at_ms = self.at_ms,
-            .data = try dupeData(alloc, self.data),
+            .data = data,
+            .git_meta = git_meta,
+            .parent_sid = parent_sid,
+            .entry_meta = entry_meta,
         };
     }
 
     /// Free strings previously allocated by `dupe`.
     pub fn free(self: Event, alloc: std.mem.Allocator) void {
         freeData(alloc, self.data);
+        freeGitMeta(alloc, self.git_meta);
+        if (self.parent_sid) |p| alloc.free(p);
+        freeEntryMeta(alloc, self.entry_meta);
+    }
+
+    fn dupeGitMeta(alloc: std.mem.Allocator, gm: ?GitMeta) error{OutOfMemory}!?GitMeta {
+        const g = gm orelse return null;
+        const repo = try alloc.dupe(u8, g.repo);
+        errdefer alloc.free(repo);
+        const branch = try alloc.dupe(u8, g.branch);
+        errdefer alloc.free(branch);
+        const commit = try alloc.dupe(u8, g.commit);
+        return .{ .repo = repo, .branch = branch, .commit = commit };
+    }
+
+    fn freeGitMeta(alloc: std.mem.Allocator, gm: ?GitMeta) void {
+        const g = gm orelse return;
+        alloc.free(g.repo);
+        alloc.free(g.branch);
+        alloc.free(g.commit);
+    }
+
+    fn dupeEntryMeta(alloc: std.mem.Allocator, em: ?EntryMeta) error{OutOfMemory}!?EntryMeta {
+        const e = em orelse return null;
+        const tool: ?[]const u8 = if (e.tool) |t| try alloc.dupe(u8, t) else null;
+        return .{
+            .ts_ms = e.ts_ms,
+            .is_err = e.is_err,
+            .tool = tool,
+            .exit_code = e.exit_code,
+        };
+    }
+
+    fn freeEntryMeta(alloc: std.mem.Allocator, em: ?EntryMeta) void {
+        const e = em orelse return;
+        if (e.tool) |t| alloc.free(t);
     }
 
     fn dupeData(alloc: std.mem.Allocator, data: Data) error{OutOfMemory}!Data {
@@ -148,8 +235,36 @@ pub fn encodeAlloc(alloc: std.mem.Allocator, ev: Event) error{OutOfMemory}![]u8 
     out.version = version_current;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    out.data = try sanitizeData(arena.allocator(), out.data);
-    return std.json.Stringify.valueAlloc(alloc, out, .{});
+    const aa = arena.allocator();
+    out.data = try sanitizeData(aa, out.data);
+    out.git_meta = try sanitizeGitMeta(aa, out.git_meta);
+    out.parent_sid = if (out.parent_sid) |p|
+        try utf8.sanitizeMaybeAlloc(aa, p)
+    else
+        null;
+    out.entry_meta = try sanitizeEntryMeta(aa, out.entry_meta);
+    // Omit null optionals so events without the new metadata serialize
+    // byte-identically to the pre-metadata format (backward compatibility).
+    return std.json.Stringify.valueAlloc(alloc, out, .{ .emit_null_optional_fields = false });
+}
+
+fn sanitizeGitMeta(alloc: std.mem.Allocator, gm: ?Event.GitMeta) error{OutOfMemory}!?Event.GitMeta {
+    const g = gm orelse return null;
+    return .{
+        .repo = try utf8.sanitizeMaybeAlloc(alloc, g.repo),
+        .branch = try utf8.sanitizeMaybeAlloc(alloc, g.branch),
+        .commit = try utf8.sanitizeMaybeAlloc(alloc, g.commit),
+    };
+}
+
+fn sanitizeEntryMeta(alloc: std.mem.Allocator, em: ?Event.EntryMeta) error{OutOfMemory}!?Event.EntryMeta {
+    const e = em orelse return null;
+    return .{
+        .ts_ms = e.ts_ms,
+        .is_err = e.is_err,
+        .tool = if (e.tool) |t| try utf8.sanitizeMaybeAlloc(alloc, t) else null,
+        .exit_code = e.exit_code,
+    };
 }
 
 fn sanitizeData(alloc: std.mem.Allocator, data: Event.Data) error{OutOfMemory}!Event.Data {
@@ -231,6 +346,12 @@ test "session event json roundtrip" {
         \\      .output: []const u8
         \\        "{"ok":true}"
         \\      .is_err: bool = false
+        \\  .git_meta: ?core.session.schema.Event.GitMeta
+        \\    null
+        \\  .parent_sid: ?[]const u8
+        \\    null
+        \\  .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\    null
     ).expectEqual(parsed.value);
 }
 
@@ -262,6 +383,141 @@ test "session event json rejects wrong version" {
     try std.testing.expectError(error.UnsupportedVersion, decodeSlice(std.testing.allocator, raw));
 }
 
+test "session event decodes legacy jsonl without optional metadata" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+    // Exactly the byte layout written before git_meta/parent_sid/entry_meta
+    // existed. The new optionals must default to null, not error.
+    const raw = "{\"version\":1,\"at_ms\":7,\"data\":{\"text\":{\"text\":\"hi\"}}}";
+
+    var parsed = try decodeSlice(std.testing.allocator, raw);
+    defer parsed.deinit();
+
+    try oh.snap(@src(),
+        \\core.session.schema.Event
+        \\  .version: u16 = 1
+        \\  .at_ms: i64 = 7
+        \\  .data: core.session.schema.Event.Data
+        \\    .text: core.session.schema.Event.Text
+        \\      .text: []const u8
+        \\        "hi"
+        \\  .git_meta: ?core.session.schema.Event.GitMeta
+        \\    null
+        \\  .parent_sid: ?[]const u8
+        \\    null
+        \\  .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\    null
+    ).expectEqual(parsed.value);
+}
+
+test "session event omits null optional metadata when encoding" {
+    // An event with no metadata must serialize byte-identically to the
+    // pre-metadata format so legacy snapshots and round-trips stay valid.
+    // A single exact-byte wire assertion is clearest with expectEqualStrings:
+    // repo precedent reserves ohsnap for multi-field struct-shape snapshots
+    // (see the Event field-tree snaps above) and uses expectEqualStrings for
+    // raw byte payloads (export.zig HTML-escape test, the JSON tests below).
+    const ev = Event{
+        .at_ms = 7,
+        .data = .{ .text = .{ .text = "hi" } },
+    };
+    const raw = try encodeAlloc(std.testing.allocator, ev);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqualStrings(
+        "{\"version\":1,\"at_ms\":7,\"data\":{\"text\":{\"text\":\"hi\"}}}",
+        raw,
+    );
+}
+
+test "session event roundtrips full metadata" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+    const ev = Event{
+        .at_ms = 99,
+        .data = .{ .text = .{ .text = "body" } },
+        .git_meta = .{ .repo = "pz", .branch = "main", .commit = "414358b" },
+        .parent_sid = "root-sid",
+        .entry_meta = .{
+            .ts_ms = 1718800000000,
+            .is_err = true,
+            .tool = "bash",
+            .exit_code = 127,
+        },
+    };
+
+    const raw = try encodeAlloc(std.testing.allocator, ev);
+    defer std.testing.allocator.free(raw);
+
+    var parsed = try decodeSlice(std.testing.allocator, raw);
+    defer parsed.deinit();
+
+    try oh.snap(@src(),
+        \\core.session.schema.Event
+        \\  .version: u16 = 1
+        \\  .at_ms: i64 = 99
+        \\  .data: core.session.schema.Event.Data
+        \\    .text: core.session.schema.Event.Text
+        \\      .text: []const u8
+        \\        "body"
+        \\  .git_meta: ?core.session.schema.Event.GitMeta
+        \\    .repo: []const u8
+        \\      "pz"
+        \\    .branch: []const u8
+        \\      "main"
+        \\    .commit: []const u8
+        \\      "414358b"
+        \\  .parent_sid: ?[]const u8
+        \\    "root-sid"
+        \\  .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\    .ts_ms: ?i64
+        \\      1718800000000
+        \\    .is_err: ?bool
+        \\      true
+        \\    .tool: ?[]const u8
+        \\      "bash"
+        \\    .exit_code: ?i32
+        \\      127
+    ).expectEqual(parsed.value);
+}
+
+test "Event.dupe deep-copies optional metadata" {
+    const alloc = std.testing.allocator;
+    const orig = Event{
+        .at_ms = 5,
+        .data = .{ .text = .{ .text = "body" } },
+        .git_meta = .{ .repo = "pz", .branch = "main", .commit = "abc" },
+        .parent_sid = "parent",
+        .entry_meta = .{ .ts_ms = 10, .is_err = false, .tool = "edit", .exit_code = 0 },
+    };
+    const d = try orig.dupe(alloc);
+    defer d.free(alloc);
+
+    // Encode both; fidelity check independent of pointer identity.
+    const a = try encodeAlloc(alloc, orig);
+    defer alloc.free(a);
+    const b = try encodeAlloc(alloc, d);
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings(a, b);
+
+    // Independent allocation: the duped strings must not alias the source.
+    try std.testing.expect(d.git_meta.?.repo.ptr != orig.git_meta.?.repo.ptr);
+    try std.testing.expect(d.parent_sid.?.ptr != orig.parent_sid.?.ptr);
+    try std.testing.expect(d.entry_meta.?.tool.?.ptr != orig.entry_meta.?.tool.?.ptr);
+}
+
+test "session event encode replaces invalid utf8 in metadata" {
+    const utf8_case = @import("../../test/utf8_case.zig");
+    const ev = Event{
+        .at_ms = 1,
+        .data = .{ .text = .{ .text = "ok" } },
+        .entry_meta = .{ .tool = utf8_case.bad_tool_out[0..] },
+    };
+    const raw = try encodeAlloc(std.testing.allocator, ev);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expect(std.mem.indexOfScalar(u8, raw, 0xff) == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, utf8_case.lossy_tool_out) != null);
+}
+
 test "Event.dupe deep-copies tool_call strings" {
     const OhSnap = @import("ohsnap");
     const oh = OhSnap{};
@@ -291,6 +547,12 @@ test "Event.dupe deep-copies tool_call strings" {
         \\        "bash"
         \\      .args: []const u8
         \\        "{"cmd":"ls"}"
+        \\  .git_meta: ?core.session.schema.Event.GitMeta
+        \\    null
+        \\  .parent_sid: ?[]const u8
+        \\    null
+        \\  .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\    null
     ).expectEqual(d);
 
     // Verify independent allocation (pointers differ)
@@ -328,6 +590,12 @@ test "Event.dupe deep-copies tool_result strings" {
         \\      .output: []const u8
         \\        "output-data"
         \\      .is_err: bool = true
+        \\  .git_meta: ?core.session.schema.Event.GitMeta
+        \\    null
+        \\  .parent_sid: ?[]const u8
+        \\    null
+        \\  .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\    null
     ).expectEqual(d);
     const tr = d.data.tool_result;
     try std.testing.expect(tr.id.ptr != orig.data.tool_result.id.ptr);

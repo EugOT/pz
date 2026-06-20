@@ -133,6 +133,12 @@ test "jsonl append preserves event order" {
         \\      .prompt: core.session.schema.Event.Text
         \\        .text: []const u8
         \\          "alpha"
+        \\    .git_meta: ?core.session.schema.Event.GitMeta
+        \\      null
+        \\    .parent_sid: ?[]const u8
+        \\      null
+        \\    .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\      null
         \\  [1]: core.session.schema.Event
         \\    .version: u16 = 1
         \\    .at_ms: i64 = 2
@@ -140,6 +146,12 @@ test "jsonl append preserves event order" {
         \\      .text: core.session.schema.Event.Text
         \\        .text: []const u8
         \\          "beta"
+        \\    .git_meta: ?core.session.schema.Event.GitMeta
+        \\      null
+        \\    .parent_sid: ?[]const u8
+        \\      null
+        \\    .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\      null
         \\  [2]: core.session.schema.Event
         \\    .version: u16 = 1
         \\    .at_ms: i64 = 3
@@ -147,6 +159,12 @@ test "jsonl append preserves event order" {
         \\      .err: core.session.schema.Event.Text
         \\        .text: []const u8
         \\          "gamma"
+        \\    .git_meta: ?core.session.schema.Event.GitMeta
+        \\      null
+        \\    .parent_sid: ?[]const u8
+        \\      null
+        \\    .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\      null
     ).expectEqual(rows.items);
     if (@import("builtin").os.tag != .windows) {
         const st = try tmp.dir.statFile(std.testing.io, "s1.jsonl", .{});
