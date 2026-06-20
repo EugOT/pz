@@ -177,19 +177,21 @@ fn loadForProviderHome(
     hooks: Hooks,
     provider: Provider,
 ) !auth.Result {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    errdefer arena.deinit();
-    const ar = arena.allocator();
+    var result: auth.Result = .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .auth = undefined,
+    };
+    errdefer result.arena.deinit();
+    const ar = result.arena.allocator();
 
     if (!hooks.lock.auth) if (authFromEnv(try providerEnvAuth(ar, provider))) |a| {
-        return .{ .arena = arena, .auth = a };
+        result.auth = a;
+        return result;
     };
 
     const home = try resolveHome(ar, hooks);
-    return .{
-        .arena = arena,
-        .auth = try loadFileAuthForProvider(ar, home, provider),
-    };
+    result.auth = try loadFileAuthForProvider(ar, home, provider);
+    return result;
 }
 
 fn loadFileAuth(alloc: std.mem.Allocator, home: []const u8) !Auth {
@@ -197,9 +199,7 @@ fn loadFileAuth(alloc: std.mem.Allocator, home: []const u8) !Auth {
 }
 
 pub fn loadFileAuthForProvider(alloc: std.mem.Allocator, home: []const u8, provider: Provider) !Auth {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const ar = arena.allocator();
+    const ar = alloc;
 
     const path = findAuthFile(ar, home) catch return error.AuthNotFound;
     const is_legacy = isLegacyPath(path);

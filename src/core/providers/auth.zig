@@ -72,8 +72,16 @@ pub const provider_names = [_][]const u8{
 
 comptime {
     // Fail the build if a Provider variant is added without a matching name.
-    if (provider_names.len != @typeInfo(Provider).@"enum".fields.len) {
-        @compileError("provider_names must cover every Provider variant");
+    const fields = @typeInfo(Provider).@"enum".fields;
+    if (provider_names.len != fields.len) {
+        @compileError("provider_names length must match Provider enum field count");
+    }
+    // Verify each name matches the enum tag in the same position so reorderings
+    // or typos are caught at compile time rather than at test time.
+    for (fields, 0..) |field, i| {
+        if (!std.mem.eql(u8, field.name, provider_names[i])) {
+            @compileError("provider_names must match enum field order and spelling exactly");
+        }
     }
 }
 
