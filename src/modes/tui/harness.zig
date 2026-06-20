@@ -93,8 +93,9 @@ pub const Ui = struct {
     /// Discover custom slash commands from `~/.pz/commands/*/COMMAND.md` and
     /// install them into the picker's command set. Replaces any prior set.
     pub fn loadCustomCommands(self: *Ui, home: ?[]const u8) !void {
-        var set = try cmdpicker_mod.discoverCustom(self.alloc, home);
-        errdefer set.deinit(self.alloc);
+        // `discoverCustom` is the only fallible step; once it succeeds the
+        // remaining swap cannot error, so no errdefer is needed on `set`.
+        const set = try cmdpicker_mod.discoverCustom(self.alloc, home);
         self.cmd_set.deinit(self.alloc);
         self.cmd_set = set;
     }

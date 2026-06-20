@@ -79,7 +79,12 @@ pub const Reader = struct {
         return .{ .fd = fd };
     }
 
-    /// Attach (or clear) the keybinding registry used to remap keys.
+    /// Attach (or clear) borrowed keybindings used to remap keys.
+    /// The pointed-to `Bindings` (and its backing rule slice) is borrowed, not
+    /// owned: it MUST outlive every subsequent `next()`/`remap()` call until it
+    /// is replaced via another `setBindings(...)` or cleared with `null`.
+    /// Deinitializing the owning `ParseResult`/`Bindings` while still attached
+    /// is a use-after-free.
     pub fn setBindings(self: *Reader, b: ?*const keybindings.Bindings) void {
         self.bindings = b;
     }

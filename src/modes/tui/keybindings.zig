@@ -98,8 +98,11 @@ pub fn load(alloc: std.mem.Allocator, home: ?[]const u8) Error!ParseResult {
     const h = home orelse return emptyResult();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    // A path-format failure (e.g. an overlong `home`) is a real error, not an
+    // absent config — surface it as BadShape rather than silently pretending
+    // there are no keybindings.
     const path = std.fmt.bufPrint(&path_buf, "{s}/.pz/keybindings.json", .{h}) catch
-        return emptyResult();
+        return error.BadShape;
 
     const active_io = defaultIo();
     // Only a genuinely missing file means "empty bindings". Other open errors
@@ -350,6 +353,14 @@ test "parse: non-string value is bad shape" {
 
 test "parse: invalid json is bad shape" {
     try std.testing.expectError(error.BadShape, parse(std.testing.allocator, "{not json"));
+}
+
+test "load: overlong home path is bad shape, not empty" {
+    // A `home` so long the "{home}/.pz/keybindings.json" path overflows the
+    // path buffer must surface as BadShape — never be silently swallowed as
+    // "no keybindings file".
+    const long_home = "/" ++ ("a" ** std.fs.max_path_bytes);
+    try std.testing.expectError(error.BadShape, load(std.testing.allocator, long_home));
 }
 
 test "parse: empty object yields empty bindings" {
