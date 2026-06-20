@@ -128,6 +128,11 @@ fn parseCommand(alloc: std.mem.Allocator, dir_name: []const u8, content: []const
     return .{ .name = name, .desc = "", .body = body };
 }
 
+/// Invariant: a zero-length `desc`/`body` is always the non-allocated `""`
+/// literal produced by `parseCommand`/the shared frontmatter parser, never a
+/// heap allocation. The `len > 0` guards therefore free every heap allocation
+/// without touching literals. If the parser ever starts allocating empty
+/// strings this guard must change to a per-field owned-flag.
 fn freeOne(alloc: std.mem.Allocator, c: CustomCmd) void {
     alloc.free(c.name);
     if (c.desc.len > 0) alloc.free(c.desc);
@@ -234,8 +239,15 @@ pub const Picker = struct {
             cp.custom = set.custom;
             return cp;
         }
-        // Total index space must fit in u8 (offset scheme). Cap defensively.
-        std.debug.assert(cmds.len + set.custom.len <= std.math.maxInt(u8));
+        // Total index space must fit in u8 (offset scheme). `debug.assert` is
+        // stripped in release builds, so enforce this at runtime: if there are
+        // too many commands to index in a u8, fall back to builtin-only
+        // matching instead of silently wrapping indices.
+        if (cmds.len + set.custom.len > std.math.maxInt(u8)) {
+            var cp = update(prefix) orelse return null;
+            cp.custom = null;
+            return cp;
+        }
 
         var cp = Picker{ .matches = undefined, .n = 0, .custom = set.custom };
 
@@ -354,9 +366,13 @@ pub const Picker = struct {
     fn cmdAt(self: *const Picker, slot: usize) Cmd {
         const idx = self.matches[slot];
         if (idx < cmds.len) return cmds[idx];
-        const custom = self.custom orelse return cmds[0]; // unreachable in practice
+        // A match index >= cmds.len can only be produced when custom commands
+        // were registered, so `self.custom` must be set and `ci` in range. Use
+        // unreachable/assert to surface any index-construction bug in debug
+        // builds instead of silently returning the wrong command.
+        const custom = self.custom orelse unreachable;
         const ci = @as(usize, idx) - cmds.len;
-        if (ci >= custom.len) return cmds[0];
+        std.debug.assert(ci < custom.len);
         return .{ .name = custom[ci].name, .desc = custom[ci].desc };
     }
 

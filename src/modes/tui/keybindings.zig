@@ -102,8 +102,14 @@ pub fn load(alloc: std.mem.Allocator, home: ?[]const u8) Error!ParseResult {
         return emptyResult();
 
     const active_io = defaultIo();
-    const file = std.Io.Dir.openFileAbsolute(active_io, path, .{}) catch
-        return emptyResult(); // no file → empty
+    // Only a genuinely missing file means "empty bindings". Other open errors
+    // (PermissionDenied, IsDir, broken symlink, …) are actionable problems the
+    // caller should hear about, so surface them as BadShape rather than
+    // silently ignoring a config the user clearly intended to provide.
+    const file = std.Io.Dir.openFileAbsolute(active_io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return emptyResult(), // no file → empty
+        else => return error.BadShape,
+    };
     defer file.close(active_io);
 
     var file_buf: [4096]u8 = undefined;
@@ -125,7 +131,15 @@ fn emptyResult() ParseResult {
 /// `ParseResult.conflicts`; the first binding for a key wins and conflicting
 /// later bindings are dropped (and reported). Structural problems are errors.
 pub fn parse(alloc: std.mem.Allocator, raw: []const u8) Error!ParseResult {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
+    // Zig 0.16's std.json defaults `duplicate_field_behavior` to `.@"error"`.
+    // Honor RFC 8259 object semantics (last value wins for a repeated textual
+    // key) so a textual duplicate collapses to a single rule instead of failing.
+    const parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        raw,
+        .{ .duplicate_field_behavior = .use_last },
+    ) catch
         return error.BadShape;
     defer parsed.deinit();
 
