@@ -435,7 +435,7 @@ fn redactLossyAlloc(alloc: std.mem.Allocator, txt: []const u8, vis: audit.Vis) !
 }
 
 /// Write a titled HTML transcript block: `<section class="..."><h2>..</h2><pre>..</pre></section>`.
-fn writeHtmlSection(alloc: std.mem.Allocator, f: File, class: []const u8, title: []const u8, txt: []const u8) !void {
+fn writeHtmlSection(alloc: std.mem.Allocator, f: File, comptime class: []const u8, comptime title: []const u8, txt: []const u8) !void {
     try writeAll(f, "<section class=\"");
     try writeAll(f, class);
     try writeAll(f, "\">\n<h2>");

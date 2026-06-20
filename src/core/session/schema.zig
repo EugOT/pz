@@ -413,6 +413,10 @@ test "session event decodes legacy jsonl without optional metadata" {
 test "session event omits null optional metadata when encoding" {
     // An event with no metadata must serialize byte-identically to the
     // pre-metadata format so legacy snapshots and round-trips stay valid.
+    // A single exact-byte wire assertion is clearest with expectEqualStrings:
+    // repo precedent reserves ohsnap for multi-field struct-shape snapshots
+    // (see the Event field-tree snaps above) and uses expectEqualStrings for
+    // raw byte payloads (export.zig HTML-escape test, the JSON tests below).
     const ev = Event{
         .at_ms = 7,
         .data = .{ .text = .{ .text = "hi" } },
