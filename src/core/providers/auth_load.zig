@@ -78,7 +78,9 @@ fn providerEnvAuth(ar: std.mem.Allocator, provider: Provider) error{ OutOfMemory
             .oauth = null,
             .api_key = try readEnv(ar, openai_api_key_env),
         },
-        .google => .{},
+        // API-key-only providers with no dedicated env-var mapping yet: file
+        // auth only. No OAuth, no env credential.
+        .google, .mistral, .groq, .deepseek, .openrouter => .{},
     };
 }
 
@@ -175,19 +177,21 @@ fn loadForProviderHome(
     hooks: Hooks,
     provider: Provider,
 ) !auth.Result {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    errdefer arena.deinit();
-    const ar = arena.allocator();
+    var result: auth.Result = .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .auth = undefined,
+    };
+    errdefer result.arena.deinit();
+    const ar = result.arena.allocator();
 
     if (!hooks.lock.auth) if (authFromEnv(try providerEnvAuth(ar, provider))) |a| {
-        return .{ .arena = arena, .auth = a };
+        result.auth = a;
+        return result;
     };
 
     const home = try resolveHome(ar, hooks);
-    return .{
-        .arena = arena,
-        .auth = try loadFileAuthForProvider(ar, home, provider),
-    };
+    result.auth = try loadFileAuthForProvider(ar, home, provider);
+    return result;
 }
 
 fn loadFileAuth(alloc: std.mem.Allocator, home: []const u8) !Auth {
@@ -195,9 +199,7 @@ fn loadFileAuth(alloc: std.mem.Allocator, home: []const u8) !Auth {
 }
 
 pub fn loadFileAuthForProvider(alloc: std.mem.Allocator, home: []const u8, provider: Provider) !Auth {
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const ar = arena.allocator();
+    const ar = alloc;
 
     const path = findAuthFile(ar, home) catch return error.AuthNotFound;
     const is_legacy = isLegacyPath(path);
@@ -220,11 +222,9 @@ pub fn loadFileAuthForProvider(alloc: std.mem.Allocator, home: []const u8, provi
         .allocate = .alloc_always,
         .ignore_unknown_fields = is_legacy,
     }) catch return error.AuthCorrupt;
-    const entry = switch (provider) {
-        .anthropic => parsed.value.anthropic,
-        .openai => parsed.value.openai,
-        .google => parsed.value.google,
-    } orelse return error.AuthNotFound;
+    const entry = (switch (provider) {
+        inline else => |p| @field(parsed.value, @tagName(p)),
+    }) orelse return error.AuthNotFound;
 
     const AuthType = enum { oauth, api_key };
     const auth_map = std.StaticStringMap(AuthType).initComptime(.{
@@ -282,9 +282,7 @@ pub fn saveAuthEntry(alloc: std.mem.Allocator, home: []const u8, provider: Provi
     }
 
     switch (provider) {
-        .anthropic => auth_file.anthropic = entry,
-        .openai => auth_file.openai = entry,
-        .google => auth_file.google = entry,
+        inline else => |p| @field(auth_file, @tagName(p)) = entry,
     }
 
     const out = try std.json.Stringify.valueAlloc(ar, auth_file, .{ .whitespace = .indent_2 });
@@ -354,22 +352,22 @@ fn listLoggedInHome(alloc: std.mem.Allocator, home: []const u8) ![]Provider {
     defer arena.deinit();
     const ar = arena.allocator();
 
-    var merged: AuthFile = .{};
     const path = authFilePath(ar, home) catch return try alloc.alloc(Provider, 0);
     const raw = readPathAlloc(ar, path) catch return try alloc.alloc(Provider, 0);
     const parsed = std.json.parseFromSlice(AuthFile, ar, raw, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     }) catch return error.AuthCorrupt;
-    merged.anthropic = parsed.value.anthropic;
-    merged.openai = parsed.value.openai;
-    merged.google = parsed.value.google;
+    const merged = parsed.value;
 
     var result = std.ArrayList(Provider).empty;
     errdefer result.deinit(alloc);
-    if (merged.anthropic != null) try result.append(alloc, .anthropic);
-    if (merged.openai != null) try result.append(alloc, .openai);
-    if (merged.google != null) try result.append(alloc, .google);
+    // Preserve enum declaration order so callers see a stable provider list.
+    inline for (@typeInfo(Provider).@"enum".fields) |field| {
+        if (@field(merged, field.name) != null) {
+            try result.append(alloc, @field(Provider, field.name));
+        }
+    }
     return try result.toOwnedSlice(alloc);
 }
 
@@ -410,9 +408,7 @@ fn logoutHomeWithHooks(alloc: std.mem.Allocator, home: []const u8, provider: Pro
     };
 
     switch (provider) {
-        .anthropic => parsed.value.anthropic = null,
-        .openai => parsed.value.openai = null,
-        .google => parsed.value.google = null,
+        inline else => |p| @field(parsed.value, @tagName(p)) = null,
     }
 
     const out = try std.json.Stringify.valueAlloc(ar, parsed.value, .{ .whitespace = .indent_2 });

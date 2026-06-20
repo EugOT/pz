@@ -84,7 +84,9 @@ pub fn oauthSpec(provider: Provider) ?*const OAuthSpec {
     return switch (provider) {
         .anthropic => &anthropic_spec,
         .openai => &openai_spec,
-        .google => null,
+        // API-key-only providers: no OAuth spec, so oauthCapable() is false and
+        // the login path resolves an API key without attempting an OAuth flow.
+        .google, .mistral, .groq, .deepseek, .openrouter => null,
     };
 }
 
@@ -109,7 +111,8 @@ pub fn looksLikeApiKey(provider: Provider, key: []const u8) bool {
     const prefix = switch (provider) {
         .anthropic => anthropic_spec.api_key_prefix,
         .openai => openai_spec.api_key_prefix,
-        .google => null,
+        // No known key prefix: any non-empty string is treated as an API key.
+        .google, .mistral, .groq, .deepseek, .openrouter => null,
     };
     if (prefix) |p| return std.mem.startsWith(u8, key, p);
     return key.len > 0;
