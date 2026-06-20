@@ -304,19 +304,23 @@ const StreamCtx = struct {
 
         // First-event scan for git provenance. Dupe the strings so they
         // survive `rdr.deinit()` and remain valid while we write <head>.
+        // `defer` guarantees the reader is closed even if `next()` errors;
+        // per-allocation `errdefer` guards free partial dupes if a later one
+        // fails so no string leaks on the error path.
         var gscan = try reader_mod.ReplayReader.init(self.alloc, self.session_dir, self.sid, .{});
+        defer gscan.deinit();
         var git_meta: ?Event.GitMeta = null;
         scan: while (try gscan.next()) |ev| {
             if (ev.git_meta) |gm| {
-                git_meta = .{
-                    .repo = try self.alloc.dupe(u8, gm.repo),
-                    .branch = try self.alloc.dupe(u8, gm.branch),
-                    .commit = try self.alloc.dupe(u8, gm.commit),
-                };
+                const repo = try self.alloc.dupe(u8, gm.repo);
+                errdefer self.alloc.free(repo);
+                const branch = try self.alloc.dupe(u8, gm.branch);
+                errdefer self.alloc.free(branch);
+                const commit = try self.alloc.dupe(u8, gm.commit);
+                git_meta = .{ .repo = repo, .branch = branch, .commit = commit };
                 break :scan;
             }
         }
-        gscan.deinit();
 
         if (git_meta) |gm| {
             defer {

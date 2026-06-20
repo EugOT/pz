@@ -346,6 +346,12 @@ test "session event json roundtrip" {
         \\      .output: []const u8
         \\        "{"ok":true}"
         \\      .is_err: bool = false
+        \\  .git_meta: ?core.session.schema.Event.GitMeta
+        \\    null
+        \\  .parent_sid: ?[]const u8
+        \\    null
+        \\  .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\    null
     ).expectEqual(parsed.value);
 }
 
@@ -450,25 +456,23 @@ test "session event roundtrips full metadata" {
         \\      .text: []const u8
         \\        "body"
         \\  .git_meta: ?core.session.schema.Event.GitMeta
-        \\    core.session.schema.Event.GitMeta
-        \\      .repo: []const u8
-        \\        "pz"
-        \\      .branch: []const u8
-        \\        "main"
-        \\      .commit: []const u8
-        \\        "414358b"
+        \\    .repo: []const u8
+        \\      "pz"
+        \\    .branch: []const u8
+        \\      "main"
+        \\    .commit: []const u8
+        \\      "414358b"
         \\  .parent_sid: ?[]const u8
         \\    "root-sid"
         \\  .entry_meta: ?core.session.schema.Event.EntryMeta
-        \\    core.session.schema.Event.EntryMeta
-        \\      .ts_ms: ?i64
-        \\        1718800000000
-        \\      .is_err: ?bool
-        \\        true
-        \\      .tool: ?[]const u8
-        \\        "bash"
-        \\      .exit_code: ?i32
-        \\        127
+        \\    .ts_ms: ?i64
+        \\      1718800000000
+        \\    .is_err: ?bool
+        \\      true
+        \\    .tool: ?[]const u8
+        \\      "bash"
+        \\    .exit_code: ?i32
+        \\      127
     ).expectEqual(parsed.value);
 }
 
@@ -539,6 +543,12 @@ test "Event.dupe deep-copies tool_call strings" {
         \\        "bash"
         \\      .args: []const u8
         \\        "{"cmd":"ls"}"
+        \\  .git_meta: ?core.session.schema.Event.GitMeta
+        \\    null
+        \\  .parent_sid: ?[]const u8
+        \\    null
+        \\  .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\    null
     ).expectEqual(d);
 
     // Verify independent allocation (pointers differ)
@@ -576,6 +586,12 @@ test "Event.dupe deep-copies tool_result strings" {
         \\      .output: []const u8
         \\        "output-data"
         \\      .is_err: bool = true
+        \\  .git_meta: ?core.session.schema.Event.GitMeta
+        \\    null
+        \\  .parent_sid: ?[]const u8
+        \\    null
+        \\  .entry_meta: ?core.session.schema.Event.EntryMeta
+        \\    null
     ).expectEqual(d);
     const tr = d.data.tool_result;
     try std.testing.expect(tr.id.ptr != orig.data.tool_result.id.ptr);
