@@ -134,10 +134,16 @@ pub fn load(gpa: std.mem.Allocator, home: []const u8) !Config {
 
     const path = try std.fs.path.join(ar, &.{ home, ".pz", "models.json" });
     const raw = readPath(ar, path) catch |err| switch (err) {
-        // Missing file is the one valid "no overrides" case. Every other read
-        // failure (permission, IO) is surfaced, not swallowed.
+        // Missing file is the one valid "no overrides" case.
         error.FileNotFound => return cfg,
-        else => return error.BadModelConfig,
+        // An oversized file is content the loader refuses to parse — a
+        // malformed-config condition, not a filesystem fault.
+        error.StreamTooLong => return error.BadModelConfig,
+        // Every genuine filesystem/IO fault (permission denied, path is a
+        // directory, read error, OOM) propagates unchanged. Collapsing these
+        // into BadModelConfig would make a permissions bug indistinguishable
+        // from a typo in the JSON — the caller could never tell which to fix.
+        else => |e| return e,
     };
 
     try applyFile(&cfg, raw);
@@ -172,18 +178,42 @@ fn seedFromRegistry(gpa: std.mem.Allocator) !Config {
     // `models.zig` keeps its registry private, so re-resolve each known name
     // through the public `findModel` API. Names are stable literals from the
     // registry; duping into the arena keeps `Config` self-contained even if a
-    // later override replaces the value.
+    // later override replaces the value. Resolution cannot fail at runtime —
+    // the comptime block below proves every name resolves, so this is an
+    // unconditional fetch, not a checked-with-panic fallback.
     for (registry_names) |name| {
-        const info = models.findModel(name) orelse
-            @panic("config: registry name not resolvable via findModel");
+        const info = registry_info.get(name).?;
         try cfg.map.put(ar, try ar.dupe(u8, name), info);
     }
     return cfg;
 }
 
-/// Names that must resolve through `models.findModel`. Kept in sync with the
-/// `models.zig` registry; a missing/renamed row panics in `seedFromRegistry`
-/// (a build-time wiring bug, not a reachable runtime state).
+/// Resolve every `registry_names` entry through `models.findModel` at comptime.
+/// `findModel` iterates a comptime-known table, so this is fully evaluable at
+/// build time: a name that no longer matches a `models.zig` row (a rename or a
+/// removal) fails the build with a clear message instead of `@panic`-ing in a
+/// user's process. The result is a comptime map of name → `ModelInfo` consumed
+/// by `seedFromRegistry`, so the resolution happens exactly once, at build.
+const registry_info = blk: {
+    var map = std.StaticStringMap(ModelInfo).initComptime(pairs: {
+        var kv: [registry_names.len]struct { []const u8, ModelInfo } = undefined;
+        for (registry_names, 0..) |name, i| {
+            const info = models.findModel(name) orelse @compileError(
+                "config: registry name '" ++ name ++
+                    "' no longer resolves via models.findModel — " ++
+                    "models.zig and config.registry_names have diverged",
+            );
+            kv[i] = .{ name, info };
+        }
+        break :pairs kv;
+    });
+    break :blk map;
+};
+
+/// Names mirrored from the `models.zig` registry. Divergence (a removed or
+/// renamed row) is caught at build time by the `registry_info` comptime block,
+/// never at runtime. Adding a new model to `models.zig` without listing it here
+/// simply leaves it unseeded; the static `findModel` lookup still serves it.
 const registry_names = [_][]const u8{
     "claude-opus-4",
     "claude-sonnet-4",
@@ -523,4 +553,67 @@ test "empty document leaves registry intact, no leaks" {
     try testing.expectEqual(@as(u32, 200_000), cfg.find("claude-opus-4").?.ctx_win);
     try testing.expectEqual(registry_names.len, cfg.map.count());
     try testing.expectEqual(@as(usize, 0), cfg.wildcards.items.len);
+}
+
+test "every registry name seeds via comptime-resolved info, not a runtime panic" {
+    // The comptime `registry_info` map proves each name resolves at build time;
+    // here we assert the runtime seed reproduces every name with the same value
+    // `models.findModel` would return — i.e. no name silently dropped or remapped.
+    var cfg = try loadFromBytes(testing.allocator, "{}");
+    defer cfg.deinit();
+    for (registry_names) |name| {
+        const seeded = cfg.find(name) orelse {
+            std.debug.print("registry name not seeded: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        };
+        const canonical = models.findModel(name).?;
+        try testing.expectEqualStrings(canonical.name, seeded.name);
+        try testing.expectEqual(canonical.provider, seeded.provider);
+        try testing.expectEqual(canonical.ctx_win, seeded.ctx_win);
+        try testing.expectEqual(canonical.in_cost, seeded.in_cost);
+    }
+}
+
+test "directory at config path surfaces a filesystem error, not BadModelConfig" {
+    // Regression for the read-error conflation finding: a real filesystem fault
+    // (here, `models.json` is a directory) must NOT be reported as a config
+    // validation error. The caller has to be able to tell "I have a perms/path
+    // problem" apart from "my JSON is malformed".
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".pz/models.json");
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+
+    const res = load(testing.allocator, home);
+    try testing.expect(std.meta.isError(res));
+    if (res) |cfg_ok| {
+        var c = cfg_ok;
+        c.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        // The exact errno varies by platform (IsDir on most POSIX, AccessDenied
+        // on some); the contract under test is only that it is NOT remapped to
+        // the config-validation error.
+        try testing.expect(err != error.BadModelConfig);
+    }
+}
+
+test "oversized config file is malformed config, not a benign miss" {
+    // A present-but-too-large file is content the loader refuses to parse. It
+    // maps to BadModelConfig (malformed), and crucially is NOT treated like a
+    // missing file (which would silently fall back to the bare registry).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".pz");
+
+    const big = try testing.allocator.alloc(u8, max_file + 16);
+    defer testing.allocator.free(big);
+    @memset(big, ' ');
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".pz/models.json", .data = big });
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+
+    try testing.expectError(error.BadModelConfig, load(testing.allocator, home));
 }
