@@ -166,6 +166,64 @@ pub const Layer = enum(u8) {
     bg = 48,
 };
 
+/// Inferred terminal background luminance from the COLORFGBG env var.
+pub const TermBg = enum { dark, light };
+
+/// Classify a single COLORFGBG color index into a background luminance.
+///
+/// Convention (matches widely deployed terminals): the 16 ANSI palette
+/// slots split as
+///   - dark backgrounds:  0,1,2,3,4,5,6  and 8 (bright black)
+///   - light backgrounds: 7 (white) and 9..15 (bright colors)
+/// Index 8 is deliberately treated as dark because it is "bright black",
+/// while 7 ("white") is the canonical light-background marker.
+fn bgFromIndex(idx: u8) ?TermBg {
+    return switch (idx) {
+        0...6, 8 => .dark,
+        7, 9...15 => .light,
+        else => null, // out of the 0..15 palette: no reliable signal
+    };
+}
+
+/// Detect terminal background luminance from a COLORFGBG value.
+///
+/// `value` is the raw COLORFGBG string (or null when the var is unset).
+/// COLORFGBG is "fg;bg" or, on some terminals, "fg;default;bg"; the
+/// background is always the last semicolon-separated field. The field is
+/// parsed as a decimal palette index and classified via `bgFromIndex`.
+///
+/// Returns null — meaning "no usable signal" — when:
+///   - `value` is null (var unset),
+///   - the string is empty or has no background field,
+///   - the background field is not a base-10 integer, or
+///   - the index falls outside the 0..15 ANSI palette.
+/// The caller is responsible for choosing an explicit default; this
+/// function never guesses a luminance from malformed input.
+pub fn detectTermBg(value: ?[]const u8) ?TermBg {
+    const raw = value orelse return null;
+    // Background is the final field; supports both "fg;bg" and
+    // "fg;default;bg" layouts.
+    const sep = std.mem.lastIndexOfScalar(u8, raw, ';') orelse return null;
+    const bg_str = raw[sep + 1 ..];
+    if (bg_str.len == 0) return null;
+    const idx = std.fmt.parseInt(u8, bg_str, 10) catch return null;
+    return bgFromIndex(idx);
+}
+
+/// Thin env-reading wrapper: reads COLORFGBG and classifies it.
+/// Kept separate from `detectTermBg` so the parsing logic stays unit
+/// testable without mutating the real process environment.
+pub fn detectTermBgFromEnv() ?TermBg {
+    return detectTermBg(getenvRuntime("COLORFGBG"));
+}
+
+/// Runtime env read for variables not known at comptime (COLORFGBG is not
+/// a field of the comptime `environString` table). Mirrors the env-access
+/// pattern used elsewhere in the codebase (e.g. theme.zig, image.zig).
+fn getenvRuntime(name: [*:0]const u8) ?[]const u8 {
+    return if (std.c.getenv(name)) |value| std.mem.span(value) else null;
+}
+
 fn writeFmt(out: anytype, comptime fmt: []const u8, args: anytype) !void {
     var buf: [64]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch return error.NoSpaceLeft;
@@ -254,6 +312,38 @@ test "writeColor basic bg idx" {
     var out = TestBuf.init(&buf);
     try writeColor(&out, .bg, .{ .idx = 1 }, .basic);
     try std.testing.expectEqualStrings(";41", out.view());
+}
+
+test "detectTermBg dark bg index 0" {
+    try std.testing.expectEqual(TermBg.dark, detectTermBg("15;0").?);
+}
+
+test "detectTermBg light bg index 15" {
+    try std.testing.expectEqual(TermBg.light, detectTermBg("0;15").?);
+}
+
+test "detectTermBg index 7 is light, index 8 is dark" {
+    // 7 = white (light bg), 8 = bright black (dark bg)
+    try std.testing.expectEqual(TermBg.light, detectTermBg("0;7").?);
+    try std.testing.expectEqual(TermBg.dark, detectTermBg("15;8").?);
+}
+
+test "detectTermBg handles fg;default;bg layout" {
+    try std.testing.expectEqual(TermBg.light, detectTermBg("15;default;15").?);
+    try std.testing.expectEqual(TermBg.dark, detectTermBg("15;default;0").?);
+}
+
+test "detectTermBg null when var unset" {
+    try std.testing.expect(detectTermBg(null) == null);
+}
+
+test "detectTermBg null on malformed input" {
+    try std.testing.expect(detectTermBg("") == null);
+    try std.testing.expect(detectTermBg("nosemicolon") == null);
+    try std.testing.expect(detectTermBg("15;") == null);
+    try std.testing.expect(detectTermBg("15;abc") == null);
+    try std.testing.expect(detectTermBg("15;999") == null); // out of u8 range
+    try std.testing.expect(detectTermBg("15;42") == null); // outside 0..15 palette
 }
 
 const TestBuf = @import("test_buf.zig").TestBuf;

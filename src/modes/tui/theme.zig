@@ -1,6 +1,8 @@
 //! Color theme definitions for light and dark terminals.
 const std = @import("std");
 const Color = @import("frame.zig").Color;
+const color_detect = @import("color_detect.zig");
+const TermBg = color_detect.TermBg;
 
 pub const Theme = struct {
     // UI
@@ -182,34 +184,33 @@ pub const light = Theme{
 var active: std.atomic.Value(*const Theme) = std.atomic.Value(*const Theme).init(&dark);
 
 pub fn init(name: ?[]const u8) void {
-    if (name) |raw| {
-        active.store(themeByName(raw) orelse &dark, .release);
-        return;
-    }
+    // Explicit override sources, in precedence order. An override always
+    // wins over COLORFGBG auto-detection (criterion 3).
+    const override = name orelse getenv("PZ_THEME") orelse getenv("PI_THEME");
+    active.store(pick(override, color_detect.detectTermBgFromEnv()), .release);
+}
 
-    if (getenv("PZ_THEME")) |val| {
-        active.store(themeByName(val) orelse &dark, .release);
-        return;
-    }
-    if (getenv("PI_THEME")) |val| {
-        active.store(themeByName(val) orelse &dark, .release);
-        return;
-    }
+/// Documented fallback theme when nothing else resolves a choice:
+/// absent or malformed COLORFGBG, and no explicit override, select dark.
+const default_theme: *const Theme = &dark;
 
-    var theme: *const Theme = &dark;
-    // Auto-detect from COLORFGBG: "fg;bg" — high bg number means light bg
-    if (getenv("COLORFGBG")) |val| {
-        if (std.mem.lastIndexOfScalar(u8, val, ';')) |sep| {
-            const bg_str = val[sep + 1 ..];
-            if (std.fmt.parseInt(u8, bg_str, 10)) |bg| {
-                // bg >= 8 typically means a light background
-                if (bg >= 8) {
-                    theme = &light;
-                }
-            } else |_| {}
-        }
-    }
-    active.store(theme, .release);
+/// Resolve the active theme from an optional explicit override name and an
+/// optional auto-detected terminal background. Pure and injectable so the
+/// precedence and fallback rules are unit testable without touching env.
+///
+/// Precedence:
+///   1. `override` (a theme name) wins when present; unknown names fall
+///      back to `default_theme`.
+///   2. otherwise, `detected` COLORFGBG luminance maps dark bg -> dark
+///      theme (light-on-dark) and light bg -> light theme (dark-on-light).
+///   3. otherwise (no override, no signal) -> `default_theme` (dark).
+fn pick(override: ?[]const u8, detected: ?TermBg) *const Theme {
+    if (override) |raw| return themeByName(raw) orelse default_theme;
+    if (detected) |bg| return switch (bg) {
+        .dark => &dark,
+        .light => &light,
+    };
+    return default_theme;
 }
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
@@ -268,4 +269,43 @@ test "init falls back to dark on unknown explicit theme" {
 
     init("custom-unknown");
     try std.testing.expect(get() == &dark);
+}
+
+// --- COLORFGBG auto-detection (criteria 1-4) via the pure `pick` helper ---
+
+test "criterion 1: dark bg selects dark theme" {
+    // COLORFGBG="15;0" -> dark bg -> light-on-dark (dark) theme
+    const bg = color_detect.detectTermBg("15;0");
+    try std.testing.expectEqual(TermBg.dark, bg.?);
+    try std.testing.expect(pick(null, bg) == &dark);
+}
+
+test "criterion 2: light bg selects light theme" {
+    // COLORFGBG="0;15" -> light bg -> dark-on-light (light) theme
+    const bg = color_detect.detectTermBg("0;15");
+    try std.testing.expectEqual(TermBg.light, bg.?);
+    try std.testing.expect(pick(null, bg) == &light);
+}
+
+test "criterion 3: explicit override wins over COLORFGBG detection" {
+    // Detection says light, but an explicit "dark" override must win.
+    const light_bg = color_detect.detectTermBg("0;15");
+    try std.testing.expectEqual(TermBg.light, light_bg.?);
+    try std.testing.expect(pick("dark", light_bg) == &dark);
+
+    // And the reverse: detection says dark, override "light" wins.
+    const dark_bg = color_detect.detectTermBg("15;0");
+    try std.testing.expectEqual(TermBg.dark, dark_bg.?);
+    try std.testing.expect(pick("light", dark_bg) == &light);
+}
+
+test "criterion 4: absent/malformed COLORFGBG falls back to dark" {
+    // Absent COLORFGBG (no signal) and no override -> documented default (dark).
+    try std.testing.expect(color_detect.detectTermBg(null) == null);
+    try std.testing.expect(pick(null, null) == default_theme);
+    try std.testing.expect(pick(null, null) == &dark);
+
+    // Malformed values produce no signal, same documented fallback.
+    try std.testing.expect(pick(null, color_detect.detectTermBg("garbage")) == &dark);
+    try std.testing.expect(pick(null, color_detect.detectTermBg("15;abc")) == &dark);
 }
