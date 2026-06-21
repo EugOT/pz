@@ -195,7 +195,11 @@ fn seedFromRegistry(gpa: std.mem.Allocator) !Config {
 /// user's process. The result is a comptime map of name → `ModelInfo` consumed
 /// by `seedFromRegistry`, so the resolution happens exactly once, at build.
 const registry_info = blk: {
-    var map = std.StaticStringMap(ModelInfo).initComptime(pairs: {
+    // Resolving every registry name through `models.findModel` (a linear scan
+    // with per-row string compares) costs more than the default 1000-branch
+    // comptime budget once this module is actually compiled into a target.
+    @setEvalBranchQuota(20_000);
+    const map = std.StaticStringMap(ModelInfo).initComptime(pairs: {
         var kv: [registry_names.len]struct { []const u8, ModelInfo } = undefined;
         for (registry_names, 0..) |name, i| {
             const info = models.findModel(name) orelse @compileError(

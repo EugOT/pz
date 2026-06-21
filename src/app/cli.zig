@@ -26,6 +26,7 @@ pub const Run = struct {
     tool_mask: u16 = @import("../core.zig").tools.builtin.mask_all,
     thinking: Args.ThinkingLevel = .adaptive,
     verbose: bool = false,
+    diag: bool = false,
     system_prompt: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
     max_turns: u16 = 0,
@@ -82,6 +83,7 @@ pub fn parse(
             .tool_mask = parsed.tool_mask,
             .thinking = parsed.thinking,
             .verbose = parsed.verbose,
+            .diag = parsed.diag,
             .system_prompt = parsed.system_prompt,
             .append_system_prompt = parsed.append_system_prompt,
             .max_turns = parsed.max_turns,
@@ -123,6 +125,7 @@ pub const help_text =
     \\      --thinking <LEVEL>      Thinking mode (off,minimal,low,medium,high,xhigh,adaptive)
     \\      --max-turns <N>          Limit agent loop turns (0=unlimited)
     \\      --verbose               Show metadata in print mode
+    \\      --diag                  Show per-turn diagnostics breakdown (print mode)
     \\      --system-prompt <TEXT>   Override system prompt
     \\      --append-system-prompt <TEXT>
     \\                             Append to system prompt
