@@ -15,6 +15,23 @@ const ToolResultOut = struct {
     is_err: bool,
 };
 
+/// Per-turn diagnostics breakdown emitted under `--diag` in the verbose path.
+/// All durations are whole milliseconds; `retries` is the count of retry
+/// attempts (0 == first try succeeded). Fields map to the reliability and
+/// streaming stages the runtime measures per turn.
+pub const DiagEntry = struct {
+    /// 1-based turn index within the run.
+    turn: u16,
+    /// Provider stream wall time (request start -> stream done), ms.
+    stream_ms: u64,
+    /// Total time spent executing tools this turn, ms.
+    tool_ms: u64,
+    /// Time spent in auto-compaction this turn (0 if none), ms.
+    compact_ms: u64,
+    /// Retry attempts that fired this turn (0 == no retries).
+    retries: u16,
+};
+
 pub const Formatter = struct {
     alloc: std.mem.Allocator,
     out: *std.Io.Writer,
@@ -25,6 +42,7 @@ pub const Formatter = struct {
     tool_calls: std.ArrayListUnmanaged(ToolCallOut) = .empty,
     tool_results: std.ArrayListUnmanaged(ToolResultOut) = .empty,
     errs: std.ArrayListUnmanaged([]const u8) = .empty,
+    diag: std.ArrayListUnmanaged(DiagEntry) = .empty,
     usage: ?core.providers.Usage = null,
     stop: ?core.providers.StopReason = null,
 
@@ -54,6 +72,9 @@ pub const Formatter = struct {
 
         for (self.errs.items) |text| self.alloc.free(text);
         self.errs.deinit(self.alloc);
+
+        // DiagEntry holds no owned allocations; release the backing list only.
+        self.diag.deinit(self.alloc);
     }
 
     pub fn push(self: *Formatter, ev: core.providers.Event) !void {
@@ -134,6 +155,15 @@ pub const Formatter = struct {
             try writeQuoted(self.out, text);
             try self.out.writeByte('\n');
         }
+
+        // Per-turn diagnostics breakdown (--diag). Emitted in turn order; turn
+        // index is the stable sort key, so no reordering is applied.
+        for (self.diag.items) |d| {
+            try self.out.print(
+                "diag turn={d} stream_ms={d} tool_ms={d} compact_ms={d} retries={d}\n",
+                .{ d.turn, d.stream_ms, d.tool_ms, d.compact_ms, d.retries },
+            );
+        }
     }
 
     fn pushText(self: *Formatter, text: []const u8) !void {
@@ -202,13 +232,21 @@ pub const Formatter = struct {
         try self.errs.append(self.alloc, dup);
     }
 
+    /// Record a per-turn diagnostics breakdown. Entries are emitted in
+    /// insertion (turn) order under the verbose `--diag` path. Called by the
+    /// runtime once per completed turn with measured timing/retry data.
+    pub fn pushDiag(self: *Formatter, entry: DiagEntry) !void {
+        try self.diag.append(self.alloc, entry);
+    }
+
     fn hasMeta(self: *const Formatter) bool {
         return self.thinking.items.len > 0 or
             self.tool_calls.items.len > 0 or
             self.tool_results.items.len > 0 or
             self.usage != null or
             self.stop != null or
-            self.errs.items.len > 0;
+            self.errs.items.len > 0 or
+            self.diag.items.len > 0;
     }
 
     fn sortMeta(self: *Formatter) void {
@@ -509,4 +547,68 @@ test "formatter redacts secrets in verbose tool output" {
     try std.testing.expect(std.mem.indexOf(u8, written, "sk-test-key") == null);
     // Path in tool args must be redacted
     try std.testing.expect(std.mem.indexOf(u8, written, "~/.pz/auth.json") == null);
+}
+
+// ---------------------------------------------------------------------------
+// ML3: --diag per-turn diagnostics breakdown
+// ---------------------------------------------------------------------------
+
+const OhSnap = @import("ohsnap");
+
+test "diag entries render a per-turn breakdown in verbose path" {
+    var buf: [2048]u8 = undefined;
+    var fbs: std.Io.Writer = .fixed(&buf);
+    var formatter = Formatter.init(std.testing.allocator, &fbs);
+    formatter.verbose = true;
+    defer formatter.deinit();
+
+    // Known timing/retry/tool-latency data for two turns.
+    try formatter.pushDiag(.{ .turn = 1, .stream_ms = 1200, .tool_ms = 350, .compact_ms = 0, .retries = 0 });
+    try formatter.pushDiag(.{ .turn = 2, .stream_ms = 800, .tool_ms = 90, .compact_ms = 420, .retries = 2 });
+    try formatter.finish();
+
+    try std.testing.expectEqualStrings(
+        "diag turn=1 stream_ms=1200 tool_ms=350 compact_ms=0 retries=0\n" ++
+            "diag turn=2 stream_ms=800 tool_ms=90 compact_ms=420 retries=2\n",
+        fbs.buffered(),
+    );
+}
+
+test "diag entries are suppressed in non-verbose path" {
+    var buf: [512]u8 = undefined;
+    var fbs: std.Io.Writer = .fixed(&buf);
+    var formatter = Formatter.init(std.testing.allocator, &fbs);
+    // verbose defaults to false; --diag breakdown is a verbose-only surface.
+    defer formatter.deinit();
+
+    try formatter.pushDiag(.{ .turn = 1, .stream_ms = 10, .tool_ms = 5, .compact_ms = 0, .retries = 1 });
+    try formatter.finish();
+
+    try std.testing.expectEqualStrings("", fbs.buffered());
+}
+
+test "snapshot: diag breakdown renders stable multi-field lines" {
+    const oh = OhSnap{};
+
+    var buf: [2048]u8 = undefined;
+    var fbs: std.Io.Writer = .fixed(&buf);
+    var formatter = Formatter.init(std.testing.allocator, &fbs);
+    formatter.verbose = true;
+    defer formatter.deinit();
+
+    // Interleave a turn with retries+compaction and a clean turn to lock the
+    // full serialized payload shape.
+    try formatter.pushDiag(.{ .turn = 1, .stream_ms = 1500, .tool_ms = 0, .compact_ms = 0, .retries = 0 });
+    try formatter.pushDiag(.{ .turn = 2, .stream_ms = 640, .tool_ms = 275, .compact_ms = 310, .retries = 3 });
+    try formatter.pushDiag(.{ .turn = 3, .stream_ms = 999, .tool_ms = 12, .compact_ms = 0, .retries = 1 });
+    try formatter.finish();
+
+    const rendered = fbs.buffered();
+    try oh.snap(@src(),
+        \\[]u8
+        \\  "diag turn=1 stream_ms=1500 tool_ms=0 compact_ms=0 retries=0
+        \\diag turn=2 stream_ms=640 tool_ms=275 compact_ms=310 retries=3
+        \\diag turn=3 stream_ms=999 tool_ms=12 compact_ms=0 retries=1
+        \\"
+    ).expectEqual(rendered);
 }

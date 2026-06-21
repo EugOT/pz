@@ -1,5 +1,6 @@
 //! Aggregated test imports for `zig build test`.
 comptime {
+    _ = @import("app/args.zig");
     _ = @import("app/cli.zig");
     _ = @import("app/changelog.zig");
     _ = @import("app/tls.zig");
@@ -15,6 +16,7 @@ comptime {
     _ = @import("core/providers/openai.zig");
     _ = @import("core/providers/models.zig");
     _ = @import("modes/mode.zig");
+    _ = @import("modes/print/format.zig");
     _ = @import("modes/print/run.zig");
     _ = @import("modes/tui/harness.zig");
     _ = @import("modes/tui/table_layout.zig");
