@@ -254,7 +254,10 @@ pub const ProcTransport = struct {
             .environ_map = &env,
             .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
         });
-        errdefer _ = child.wait(self.io) catch {};
+        // On any error below, terminate the child before reaping. A bare
+        // `wait()` here would block indefinitely if the plugin closed stdin but
+        // kept running (or we hit max_resp) — kill the process group first.
+        errdefer killAndWait(self.io, &child);
 
         var stdin = child.stdin orelse return error.Closed;
         child.stdin = null;
@@ -281,6 +284,40 @@ pub const ProcTransport = struct {
         return resp;
     }
 };
+
+/// Terminate a spawned child's process group, then reap it. Used on error paths
+/// so a misbehaving plugin (closed stdin but still running, or a response that
+/// overran the limit) can never block the caller in `wait()` forever. SIGTERM
+/// first, escalate to SIGKILL after a short grace, then wait. Best-effort: any
+/// signalling error still falls through to the final `wait`.
+fn killAndWait(io: std.Io, child: *std.process.Child) void {
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (child.id) |pid| {
+            const pgid = -pid;
+            std.posix.kill(pgid, std.posix.SIG.TERM) catch {};
+            // Grace period (~150ms) polling for exit before escalating.
+            var polls: u32 = 0;
+            while (polls < 15) : (polls += 1) {
+                const res = std.c.waitpid(pid, null, std.c.W.NOHANG);
+                switch (std.posix.errno(res)) {
+                    .SUCCESS => if (res != 0) {
+                        child.id = null;
+                        return;
+                    },
+                    .CHILD => {
+                        child.id = null;
+                        return;
+                    },
+                    .INTR => continue,
+                    else => break,
+                }
+                _ = std.posix.poll(&.{}, 10) catch 0;
+            }
+            std.posix.kill(pgid, std.posix.SIG.KILL) catch {};
+        }
+    }
+    _ = child.wait(io) catch {};
+}
 
 const ensureUtf8 = @import("tui/frame.zig").ensureUtf8;
 
