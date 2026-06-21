@@ -58,6 +58,7 @@ pub const Parsed = struct {
     provider_cmd: ?[]const u8 = null,
     thinking: ThinkingLevel = .adaptive,
     verbose: bool = false,
+    diag: bool = false,
     system_prompt: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
     max_turns: u16 = 0,
@@ -168,6 +169,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         provider_cmd,
         thinking,
         verbose,
+        diag,
         system_prompt,
         append_system_prompt,
         changelog,
@@ -204,6 +206,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .{ "--provider-cmd", .provider_cmd },
         .{ "--thinking", .thinking },
         .{ "--verbose", .verbose },
+        .{ "--diag", .diag },
         .{ "--system-prompt", .system_prompt },
         .{ "--append-system-prompt", .append_system_prompt },
         .{ "--changelog", .changelog },
@@ -291,6 +294,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
                     out.thinking = parseThinking(val) orelse return error.InvalidThinking;
                 },
                 .verbose => out.verbose = true,
+                .diag => out.diag = true,
                 .system_prompt => {
                     const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingSystemPromptValue;
                     if (val.len == 0) return error.MissingSystemPromptValue;
@@ -668,6 +672,24 @@ test "errors on duplicate and missing model or provider command args" {
         error.DuplicateProviderCmd,
         parse(&.{ "--provider-cmd", "a", "--provider-cmd", "b" }),
     );
+}
+
+test "parse diag flag" {
+    // Default: disabled.
+    const off = try parse(&.{});
+    try std.testing.expectEqual(false, off.diag);
+
+    // Present: enabled. --diag is an independent gate and must NOT imply
+    // --verbose: the runtime copies parsed.diag into its own formatter gate
+    // (diag_enabled), separate from the verbose gate.
+    const on = try parse(&.{"--diag"});
+    try std.testing.expectEqual(true, on.diag);
+    try std.testing.expectEqual(false, on.verbose);
+
+    // Combines with other flags without conflict.
+    const combo = try parse(&.{ "--verbose", "--diag" });
+    try std.testing.expectEqual(true, combo.verbose);
+    try std.testing.expectEqual(true, combo.diag);
 }
 
 test "parse max-turns flag" {
