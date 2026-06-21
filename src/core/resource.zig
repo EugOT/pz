@@ -338,7 +338,9 @@ fn joinBodiesAlloc(
 
     for (ordered, 0..) |r, i| {
         if (i != 0) try out.appendSlice(alloc, "\n\n");
-        try out.appendSlice(alloc, std.mem.trimEnd(u8, r.meta.body, "\n"));
+        // Trim both \n and \r so CRLF-terminated bodies (Windows-authored
+        // PROMPT.md/CONTEXT.md) don't leave a stray \r in the merged output.
+        try out.appendSlice(alloc, std.mem.trimEnd(u8, r.meta.body, "\r\n"));
     }
 
     return out.toOwnedSlice(alloc);
@@ -391,6 +393,45 @@ test "parseFrontmatter: enabled false and negative priority" {
     try std.testing.expect(result != null);
     try std.testing.expect(!result.?.meta.enabled);
     try std.testing.expectEqual(@as(i64, -3), result.?.meta.priority);
+}
+
+test "parseFrontmatter: CRLF line endings parse like LF" {
+    // Windows-authored files use \r\n; the parser must accept ---\r\n fences
+    // and not leave \r in parsed field values.
+    const input = "---\r\nname: win\r\ndescription: crlf file\r\nenabled: true\r\npriority: 2\r\n---\r\nbody line";
+    const result = try parseFrontmatter(std.testing.allocator, input);
+    defer if (result) |r| freeMeta(std.testing.allocator, r.meta);
+    try std.testing.expect(result != null);
+    const r = result.?;
+    try std.testing.expectEqualStrings("win", r.meta.name);
+    try std.testing.expectEqualStrings("crlf file", r.meta.description);
+    try std.testing.expect(r.meta.enabled);
+    try std.testing.expectEqual(@as(i64, 2), r.meta.priority);
+}
+
+test "parseFrontmatter: leading UTF-8 BOM is stripped" {
+    const input = "\xEF\xBB\xBF---\nname: bomtest\n---\nbody";
+    const result = try parseFrontmatter(std.testing.allocator, input);
+    defer if (result) |r| freeMeta(std.testing.allocator, r.meta);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("bomtest", result.?.meta.name);
+}
+
+test "mergePromptsAlloc trims trailing CRLF so no stray \\r leaks into output" {
+    // Regression for the body-trim bug: trimEnd("\n") alone left a trailing
+    // \r on CRLF bodies. The merged output must end at the last real char.
+    const res = [_]ResourceInfo{
+        .{ .kind = .prompts, .dir_name = "p", .meta = .{
+            .name = "p",
+            .description = "",
+            .body = "hello\r\n",
+            .enabled = true,
+            .priority = 0,
+        } },
+    };
+    const merged = try mergePromptsAlloc(std.testing.allocator, &res);
+    defer std.testing.allocator.free(merged);
+    try std.testing.expectEqualStrings("hello", merged);
 }
 
 // Criterion 1: discoverAndRead finds prompts/*/PROMPT.md and context/*/CONTEXT.md
