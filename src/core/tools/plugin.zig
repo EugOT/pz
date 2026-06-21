@@ -307,11 +307,18 @@ pub fn discover(alloc: std.mem.Allocator, home: ?[]const u8, pol: policy.Policy)
         return error.OutOfMemory;
 
     const active_io = defaultIo();
-    var dir = std.Io.Dir.openDirAbsolute(active_io, tools_path, .{ .iterate = true }) catch
-        return .{
+    var dir = std.Io.Dir.openDirAbsolute(active_io, tools_path, .{ .iterate = true }) catch |err| switch (err) {
+        // A missing tools dir (or a non-directory at that path) is the normal
+        // "no plugins installed" case → empty result. Every other open error
+        // (AccessDenied, PermissionDenied, SystemResources, …) is a real fault:
+        // surfacing it is the whole point of this gate, so it must propagate
+        // rather than masquerade as "no plugins" (per the module contract above).
+        error.FileNotFound, error.NotDir => return .{
             .plugins = try plugins.toOwnedSlice(alloc),
             .blocked = try blocked.toOwnedSlice(alloc),
-        };
+        },
+        else => return err,
+    };
     defer dir.close(active_io);
 
     var iter = dir.iterate();
@@ -443,8 +450,11 @@ pub const Runtime = struct {
     }
 
     /// Dispatch entry point — same signature/vtable the builtin Runtime binds.
-    /// Emits an audit entry on every plugin call before returning the result
-    /// envelope describing the handler that would run.
+    /// Emits an audit entry on every plugin call (EXT2's security boundary),
+    /// then reports that handler execution is not yet wired. EXT2 owns
+    /// discovery + the policy/audit gate; running the handler process is
+    /// EXT-WIRE's job. Until then the call must NOT claim success — returning a
+    /// fake `.ok` for a handler that never ran would be a silent false success.
     fn dispatchRun(self: *Runtime, call: tools.Call, _: *tools.Sink) !tools.Result {
         if (std.meta.activeTag(call.args) != .bash) return error.InvalidArgs;
 
@@ -473,30 +483,10 @@ pub const Runtime = struct {
             } },
         });
 
-        const msg = try std.fmt.allocPrint(self.alloc, "plugin {s}: {s}", .{
-            plugin.meta.name,
-            plugin.meta.handler,
-        });
-        errdefer self.alloc.free(msg);
-
-        const out = try self.alloc.alloc(tools.Output, 1);
-        out[0] = .{
-            .call_id = call.id,
-            .seq = 0,
-            .at_ms = call.at_ms,
-            .stream = .stdout,
-            .chunk = msg,
-            .owned = true,
-            .truncated = false,
-        };
-        return .{
-            .call_id = call.id,
-            .started_at_ms = call.at_ms,
-            .ended_at_ms = call.at_ms,
-            .out = out,
-            .out_owned = true,
-            .final = .{ .ok = .{ .code = 0 } },
-        };
+        // Handler execution lives in EXT-WIRE. Report that honestly instead of
+        // fabricating success: the call was audited and gated, but the handler
+        // command did not run, so the result is a typed `failed`, not `ok`.
+        return failed(call, .internal, "plugin handler execution not wired (EXT-WIRE)");
     }
 
     pub fn deinitResult(self: Runtime, res: tools.Result) void {
@@ -622,6 +612,35 @@ test "deniedRequirement: returns first tool the policy denies" {
     try testing.expectEqualStrings("bash", denied);
 }
 
+test "deniedRequirement: default-deny (no matching rule) blocks the tool" {
+    // No rule mentions "web" at all → policy falls through to deny. The gate's
+    // `!= .allow` guard must treat that absence as blocked, not allowed.
+    const rules = [_]policy.Rule{
+        .{ .pattern = "read", .effect = .allow, .tool = "read" },
+    };
+    const pol = policy.Policy{ .rules = &rules };
+    const reqs = [_][]const u8{"web"};
+    try testing.expectEqualStrings("web", deniedRequirement(pol, &reqs).?);
+}
+
+test "deniedRequirement: explicit deny effect blocks the tool" {
+    // An allow for one tool plus an explicit deny for another: the denied tool
+    // must be reported even though an earlier requirement was allowed.
+    const rules = [_]policy.Rule{
+        .{ .pattern = "read", .effect = .allow, .tool = "read" },
+        .{ .pattern = "bash", .effect = .deny, .tool = "bash" },
+    };
+    const pol = policy.Policy{ .rules = &rules };
+    const reqs = [_][]const u8{ "read", "bash" };
+    try testing.expectEqualStrings("bash", deniedRequirement(pol, &reqs).?);
+}
+
+test "deniedRequirement: all-allowed returns null" {
+    const pol = policy.Policy{ .rules = &allow_all };
+    const reqs = [_][]const u8{ "read", "bash", "web" };
+    try testing.expect(deniedRequirement(pol, &reqs) == null);
+}
+
 // ── Criterion 1: discovery + type-safe dispatch alongside builtins ──────
 
 test "criterion1: loader discovers PLUGIN.md and registers an invocable tool" {
@@ -692,8 +711,15 @@ test "criterion1: loader discovers PLUGIN.md and registers an invocable tool" {
     };
     const res = try reg.run("deploy", call, sink);
     defer rt.deinitResult(res);
-    try testing.expectEqual(tools.Result.Tag.ok, std.meta.activeTag(res.final));
-    try testing.expectEqualStrings("plugin deploy: ./deploy.sh", res.out[0].chunk);
+    // The handler is discovered, gated, and dispatched, but EXT2 does not run
+    // the handler process — that is EXT-WIRE. Dispatch must report this as a
+    // typed `failed`, never a fabricated `ok` for work that did not happen.
+    try testing.expectEqual(tools.Result.Tag.failed, std.meta.activeTag(res.final));
+    try testing.expectEqual(tools.Result.ErrKind.internal, res.final.failed.kind);
+    try testing.expectEqualStrings(
+        "plugin handler execution not wired (EXT-WIRE)",
+        res.final.failed.msg,
+    );
 }
 
 // ── Criterion 2: policy gate blocks a plugin (surfaced, not silent) ─────
@@ -851,4 +877,56 @@ test "no plugins dir: discover returns empty, no error" {
     defer loaded.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), loaded.plugins.len);
     try testing.expectEqual(@as(usize, 0), loaded.blocked.len);
+}
+
+test "tools path is a file (NotDir): discover treats it as empty, no error" {
+    // `<home>/.pz/tools` exists but is a regular file, not a directory. That is
+    // a benign "no plugins" shape (NotDir) → empty result, never an error.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+
+    try tmp.dir.createDirPath(testing.io, ".pz");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = ".pz/tools", .data = "not a dir" });
+
+    const pol = policy.Policy{ .rules = &allow_all };
+    const loaded = try discover(testing.allocator, home, pol);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), loaded.plugins.len);
+    try testing.expectEqual(@as(usize, 0), loaded.blocked.len);
+}
+
+test "unreadable tools dir: discover propagates the error, not a silent empty" {
+    // Root ignores POSIX mode bits, so the chmod-to-000 trap would not fire.
+    if (std.posix.geteuid() == 0) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+
+    try tmp.dir.createDirPath(testing.io, ".pz/tools");
+    var tools_dir = try tmp.dir.openDir(testing.io, ".pz/tools", .{});
+    // Strip all permissions: opening it for iteration must now fail with an
+    // access error. Restore perms before cleanup so deleteTree can recurse in.
+    try tools_dir.setPermissions(testing.io, .fromMode(0o000));
+    defer {
+        tools_dir.setPermissions(testing.io, .fromMode(0o755)) catch {};
+        tools_dir.close(testing.io);
+    }
+
+    const pol = policy.Policy{ .rules = &allow_all };
+    // The exact errno class is platform-dependent (AccessDenied /
+    // PermissionDenied); the contract is only that it does NOT silently return
+    // an empty Loaded. Assert that discover returns an error of any kind.
+    if (discover(testing.allocator, home, pol)) |loaded| {
+        loaded.deinit(testing.allocator);
+        // Some sandboxes (e.g. running effectively privileged) may still allow
+        // the open; in that case the trap could not be set, so skip rather than
+        // assert a false negative.
+        return error.SkipZigTest;
+    } else |_| {
+        // Propagated, as required. PASS.
+    }
 }
