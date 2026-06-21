@@ -679,9 +679,12 @@ test "parse diag flag" {
     const off = try parse(&.{});
     try std.testing.expectEqual(false, off.diag);
 
-    // Present: enabled.
+    // Present: enabled. --diag is an independent gate and must NOT imply
+    // --verbose: the runtime copies parsed.diag into its own formatter gate
+    // (diag_enabled), separate from the verbose gate.
     const on = try parse(&.{"--diag"});
     try std.testing.expectEqual(true, on.diag);
+    try std.testing.expectEqual(false, on.verbose);
 
     // Combines with other flags without conflict.
     const combo = try parse(&.{ "--verbose", "--diag" });

@@ -36,6 +36,10 @@ pub const Formatter = struct {
     alloc: std.mem.Allocator,
     out: *std.Io.Writer,
     verbose: bool = false,
+    /// Gate for the `--diag` per-turn breakdown. The runtime sets this from
+    /// `parsed.diag` (mirroring `verbose`). When false, `pushDiag` is a no-op
+    /// and the breakdown is never rendered, so the CLI flag drives the surface.
+    diag_enabled: bool = false,
     text_seen: bool = false,
     text_ended_nl: bool = false,
     thinking: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -235,7 +239,10 @@ pub const Formatter = struct {
     /// Record a per-turn diagnostics breakdown. Entries are emitted in
     /// insertion (turn) order under the verbose `--diag` path. Called by the
     /// runtime once per completed turn with measured timing/retry data.
+    /// No-op unless `diag_enabled` (set from the `--diag` flag), so the CLI
+    /// switch fully governs whether the breakdown is collected and shown.
     pub fn pushDiag(self: *Formatter, entry: DiagEntry) !void {
+        if (!self.diag_enabled) return;
         try self.diag.append(self.alloc, entry);
     }
 
@@ -560,6 +567,7 @@ test "diag entries render a per-turn breakdown in verbose path" {
     var fbs: std.Io.Writer = .fixed(&buf);
     var formatter = Formatter.init(std.testing.allocator, &fbs);
     formatter.verbose = true;
+    formatter.diag_enabled = true;
     defer formatter.deinit();
 
     // Known timing/retry/tool-latency data for two turns.
@@ -579,12 +587,32 @@ test "diag entries are suppressed in non-verbose path" {
     var fbs: std.Io.Writer = .fixed(&buf);
     var formatter = Formatter.init(std.testing.allocator, &fbs);
     // verbose defaults to false; --diag breakdown is a verbose-only surface.
+    // diag_enabled is set so the suppression is driven by verbose, not the gate.
+    formatter.diag_enabled = true;
     defer formatter.deinit();
 
     try formatter.pushDiag(.{ .turn = 1, .stream_ms = 10, .tool_ms = 5, .compact_ms = 0, .retries = 1 });
     try formatter.finish();
 
     try std.testing.expectEqualStrings("", fbs.buffered());
+}
+
+test "diag breakdown is gated off when diag flag is unset" {
+    // Proves the CLI flag governs the surface: with verbose on but the
+    // --diag gate off, pushDiag is a no-op and finish() emits nothing.
+    var buf: [512]u8 = undefined;
+    var fbs: std.Io.Writer = .fixed(&buf);
+    var formatter = Formatter.init(std.testing.allocator, &fbs);
+    formatter.verbose = true;
+    // diag_enabled defaults to false (mirrors --diag not being passed).
+    defer formatter.deinit();
+
+    try formatter.pushDiag(.{ .turn = 1, .stream_ms = 10, .tool_ms = 5, .compact_ms = 0, .retries = 1 });
+    try formatter.finish();
+
+    // No diag lines, and pushDiag did not buffer the entry.
+    try std.testing.expectEqual(@as(usize, 0), formatter.diag.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, fbs.buffered(), "diag ") == null);
 }
 
 test "snapshot: diag breakdown renders stable multi-field lines" {
@@ -594,6 +622,7 @@ test "snapshot: diag breakdown renders stable multi-field lines" {
     var fbs: std.Io.Writer = .fixed(&buf);
     var formatter = Formatter.init(std.testing.allocator, &fbs);
     formatter.verbose = true;
+    formatter.diag_enabled = true;
     defer formatter.deinit();
 
     // Interleave a turn with retries+compaction and a clean turn to lock the
