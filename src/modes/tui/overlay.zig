@@ -432,6 +432,346 @@ pub const Overlay = struct {
     }
 };
 
+// ── Session fork tree (parent/child chain) ───────────────────────────────
+//
+// Consumes the ML1 schema `Event.parent_sid` link (read-only). Given a flat
+// set of sessions, each carrying its own sid plus an optional parent_sid,
+// `SessionTree` reconstructs the fork hierarchy and renders it into a Frame as
+// an indented parent → child chain so the selection overlay can show where a
+// session was forked from.
+
+/// One node in the fork tree. `parent_sid` mirrors `schema.Event.parent_sid`:
+/// null marks a root session.
+pub const SessionNode = struct {
+    sid: []const u8,
+    title: []const u8,
+    parent_sid: ?[]const u8 = null,
+};
+
+/// Builds and renders the parent/child fork hierarchy from a flat node list.
+/// No ownership: it borrows the caller's `SessionNode` slice for its lifetime.
+pub const SessionTree = struct {
+    nodes: []const SessionNode,
+    sel: usize = 0,
+    title: []const u8 = "Session Tree",
+
+    /// Glyphs for the chain connectors.
+    const glyph_branch: u21 = 0x251C; // ├
+    const glyph_last: u21 = 0x2514; // └
+    const glyph_horiz: u21 = 0x2500; // ─
+    const glyph_vert: u21 = 0x2502; // │
+
+    pub fn init(nodes: []const SessionNode) SessionTree {
+        return .{ .nodes = nodes };
+    }
+
+    fn findIndex(self: *const SessionTree, sid: []const u8) ?usize {
+        for (self.nodes, 0..) |n, i| {
+            if (std.mem.eql(u8, n.sid, sid)) return i;
+        }
+        return null;
+    }
+
+    fn parentIndex(self: *const SessionTree, i: usize) ?usize {
+        const p = self.nodes[i].parent_sid orelse return null;
+        return self.findIndex(p);
+    }
+
+    fn isRoot(self: *const SessionTree, i: usize) bool {
+        // A node is a root if it has no parent_sid or its parent is not in
+        // this node set (an orphaned fork still renders at the top level).
+        return self.parentIndex(i) == null;
+    }
+
+    /// Depth of node `i` measured by walking parent links. Cycle-safe: a chain
+    /// longer than the node count is treated as detached and clamped.
+    fn depthOf(self: *const SessionTree, i: usize) usize {
+        var depth: usize = 0;
+        var cur = i;
+        var guard: usize = 0;
+        while (self.parentIndex(cur)) |p| {
+            depth += 1;
+            cur = p;
+            guard += 1;
+            if (guard > self.nodes.len) break;
+        }
+        return depth;
+    }
+
+    fn childCount(self: *const SessionTree, parent: usize) usize {
+        var n: usize = 0;
+        for (self.nodes, 0..) |_, i| {
+            if (self.parentIndex(i)) |p| {
+                if (p == parent) n += 1;
+            }
+        }
+        return n;
+    }
+
+    /// Index of node `i` among its siblings (children of the same parent, or
+    /// among roots when it has no parent), in node-array order.
+    fn siblingOrdinal(self: *const SessionTree, i: usize) usize {
+        const my_parent = self.parentIndex(i);
+        var ord: usize = 0;
+        for (self.nodes, 0..) |_, j| {
+            if (j == i) break;
+            const jp = self.parentIndex(j);
+            const same = if (my_parent) |mp|
+                (jp != null and jp.? == mp)
+            else
+                (jp == null);
+            if (same) ord += 1;
+        }
+        return ord;
+    }
+
+    fn isLastSibling(self: *const SessionTree, i: usize) bool {
+        return self.siblingOrdinal(i) + 1 == self.siblingGroupSize(i);
+    }
+
+    fn siblingGroupSize(self: *const SessionTree, i: usize) usize {
+        const my_parent = self.parentIndex(i);
+        var n: usize = 0;
+        for (self.nodes, 0..) |_, j| {
+            const jp = self.parentIndex(j);
+            const same = if (my_parent) |mp|
+                (jp != null and jp.? == mp)
+            else
+                (jp == null);
+            if (same) n += 1;
+        }
+        return n;
+    }
+
+    /// Visit nodes in pre-order (parent before children). Roots are visited in
+    /// node-array order; each subtree is expanded depth-first. The callback
+    /// receives the node index and its depth.
+    fn walk(
+        self: *const SessionTree,
+        comptime Ctx: type,
+        ctx: Ctx,
+        comptime cb: fn (Ctx, usize, usize) anyerror!void,
+    ) anyerror!void {
+        var visited = [_]bool{false} ** 256;
+        // Roots first, in order.
+        for (self.nodes, 0..) |_, i| {
+            if (self.isRoot(i) and !visited[i]) {
+                try self.walkSubtree(Ctx, ctx, cb, i, 0, &visited);
+            }
+        }
+        // Any node not reachable from a detected root (e.g. a cycle) still
+        // renders, so nothing is silently dropped.
+        for (self.nodes, 0..) |_, i| {
+            if (!visited[i]) {
+                try self.walkSubtree(Ctx, ctx, cb, i, self.depthOf(i), &visited);
+            }
+        }
+    }
+
+    fn walkSubtree(
+        self: *const SessionTree,
+        comptime Ctx: type,
+        ctx: Ctx,
+        comptime cb: fn (Ctx, usize, usize) anyerror!void,
+        i: usize,
+        depth: usize,
+        visited: *[256]bool,
+    ) anyerror!void {
+        if (i >= visited.len or visited[i]) return;
+        visited[i] = true;
+        try cb(ctx, i, depth);
+        for (self.nodes, 0..) |_, j| {
+            if (self.parentIndex(j)) |p| {
+                if (p == i and !visited[j]) {
+                    try self.walkSubtree(Ctx, ctx, cb, j, depth + 1, visited);
+                }
+            }
+        }
+    }
+
+    pub fn rowCount(self: *const SessionTree) usize {
+        return self.nodes.len;
+    }
+
+    /// Render context threaded through `walk` during a draw.
+    const RenderCtx = struct {
+        tree: *const SessionTree,
+        frm: *Frame,
+        x0: usize,
+        y0: usize,
+        box_w: usize,
+        row: *usize,
+        border_st: Style,
+        item_st: Style,
+        sel_st: Style,
+        bg: Color,
+        sel_bg: Color,
+    };
+
+    fn renderRow(ctx: RenderCtx, i: usize, depth: usize) anyerror!void {
+        const self = ctx.tree;
+        const frm = ctx.frm;
+        const r = ctx.row.*;
+        const y = ctx.y0 + 1 + r;
+        const is_sel = i == self.sel;
+        const row_bg = if (is_sel) ctx.sel_bg else ctx.bg;
+        const row_st = if (is_sel) ctx.sel_st else ctx.item_st;
+
+        try frm.set(ctx.x0, y, glyph_vert, ctx.border_st); // │ left edge
+
+        // Fill background across the interior.
+        var x = ctx.x0 + 1;
+        while (x < ctx.x0 + ctx.box_w - 1) : (x += 1) {
+            try frm.set(x, y, ' ', Style{ .bg = row_bg });
+        }
+
+        x = ctx.x0 + 2;
+        // Selection marker.
+        if (is_sel) {
+            try frm.set(x, y, '>', Style{ .fg = ctx.sel_st.fg, .bg = row_bg, .bold = true });
+        } else {
+            try frm.set(x, y, ' ', Style{ .bg = row_bg });
+        }
+        x += 1;
+        try frm.set(x, y, ' ', Style{ .bg = row_bg });
+        x += 1;
+
+        // Indentation: two columns per ancestor level.
+        var d: usize = 0;
+        while (d + 1 < depth) : (d += 1) {
+            if (x + 2 > ctx.x0 + ctx.box_w - 1) break;
+            try frm.set(x, y, ' ', Style{ .bg = row_bg });
+            try frm.set(x + 1, y, ' ', Style{ .bg = row_bg });
+            x += 2;
+        }
+
+        // Connector glyph for non-root rows.
+        if (depth > 0 and x + 2 <= ctx.x0 + ctx.box_w - 1) {
+            const branch: u21 = if (self.isLastSibling(i)) glyph_last else glyph_branch;
+            try frm.set(x, y, branch, Style{ .fg = ctx.border_st.fg, .bg = row_bg });
+            try frm.set(x + 1, y, glyph_horiz, Style{ .fg = ctx.border_st.fg, .bg = row_bg });
+            x += 2;
+            try frm.set(x, y, ' ', Style{ .bg = row_bg });
+            x += 1;
+        }
+
+        // Title text.
+        const text = self.nodes[i].title;
+        var ti: usize = 0;
+        while (ti < text.len) {
+            if (x >= ctx.x0 + ctx.box_w - 2) break;
+            const n = std.unicode.utf8ByteSequenceLength(text[ti]) catch break;
+            if (ti + n > text.len) break;
+            const cp = std.unicode.utf8Decode(text[ti .. ti + n]) catch break;
+            const cw = wc.wcwidth(cp);
+            if (x + cw > ctx.x0 + ctx.box_w - 1) break;
+            try frm.set(x, y, cp, Style{ .fg = row_st.fg, .bg = row_bg, .bold = row_st.bold });
+            x += cw;
+            ti += n;
+        }
+
+        try frm.set(ctx.x0 + ctx.box_w - 1, y, glyph_vert, ctx.border_st); // │ right edge
+        ctx.row.* = r + 1;
+    }
+
+    /// Render the fork tree centered in `frm`. Mock-terminal friendly: the
+    /// caller supplies an in-memory Frame and inspects cells afterward.
+    pub fn render(self: *const SessionTree, frm: *Frame) !void {
+        const t = theme_mod.get();
+        const n = self.nodes.len;
+
+        // Width: title plus the widest indented label.
+        var max_w: usize = wc.strwidth(self.title);
+        for (self.nodes, 0..) |node, i| {
+            const indent = 2 * self.depthOf(i) + 3; // marker + connector budget
+            const lw = wc.strwidth(node.title) + indent;
+            if (lw + 4 > max_w) max_w = lw + 4;
+        }
+
+        const box_w = @min(max_w + 4, frm.w);
+        const box_h = n + 2;
+        if (box_w < 8 or box_h > frm.h) return;
+
+        const x0 = (frm.w - box_w) / 2;
+        const y0 = (frm.h - box_h) / 2;
+
+        const border_rgb = switch (t.border_c) {
+            .rgb => |v| v,
+            else => 0x555555,
+        };
+        const heading_rgb = switch (t.md_heading) {
+            .rgb => |v| v,
+            else => 0xc5c8c6,
+        };
+        const border_st = Style{ .fg = .{ .rgb = border_rgb } };
+        const title_st = Style{ .fg = .{ .rgb = heading_rgb }, .bold = true };
+        const item_st = Style{ .fg = .{ .rgb = 0xc5c8c6 } };
+        const sel_st = Style{ .fg = .{ .rgb = 0x81a1c1 }, .bold = true };
+        const bg: Color = .{ .rgb = 0x1d1f21 };
+        const sel_bg: Color = .{ .rgb = 0x2d2f31 };
+
+        // Top border with centered title.
+        try frm.set(x0, y0, 0x250C, border_st); // ┌
+        {
+            var x = x0 + 1;
+            const title_w = wc.strwidth(self.title);
+            const pad_total = box_w -| 2 -| title_w;
+            const pad_l = pad_total / 2;
+            const pad_r = pad_total - pad_l;
+            var pi: usize = 0;
+            while (pi < pad_l) : (pi += 1) {
+                try frm.set(x, y0, 0x2500, border_st);
+                x += 1;
+            }
+            var ti: usize = 0;
+            while (ti < self.title.len) {
+                const sl = std.unicode.utf8ByteSequenceLength(self.title[ti]) catch break;
+                if (ti + sl > self.title.len) break;
+                const cp = std.unicode.utf8Decode(self.title[ti .. ti + sl]) catch break;
+                if (x >= x0 + box_w - 1) break;
+                try frm.set(x, y0, cp, title_st);
+                x += wc.wcwidth(cp);
+                ti += sl;
+            }
+            pi = 0;
+            while (pi < pad_r) : (pi += 1) {
+                if (x >= x0 + box_w - 1) break;
+                try frm.set(x, y0, 0x2500, border_st);
+                x += 1;
+            }
+        }
+        try frm.set(x0 + box_w - 1, y0, 0x2510, border_st); // ┐
+
+        // Body rows in pre-order.
+        var row: usize = 0;
+        const ctx = RenderCtx{
+            .tree = self,
+            .frm = frm,
+            .x0 = x0,
+            .y0 = y0,
+            .box_w = box_w,
+            .row = &row,
+            .border_st = border_st,
+            .item_st = item_st,
+            .sel_st = sel_st,
+            .bg = bg,
+            .sel_bg = sel_bg,
+        };
+        try self.walk(RenderCtx, ctx, renderRow);
+
+        // Bottom border.
+        const yb = y0 + box_h - 1;
+        try frm.set(x0, yb, 0x2514, border_st); // └
+        {
+            var x = x0 + 1;
+            while (x < x0 + box_w - 1) : (x += 1) {
+                try frm.set(x, yb, 0x2500, border_st);
+            }
+        }
+        try frm.set(x0 + box_w - 1, yb, 0x2518, border_st); // ┘
+    }
+};
+
 /// Extract short display name from full model ID.
 /// "claude-opus-4-6-20250219" → "claude-opus-4-6"
 fn shortLabel(model: []const u8) []const u8 {
@@ -695,6 +1035,50 @@ test "settings overlay toggle and render" {
         "row1 @0:? | @2:> | @4:Show | @9:tools | @18:? | @20:?\nrow2 @0:? | @4:Show | @9:thinking | @18:? | @20:?\nrow3 @0:? | @4:Auto-compact | @18:? | @20:?",
         actual,
     );
+}
+
+test "session tree renders parent/child hierarchy from parent_sid" {
+    // root → child-a → grandchild, plus a second child-b under root.
+    // parent_sid links mirror schema.Event.parent_sid.
+    const nodes = [_]SessionNode{
+        .{ .sid = "root", .title = "root", .parent_sid = null },
+        .{ .sid = "a", .title = "child-a", .parent_sid = "root" },
+        .{ .sid = "g", .title = "grandkid", .parent_sid = "a" },
+        .{ .sid = "b", .title = "child-b", .parent_sid = "root" },
+    };
+    var tree = SessionTree.init(&nodes);
+    tree.title = "Fork Tree";
+    tree.sel = 1; // child-a selected
+
+    var frm = try Frame.init(std.testing.allocator, 36, 10);
+    defer frm.deinit(std.testing.allocator);
+    try tree.render(&frm);
+
+    const actual = try trimmedBoxSegmentsAlloc(std.testing.allocator, &frm);
+    defer std.testing.allocator.free(actual);
+    // row0: title border. row1: root (depth 0, no connector).
+    // row2: > child-a with ├─ connector (selected, depth 1).
+    // row3: grandkid with └─ under child-a (depth 2).
+    // row4: child-b with └─ (last child of root, depth 1).
+    try expectSnapText(
+        @src(),
+        "row0 @0:???????Fork | @12:Tree???????\nrow1 @0:? | @4:root | @22:?\nrow2 @0:? | @2:> | @4:?? | @7:child-a | @22:?\nrow3 @0:? | @6:?? | @9:grandkid | @22:?\nrow4 @0:? | @4:?? | @7:child-b | @22:?\nrow5 @0:???????????????????????",
+        actual,
+    );
+}
+
+test "session tree depth and root detection from parent_sid" {
+    const nodes = [_]SessionNode{
+        .{ .sid = "root", .title = "root", .parent_sid = null },
+        .{ .sid = "a", .title = "child", .parent_sid = "root" },
+        .{ .sid = "g", .title = "grandkid", .parent_sid = "a" },
+    };
+    const tree = SessionTree.init(&nodes);
+    try std.testing.expect(tree.isRoot(0));
+    try std.testing.expect(!tree.isRoot(1));
+    try std.testing.expectEqual(@as(usize, 0), tree.depthOf(0));
+    try std.testing.expectEqual(@as(usize, 1), tree.depthOf(1));
+    try std.testing.expectEqual(@as(usize, 2), tree.depthOf(2));
 }
 
 test "shortLabel strips date suffix" {
