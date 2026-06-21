@@ -22,6 +22,7 @@ comptime {
     _ = @import("modes/tui/test.zig");
     _ = @import("perf/baseline.zig");
     _ = @import("core/skill.zig");
+    _ = @import("core/resource.zig");
     _ = @import("core/policy.zig");
     _ = @import("core/shell.zig");
     _ = @import("core/lru.zig");
