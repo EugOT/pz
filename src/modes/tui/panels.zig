@@ -570,6 +570,181 @@ pub const Panels = struct {
     }
 };
 
+// --- Custom panel plugins (~/.pz/panels/*/PANEL.md) ---
+
+/// Where the custom panel sits in the frame layout (read from settings).
+pub const PanelSlot = enum {
+    /// Below the transcript, above the editor border.
+    below_transcript,
+    /// Above the footer, below the editor border.
+    above_footer,
+};
+
+/// A discovered panel plugin. `body` is the markdown after the PANEL.md
+/// frontmatter; it is rendered line-by-line into the panel rect. `title` is the
+/// frontmatter `name`. `slot` controls layout placement.
+pub const PanelPlugin = struct {
+    dir_name: []const u8,
+    title: []const u8,
+    body: []const u8,
+    slot: PanelSlot,
+
+    /// Render the panel into `rect`: a 1-line title header (inverse style)
+    /// followed by the body, one source line per row, clipped to width.
+    pub fn render(
+        self: *const PanelPlugin,
+        frm: *frame.Frame,
+        rect: Rect,
+    ) Panels.RenderError!void {
+        if (rect.w == 0 or rect.h == 0) return;
+        _ = try rect.endX(frm);
+        _ = try rect.endY(frm);
+        try rect.clear(frm);
+
+        const title_st = frame.Style{ .fg = theme.get().accent, .bold = true };
+        const body_st = frame.Style{ .fg = theme.get().dim };
+
+        {
+            var x = rect.x;
+            const x_end = rect.x + rect.w;
+            try writePart(frm, &x, x_end, rect.y, self.title, title_st);
+        }
+        if (rect.h < 2) return;
+
+        var line_it = std.mem.splitScalar(u8, self.body, '\n');
+        var row: usize = 1;
+        while (row < rect.h) : (row += 1) {
+            const line = line_it.next() orelse break;
+            if (line.len == 0) continue;
+            var x = rect.x;
+            const x_end = rect.x + rect.w;
+            try writePart(frm, &x, x_end, rect.y + row, line, body_st);
+        }
+    }
+};
+
+/// Owns discovered panel plugins and their backing allocations.
+pub const PanelRegistry = struct {
+    alloc: std.mem.Allocator,
+    plugins: std.ArrayListUnmanaged(PanelPlugin) = .empty,
+
+    pub fn init(alloc: std.mem.Allocator) PanelRegistry {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *PanelRegistry) void {
+        for (self.plugins.items) |p| {
+            self.alloc.free(p.dir_name);
+            self.alloc.free(p.title);
+            self.alloc.free(p.body);
+        }
+        self.plugins.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn count(self: *const PanelRegistry) usize {
+        return self.plugins.items.len;
+    }
+
+    /// The active panel to compose, if any (first discovered). Returns null when
+    /// no panels are installed so the layout reserves no rows.
+    pub fn active(self: *const PanelRegistry) ?*const PanelPlugin {
+        if (self.plugins.items.len == 0) return null;
+        return &self.plugins.items[0];
+    }
+
+    /// Discover `<home>/.pz/panels/*/PANEL.md`. `io` is injected so tests can
+    /// scan a temp dir with `std.testing.io` without a real subprocess/home.
+    /// Missing/inaccessible dirs are silently skipped (no panels installed is a
+    /// valid state, not an error).
+    pub fn discover(self: *PanelRegistry, io: std.Io, home: []const u8) DiscoverError!void {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const panels_path = std.fmt.bufPrint(&path_buf, "{s}/.pz/panels", .{home}) catch
+            return error.PathTooLong;
+
+        var dir = std.Io.Dir.openDirAbsolute(io, panels_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        var iter = dir.iterate();
+        while (iter.next(io) catch return error.ReadFailed) |entry| {
+            if (entry.kind != .directory) continue;
+            if (!isValidPanelDir(entry.name)) continue;
+
+            var sub = dir.openDir(io, entry.name, .{}) catch continue;
+            defer sub.close(io);
+            const file = sub.openFile(io, "PANEL.md", .{}) catch continue;
+            defer file.close(io);
+
+            var file_buf: [4096]u8 = undefined;
+            var reader = file.readerStreaming(io, &file_buf);
+            const content = reader.interface.allocRemaining(self.alloc, .limited(64 * 1024)) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            defer self.alloc.free(content);
+
+            if (!std.unicode.utf8ValidateSlice(content)) continue;
+
+            try self.addFromMarkdown(entry.name, content);
+        }
+    }
+
+    /// Parse a PANEL.md document and append it to the registry. Reuses the
+    /// skill frontmatter parser (---/name/--- + body). Exposed so tests can
+    /// inject markdown directly without touching the filesystem.
+    pub fn addFromMarkdown(self: *PanelRegistry, dir_name: []const u8, raw: []const u8) DiscoverError!void {
+        const skill = @import("../../core/skill.zig");
+        const parsed = (skill.parseFrontmatter(self.alloc, raw) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        }) orelse return error.BadPanel;
+        // parsed.meta owns body/name/description; we re-own title+body, free the rest.
+        const meta = parsed.meta;
+        defer self.alloc.free(meta.body);
+        defer if (meta.name.len > 0) self.alloc.free(meta.name);
+        defer if (meta.description.len > 0) self.alloc.free(meta.description);
+
+        const slot = slotFromName(meta.description);
+
+        const dir_copy = try self.alloc.dupe(u8, dir_name);
+        errdefer self.alloc.free(dir_copy);
+        const title_copy = try self.alloc.dupe(u8, if (meta.name.len > 0) meta.name else dir_name);
+        errdefer self.alloc.free(title_copy);
+        const body_copy = try self.alloc.dupe(u8, std.mem.trim(u8, meta.body, " \t\r\n"));
+        errdefer self.alloc.free(body_copy);
+
+        try self.plugins.append(self.alloc, .{
+            .dir_name = dir_copy,
+            .title = title_copy,
+            .body = body_copy,
+            .slot = slot,
+        });
+    }
+};
+
+pub const DiscoverError = std.mem.Allocator.Error || error{
+    PathTooLong,
+    ReadFailed,
+    BadPanel,
+};
+
+/// Layout slot is encoded in the PANEL.md `description` field as either
+/// "slot=below_transcript" or "slot=above_footer". Defaults to above_footer.
+fn slotFromName(desc: []const u8) PanelSlot {
+    if (std.mem.indexOf(u8, desc, "below_transcript") != null) return .below_transcript;
+    return .above_footer;
+}
+
+fn isValidPanelDir(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '.', '-' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// Cost in micents (1/100000 $) from usage + model name.
 /// Looks up rates from the central model registry; falls back to sonnet rates for unknown models.
 /// Returns micents to add to cumulative total.
@@ -1174,6 +1349,101 @@ test "panels footer shows background job counts" {
         "row0 @32:shift+drag: | @44:select\nrow1 @1:bg | @4:L3 | @7:R1 | @10:D2 | @13:⠋ | @49:m",
         actual,
     );
+}
+
+test "custom panel renders into composed frame layout" {
+    // In-memory: inject markdown directly, compose a frame with a panel slot,
+    // render transcript marker + footer + the custom panel, read it back.
+    var reg = PanelRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+
+    try reg.addFromMarkdown("status",
+        \\---
+        \\name: Build Status
+        \\description: slot=above_footer
+        \\---
+        \\ok: 3 passed
+        \\warn: 1 flaky
+    );
+    try std.testing.expectEqual(@as(usize, 1), reg.count());
+
+    const plugin = reg.active() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(plugin.slot == .above_footer);
+
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 10);
+    defer frm.deinit(std.testing.allocator);
+
+    const lay = frame.Layout.compute(.{ .w = 30, .h = 10, .footer_h = 2, .panel_h = 3 });
+    const panel_rect = lay.panel orelse return error.TestUnexpectedResult;
+
+    // transcript region marker
+    _ = try frm.write(lay.transcript.x, lay.transcript.y, "TRANSCRIPT", .{});
+    // panel composed into its reserved rect
+    try plugin.render(&frm, panel_rect);
+
+    const actual = try footerSegmentsAlloc(std.testing.allocator, &frm, .{
+        .x = 0,
+        .y = panel_rect.y,
+        .w = 30,
+        .h = panel_rect.h,
+    });
+    defer std.testing.allocator.free(actual);
+    try expectSnapText(
+        @src(),
+        "row0 @0:Build | @6:Status\nrow1 @0:ok: | @4:3 | @6:passed\nrow2 @0:warn: | @6:1 | @8:flaky",
+        actual,
+    );
+}
+
+test "panel registry discovers PANEL.md from injected home dir" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, ".pz/panels/jobs");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".pz/panels/jobs/PANEL.md",
+        .data = "---\nname: Jobs\ndescription: slot=below_transcript\n---\nrunning: 2\n",
+    });
+    // A non-panel dir without PANEL.md is skipped.
+    try tmp.dir.createDirPath(std.testing.io, ".pz/panels/empty");
+
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    var reg = PanelRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+    try reg.discover(std.testing.io, home);
+
+    try std.testing.expectEqual(@as(usize, 1), reg.count());
+    const plugin = reg.active() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(plugin.slot == .below_transcript);
+
+    var frm = try frame.Frame.init(std.testing.allocator, 20, 3);
+    defer frm.deinit(std.testing.allocator);
+    try plugin.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 3 });
+    const actual = try footerSegmentsAlloc(std.testing.allocator, &frm, .{ .x = 0, .y = 0, .w = 20, .h = 3 });
+    defer std.testing.allocator.free(actual);
+    try expectSnapText(
+        @src(),
+        "row0 @0:Jobs\nrow1 @0:running: | @9:2\nrow2 ",
+        actual,
+    );
+}
+
+test "panel registry discover on missing home is a no-op" {
+    var reg = PanelRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+    // Nonexistent directory: not installed is a valid state, not an error.
+    try reg.discover(std.testing.io, "/nonexistent-pz-home-xyz");
+    try std.testing.expectEqual(@as(usize, 0), reg.count());
+    try std.testing.expect(reg.active() == null);
+}
+
+test "panel addFromMarkdown rejects document without frontmatter" {
+    var reg = PanelRegistry.init(std.testing.allocator);
+    defer reg.deinit();
+    try std.testing.expectError(error.BadPanel, reg.addFromMarkdown("bad", "no frontmatter body"));
+    try std.testing.expectEqual(@as(usize, 0), reg.count());
 }
 
 test "panels footer animates background spinner while running" {

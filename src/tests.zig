@@ -17,6 +17,9 @@ comptime {
     _ = @import("core/providers/models.zig");
     _ = @import("modes/mode.zig");
     _ = @import("modes/print/format.zig");
+    _ = @import("modes/rpc.zig");
+    _ = @import("modes/tui/panels.zig");
+    _ = @import("modes/tui/frame.zig");
     _ = @import("modes/print/run.zig");
     _ = @import("modes/tui/harness.zig");
     _ = @import("modes/tui/overlay.zig");
