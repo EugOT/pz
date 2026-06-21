@@ -15,6 +15,15 @@ comptime {
     _ = @import("core/providers/http_client.zig");
     _ = @import("core/providers/openai.zig");
     _ = @import("core/providers/models.zig");
+    _ = @import("core/providers.zig");
+    _ = @import("core/providers/registry.zig");
+    _ = @import("core/providers/compat.zig");
+    _ = @import("core/providers/config.zig");
+    _ = @import("core/providers/openrouter.zig");
+    _ = @import("core/providers/google.zig");
+    _ = @import("core/providers/mistral.zig");
+    _ = @import("core/providers/groq.zig");
+    _ = @import("core/providers/deepseek.zig");
     _ = @import("modes/mode.zig");
     _ = @import("modes/print/format.zig");
     _ = @import("modes/rpc.zig");

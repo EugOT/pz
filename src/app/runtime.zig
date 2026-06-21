@@ -89,15 +89,189 @@ const ProviderRuntime = struct {
     }
 };
 
-const NativeProviderKind = enum { anthropic, openai };
+// Native fast-path kinds plus the OpenAI-compatible providers routed through the
+// dynamic arm. `anthropic`/`openai` keep their hand-wired native clients; every
+// other tag resolves to a `core.providers.*` SseClient dispatched via the
+// router (MP7). The set mirrors `registry.ProviderTag` so every registered
+// provider has a runtime construction path — no provider falls through.
+const NativeProviderKind = enum {
+    anthropic,
+    openai,
+    openrouter,
+    google,
+    mistral,
+    groq,
+    deepseek,
+};
 const native_provider_kind_map = std.StaticStringMap(NativeProviderKind).initComptime(.{
     .{ "anthropic", .anthropic },
     .{ "openai", .openai },
+    .{ "openrouter", .openrouter },
+    .{ "google", .google },
+    .{ "mistral", .mistral },
+    .{ "groq", .groq },
+    .{ "deepseek", .deepseek },
 });
 
 fn parseNativeProviderKind(provider: []const u8) ?NativeProviderKind {
     return native_provider_kind_map.get(provider);
 }
+
+// The OpenAI-compatible provider kinds handled by the dynamic arm. anthropic and
+// openai are the native fast paths and are excluded here.
+const DynamicKind = enum {
+    openrouter,
+    google,
+    mistral,
+    groq,
+    deepseek,
+
+    fn fromNative(kind: NativeProviderKind) ?DynamicKind {
+        return switch (kind) {
+            .anthropic, .openai => null,
+            .openrouter => .openrouter,
+            .google => .google,
+            .mistral => .mistral,
+            .groq => .groq,
+            .deepseek => .deepseek,
+        };
+    }
+
+    /// Canonical registry/auth name for this provider. Used by the router lookup
+    /// to match the dispatch-resolved provider name to this single backend.
+    fn name(self: DynamicKind) []const u8 {
+        return switch (self) {
+            .openrouter => "openrouter",
+            .google => "google",
+            .mistral => "mistral",
+            .groq => "groq",
+            .deepseek => "deepseek",
+        };
+    }
+
+    /// Auth tag used for credential reload after a login. Mirrors each module's
+    /// `Cfg.provider_tag` so reloadAuth fetches the same credential the client
+    /// was constructed with.
+    fn authTag(self: DynamicKind) core.providers.auth.Provider {
+        return switch (self) {
+            // openrouter/groq/deepseek reuse the `.openai` auth identity (their
+            // Cfg.provider_tag is `.openai`); google has its own identity.
+            .openrouter, .groq, .deepseek, .mistral => .openai,
+            .google => .google,
+        };
+    }
+};
+
+// One OpenAI-compatible backend client, plus a router that dispatches requests
+// to it by resolved provider name (MP7). The router never falls back: a request
+// whose resolved provider does not match this backend surfaces `error.NoBackend`
+// (or a named dispatch error from `resolveDispatch`), never a silent reroute.
+const DynamicProvider = struct {
+    kind: DynamicKind,
+    backend: Backend,
+    router: core.providers.client.Router = undefined,
+    router_ready: bool = false,
+
+    const Backend = union(DynamicKind) {
+        openrouter: core.providers.openrouter.Client,
+        google: core.providers.google.Client,
+        mistral: core.providers.mistral.Client,
+        groq: core.providers.groq.Client,
+        deepseek: core.providers.deepseek.Client,
+    };
+
+    fn init(alloc: std.mem.Allocator, kind: DynamicKind, hooks: core.providers.auth.Hooks) !DynamicProvider {
+        const backend: Backend = switch (kind) {
+            .openrouter => .{ .openrouter = try core.providers.openrouter.Client.init(alloc, hooks) },
+            .google => .{ .google = try core.providers.google.Client.init(alloc, hooks) },
+            .mistral => .{ .mistral = try core.providers.mistral.Client.init(alloc, hooks) },
+            .groq => .{ .groq = try core.providers.groq.Client.init(alloc, hooks) },
+            .deepseek => .{ .deepseek = try core.providers.deepseek.Client.init(alloc, hooks) },
+        };
+        return .{ .kind = kind, .backend = backend };
+    }
+
+    /// Backend `*Provider` for the active client. Single source the router
+    /// forwards to once the resolved name matches `self.kind`.
+    fn backendProvider(self: *DynamicProvider) *core.providers.Provider {
+        return switch (self.backend) {
+            inline else => |*client| &client.provider,
+        };
+    }
+
+    /// Router lookup: forward only when the dispatch-resolved provider name is
+    /// exactly this backend's provider. Any other (still-registered) provider
+    /// returns null → `Router` raises `error.NoBackend`. No fallback.
+    fn lookup(self: *DynamicProvider, lookup_name: []const u8) ?*core.providers.Provider {
+        if (std.mem.eql(u8, lookup_name, self.kind.name())) return self.backendProvider();
+        return null;
+    }
+
+    /// Bind the router to this (stable) address and return its `*Provider`. Safe
+    /// to call repeatedly; the binding is recomputed against the current address
+    /// so it survives the move from the init temporary into `native_rt`.
+    fn providerPtr(self: *DynamicProvider) *core.providers.Provider {
+        self.router = core.providers.client.Router.init(
+            core.providers.client.DynamicCfg.from(DynamicProvider, self, DynamicProvider.lookup),
+        );
+        self.router_ready = true;
+        return &self.router.provider;
+    }
+
+    fn setEventLoop(self: *DynamicProvider, el: *event_loop.EventLoop) void {
+        switch (self.backend) {
+            inline else => |*client| client.el = el,
+        }
+    }
+
+    fn setCancel(self: *DynamicProvider, cancel: *core.providers.CancelPoll) void {
+        switch (self.backend) {
+            inline else => |*client| client.cancel = cancel,
+        }
+    }
+
+    fn clearCancel(self: *DynamicProvider) void {
+        switch (self.backend) {
+            inline else => |*client| client.cancel = null,
+        }
+    }
+
+    fn expiredOAuthProvider(self: *DynamicProvider) ?core.providers.auth.Provider {
+        const auth = switch (self.backend) {
+            inline else => |*client| client.auth.auth,
+        };
+        switch (auth) {
+            .oauth => |oauth| {
+                if (core.time.milliTimestamp() >= oauth.expires) return self.kind.authTag();
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    fn reloadAuth(self: *DynamicProvider, alloc: std.mem.Allocator, hooks: core.providers.auth.Hooks) !void {
+        const new_auth = try core.providers.auth.loadForProviderWithHooks(alloc, self.kind.authTag(), hooks);
+        switch (self.backend) {
+            inline else => |*client| {
+                client.auth.deinit();
+                client.auth = new_auth;
+            },
+        }
+    }
+
+    fn isSub(self: *const DynamicProvider) bool {
+        return switch (self.backend) {
+            inline else => |client| client.isSub(),
+        };
+    }
+
+    fn deinit(self: *DynamicProvider) void {
+        switch (self.backend) {
+            inline else => |*client| client.deinit(),
+        }
+        self.* = undefined;
+    }
+};
 
 fn parseSyslogTransport(s: []const u8) ?core.syslog.Transport {
     if (std.mem.eql(u8, s, "udp")) return .udp;
@@ -106,14 +280,28 @@ fn parseSyslogTransport(s: []const u8) ?core.syslog.Transport {
     return null;
 }
 
+// The runtime's provider home: native anthropic/openai fast paths plus one
+// `dynamic_provider` arm that wraps an OpenAI-compatible client behind the
+// dispatch router (MP7). EVERY switch below covers ALL THREE arms — there is no
+// `unreachable`, no `else =>`, and no panic. Adding a union arm is a build error
+// until each switch handles it.
 const NativeProviderRuntime = union(enum) {
     anthropic: core.providers.anthropic.Client,
     openai: core.providers.openai.Client,
+    dynamic_provider: DynamicProvider,
 
     fn init(alloc: std.mem.Allocator, kind: NativeProviderKind, hooks: core.providers.auth.Hooks) !NativeProviderRuntime {
         return switch (kind) {
             .anthropic => .{ .anthropic = try core.providers.anthropic.Client.init(alloc, hooks) },
             .openai => .{ .openai = try core.providers.openai.Client.init(alloc, hooks) },
+            // Any non-native kind constructs the dynamic arm. `fromNative`
+            // returns a concrete DynamicKind for exactly these tags, so the
+            // `orelse` branch is unreachable-by-construction yet still surfaces a
+            // named error instead of `unreachable` if the maps ever diverge.
+            .openrouter, .google, .mistral, .groq, .deepseek => blk: {
+                const dyn_kind = DynamicKind.fromNative(kind) orelse return error.UnsupportedProvider;
+                break :blk .{ .dynamic_provider = try DynamicProvider.init(alloc, dyn_kind, hooks) };
+            },
         };
     }
 
@@ -121,6 +309,7 @@ const NativeProviderRuntime = union(enum) {
         switch (self.*) {
             .anthropic => |*client| client.el = el,
             .openai => |*client| client.el = el,
+            .dynamic_provider => |*dyn| dyn.setEventLoop(el),
         }
     }
 
@@ -128,6 +317,7 @@ const NativeProviderRuntime = union(enum) {
         switch (self.*) {
             .anthropic => |*client| client.cancel = cancel,
             .openai => |*client| client.cancel = cancel,
+            .dynamic_provider => |*dyn| dyn.setCancel(cancel),
         }
     }
 
@@ -135,45 +325,33 @@ const NativeProviderRuntime = union(enum) {
         switch (self.*) {
             .anthropic => |*client| client.cancel = null,
             .openai => |*client| client.cancel = null,
+            .dynamic_provider => |*dyn| dyn.clearCancel(),
         }
     }
 
     /// Returns the provider tag if the current auth is expired OAuth.
     fn expiredOAuthProvider(self: *NativeProviderRuntime) ?core.providers.auth.Provider {
-        const auth = switch (self.*) {
-            .anthropic => |*c| c.auth.auth,
-            .openai => |*c| c.auth.auth,
+        return switch (self.*) {
+            .anthropic => |*c| oauthExpiredTag(c.auth.auth, .anthropic),
+            .openai => |*c| oauthExpiredTag(c.auth.auth, .openai),
+            .dynamic_provider => |*dyn| dyn.expiredOAuthProvider(),
         };
-        switch (auth) {
-            .oauth => |oauth| {
-                if (core.time.milliTimestamp() >= oauth.expires) {
-                    return switch (self.*) {
-                        .anthropic => .anthropic,
-                        .openai => .openai,
-                    };
-                }
-            },
-            else => {},
-        }
-        return null;
     }
 
     /// Replace auth after a successful login flow.
     fn reloadAuth(self: *NativeProviderRuntime, alloc: std.mem.Allocator, hooks: core.providers.auth.Hooks) !void {
-        const tag: core.providers.auth.Provider = switch (self.*) {
-            .anthropic => .anthropic,
-            .openai => .openai,
-        };
-        const new_auth = try core.providers.auth.loadForProviderWithHooks(alloc, tag, hooks);
         switch (self.*) {
             .anthropic => |*c| {
+                const new_auth = try core.providers.auth.loadForProviderWithHooks(alloc, .anthropic, hooks);
                 c.auth.deinit();
                 c.auth = new_auth;
             },
             .openai => |*c| {
+                const new_auth = try core.providers.auth.loadForProviderWithHooks(alloc, .openai, hooks);
                 c.auth.deinit();
                 c.auth = new_auth;
             },
+            .dynamic_provider => |*dyn| try dyn.reloadAuth(alloc, hooks),
         }
     }
 
@@ -181,6 +359,7 @@ const NativeProviderRuntime = union(enum) {
         return switch (self.*) {
             .anthropic => |*client| &client.provider,
             .openai => |*client| &client.provider,
+            .dynamic_provider => |*dyn| dyn.providerPtr(),
         };
     }
 
@@ -188,6 +367,7 @@ const NativeProviderRuntime = union(enum) {
         return switch (self.*) {
             .anthropic => |client| client.isSub(),
             .openai => |client| client.isSub(),
+            .dynamic_provider => |dyn| dyn.isSub(),
         };
     }
 
@@ -195,27 +375,46 @@ const NativeProviderRuntime = union(enum) {
         switch (self.*) {
             .anthropic => |*client| client.deinit(),
             .openai => |*client| client.deinit(),
+            .dynamic_provider => |*dyn| dyn.deinit(),
         }
         self.* = undefined;
     }
 };
 
-const missing_provider_msg = "provider unavailable; choose anthropic/openai with credentials or set --provider-cmd/PZ_PROVIDER_CMD";
+/// Map an auth value to its expired-OAuth tag, or null if the auth is not an
+/// expired OAuth token. Shared by the native arms so the expiry check stays
+/// identical across providers.
+fn oauthExpiredTag(auth: core.providers.auth.Auth, tag: core.providers.auth.Provider) ?core.providers.auth.Provider {
+    switch (auth) {
+        .oauth => |oauth| {
+            if (core.time.milliTimestamp() >= oauth.expires) return tag;
+        },
+        else => {},
+    }
+    return null;
+}
+
+const missing_provider_msg = "provider unavailable; choose a supported provider with credentials or set --provider-cmd/PZ_PROVIDER_CMD";
 const missing_anthropic_provider_msg = "anthropic credentials missing; set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN, run /login anthropic, or set --provider-cmd/PZ_PROVIDER_CMD";
 const missing_openai_provider_msg = "openai credentials missing; set OPENAI_API_KEY, run /login openai, or set --provider-cmd/PZ_PROVIDER_CMD";
-const unsupported_native_provider_msg = "native provider unavailable for this provider label; use anthropic/openai or set --provider-cmd/PZ_PROVIDER_CMD";
+const missing_openrouter_provider_msg = "openrouter credentials missing; run /login openrouter <key> or set --provider-cmd/PZ_PROVIDER_CMD";
+const missing_google_provider_msg = "google credentials missing; set GOOGLE_API_KEY, run /login google <key>, or set --provider-cmd/PZ_PROVIDER_CMD";
+const missing_mistral_provider_msg = "mistral credentials missing; run /login mistral <key> or set --provider-cmd/PZ_PROVIDER_CMD";
+const missing_groq_provider_msg = "groq credentials missing; run /login groq <key> or set --provider-cmd/PZ_PROVIDER_CMD";
+const missing_deepseek_provider_msg = "deepseek credentials missing; run /login deepseek <key> or set --provider-cmd/PZ_PROVIDER_CMD";
+const unsupported_native_provider_msg = "native provider unavailable for this provider label; use a supported provider or set --provider-cmd/PZ_PROVIDER_CMD";
 const policy_denied_msg = "blocked by policy";
 
 fn missingProviderMsgForInitErr(kind: NativeProviderKind, err: anyerror) []const u8 {
+    const auth_missing = err == error.AuthNotFound;
     return switch (kind) {
-        .anthropic => switch (err) {
-            error.AuthNotFound => missing_anthropic_provider_msg,
-            else => missing_provider_msg,
-        },
-        .openai => switch (err) {
-            error.AuthNotFound => missing_openai_provider_msg,
-            else => missing_provider_msg,
-        },
+        .anthropic => if (auth_missing) missing_anthropic_provider_msg else missing_provider_msg,
+        .openai => if (auth_missing) missing_openai_provider_msg else missing_provider_msg,
+        .openrouter => if (auth_missing) missing_openrouter_provider_msg else missing_provider_msg,
+        .google => if (auth_missing) missing_google_provider_msg else missing_provider_msg,
+        .mistral => if (auth_missing) missing_mistral_provider_msg else missing_provider_msg,
+        .groq => if (auth_missing) missing_groq_provider_msg else missing_provider_msg,
+        .deepseek => if (auth_missing) missing_deepseek_provider_msg else missing_provider_msg,
     };
 }
 
@@ -2144,6 +2343,15 @@ fn runPrint(
     var sink_impl = PrintSink.init(alloc, out);
     defer sink_impl.deinit();
     sink_impl.fmt.verbose = run_cmd.verbose;
+    // ML3 --diag handoff: carry the parsed flag into the formatter's per-turn
+    // diagnostics gate. With the gate on, `pushDiag` buffers turn timings and
+    // `finish()` flushes the breakdown; with it off, `pushDiag` is a no-op.
+    // NOTE: the actual per-turn `pushDiag` feed needs turn timings emitted by
+    // the agent loop. The loop's `ModeEv` union (core/loop.zig) has no per-turn
+    // timing event yet, so the source data is not available without editing
+    // loop.zig (RELIABILITY-owned). The gate is wired here; the feed is the
+    // documented residual (see PR body / report).
+    sink_impl.fmt.diag_enabled = run_cmd.diag;
 
     var reg: PolicyToolRegistry = undefined;
     var tool_audit_seq: u64 = 1;
@@ -2558,6 +2766,11 @@ fn runTui(
         else if (needs_login) |kind| switch (kind) {
             .anthropic => .anthropic,
             .openai => .openai,
+            .openrouter => .openrouter,
+            .google => .google,
+            .mistral => .mistral,
+            .groq => .groq,
+            .deepseek => .deepseek,
         } else null;
 
         if (login_prov) |prov| {
@@ -6171,15 +6384,232 @@ test "parseJjBookmark rejects detached hash" {
     try std.testing.expect(parseJjBookmark("44693e6218c0b15a85acf5d2af52149b09dc4c76") == null);
 }
 
-test "parseNativeProviderKind resolves known native providers" {
+test "parseNativeProviderKind resolves native and dynamic providers" {
+    // Native fast paths.
     try std.testing.expectEqual(NativeProviderKind.anthropic, parseNativeProviderKind("anthropic").?);
     try std.testing.expectEqual(NativeProviderKind.openai, parseNativeProviderKind("openai").?);
-    try std.testing.expect(parseNativeProviderKind("google") == null);
+    // MP7: every OpenAI-compatible provider now resolves to a runtime kind
+    // (previously these returned null and fell through to "unsupported").
+    try std.testing.expectEqual(NativeProviderKind.openrouter, parseNativeProviderKind("openrouter").?);
+    try std.testing.expectEqual(NativeProviderKind.google, parseNativeProviderKind("google").?);
+    try std.testing.expectEqual(NativeProviderKind.mistral, parseNativeProviderKind("mistral").?);
+    try std.testing.expectEqual(NativeProviderKind.groq, parseNativeProviderKind("groq").?);
+    try std.testing.expectEqual(NativeProviderKind.deepseek, parseNativeProviderKind("deepseek").?);
+    // Unknown names still miss (no silent fallback).
+    try std.testing.expect(parseNativeProviderKind("not-a-provider") == null);
 }
 
-test "missingProviderMsgForInitErr is provider-specific" {
+test "DynamicKind.fromNative splits native fast paths from dynamic providers" {
+    // anthropic/openai are native and have NO dynamic kind.
+    try std.testing.expect(DynamicKind.fromNative(.anthropic) == null);
+    try std.testing.expect(DynamicKind.fromNative(.openai) == null);
+    // Every other native kind maps to its dynamic counterpart.
+    try std.testing.expectEqual(DynamicKind.openrouter, DynamicKind.fromNative(.openrouter).?);
+    try std.testing.expectEqual(DynamicKind.google, DynamicKind.fromNative(.google).?);
+    try std.testing.expectEqual(DynamicKind.mistral, DynamicKind.fromNative(.mistral).?);
+    try std.testing.expectEqual(DynamicKind.groq, DynamicKind.fromNative(.groq).?);
+    try std.testing.expectEqual(DynamicKind.deepseek, DynamicKind.fromNative(.deepseek).?);
+}
+
+test "DynamicKind name and auth tag round-trip through the registry" {
+    // Each dynamic kind's name must be a registered provider, and its auth tag
+    // must match the auth identity the corresponding Cfg was built with.
+    inline for (@typeInfo(DynamicKind).@"enum".fields) |field| {
+        const dk: DynamicKind = @field(DynamicKind, field.name);
+        try std.testing.expect(core.providers.registry.resolveProvider(dk.name()) != null);
+    }
+    // openrouter/groq/deepseek/mistral reuse the `.openai` auth identity; google
+    // has its own. This mirrors each module's Cfg.provider_tag exactly.
+    try std.testing.expectEqual(core.providers.auth.Provider.openai, DynamicKind.openrouter.authTag());
+    try std.testing.expectEqual(core.providers.auth.Provider.openai, DynamicKind.groq.authTag());
+    try std.testing.expectEqual(core.providers.auth.Provider.openai, DynamicKind.deepseek.authTag());
+    try std.testing.expectEqual(core.providers.auth.Provider.openai, DynamicKind.mistral.authTag());
+    try std.testing.expectEqual(core.providers.auth.Provider.google, DynamicKind.google.authTag());
+}
+
+test "missingProviderMsgForInitErr is provider-specific for native and dynamic" {
     try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.anthropic, error.AuthNotFound), "ANTHROPIC_API_KEY") != null);
     try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.openai, error.AuthNotFound), "OPENAI_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.google, error.AuthNotFound), "GOOGLE_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.mistral, error.AuthNotFound), "mistral") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.groq, error.AuthNotFound), "groq") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.deepseek, error.AuthNotFound), "deepseek") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.openrouter, error.AuthNotFound), "openrouter") != null);
+}
+
+// MP4-R2: `pz login <newprovider>` must resolve to the api-key path. These
+// tests exercise the runtime's CLI-name → auth.Provider resolution + the env
+// var map a user is told to set, for every login-able provider.
+test "login name resolves to auth provider for native and new providers" {
+    try std.testing.expectEqual(core.providers.auth.Provider.anthropic, parseAuthProvider("anthropic").?);
+    try std.testing.expectEqual(core.providers.auth.Provider.openai, parseAuthProvider("openai").?);
+    try std.testing.expectEqual(core.providers.auth.Provider.google, parseAuthProvider("google").?);
+    // MP4-R2 additions: these previously returned null → "unknown provider".
+    try std.testing.expectEqual(core.providers.auth.Provider.openrouter, parseAuthProvider("openrouter").?);
+    try std.testing.expectEqual(core.providers.auth.Provider.mistral, parseAuthProvider("mistral").?);
+    try std.testing.expectEqual(core.providers.auth.Provider.groq, parseAuthProvider("groq").?);
+    try std.testing.expectEqual(core.providers.auth.Provider.deepseek, parseAuthProvider("deepseek").?);
+    // A bogus name still fails to resolve (caller surfaces "unknown provider").
+    try std.testing.expect(parseAuthProvider("nope") == null);
+}
+
+test "pz login <newprovider> classifies as api-key (no OAuth) with env hint" {
+    // For every api-key-only provider, the login flow must classify input as an
+    // API key, not an OAuth start, and name a dedicated env var.
+    const cases = [_]struct { name: []const u8, env: []const u8, tag: core.providers.auth.Provider }{
+        .{ .name = "mistral", .env = "MISTRAL_API_KEY", .tag = .mistral },
+        .{ .name = "groq", .env = "GROQ_API_KEY", .tag = .groq },
+        .{ .name = "deepseek", .env = "DEEPSEEK_API_KEY", .tag = .deepseek },
+        .{ .name = "openrouter", .env = "OPENROUTER_API_KEY", .tag = .openrouter },
+    };
+    for (cases) |c| {
+        const prov = parseAuthProvider(c.name) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(c.tag, prov);
+        // Empty key + non-OAuth-capable provider → api_key flow (prompt to paste).
+        try std.testing.expectEqual(LoginInputKind.api_key, classifyLoginInput(prov, ""));
+        // A pasted key is also classified api_key (saved directly, no OAuth).
+        try std.testing.expectEqual(LoginInputKind.api_key, classifyLoginInput(prov, "sk-secret-123"));
+        // The env-var hint shown to the user is the provider-specific one.
+        const env = provider_env_map.get(c.name) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(c.env, env);
+    }
+}
+
+test "pz login <newprovider> end-to-end saves an api key via the runtime flow" {
+    // Drive the same parse → classify → save path the CLI uses, proving
+    // `pz login mistral <key>` lands the credential on disk under the right
+    // provider (the api-key path, never OAuth).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    const req = try parseAuthReq("mistral ml-key-789", null);
+    try std.testing.expectEqual(core.providers.auth.Provider.mistral, req.prov);
+    try std.testing.expectEqualStrings("mistral", req.prov_name);
+    try std.testing.expectEqualStrings("ml-key-789", req.key);
+    try std.testing.expectEqual(LoginInputKind.api_key, classifyLoginInput(req.prov, req.key));
+
+    var out_buf: [512]u8 = undefined;
+    var out_writer: std.Io.Writer = .fixed(&out_buf);
+    try runLoginFlow(std.testing.allocator, &out_writer, req, .{ .home_override = home });
+    try std.testing.expect(std.mem.indexOf(u8, out_writer.buffered(), "API key saved for mistral") != null);
+
+    // The credential resolves back through the same provider-scoped loader the
+    // runtime uses (env first — empty for mistral — then the file).
+    var loaded = try core.providers.auth.loadForProviderWithHooks(std.testing.allocator, .mistral, .{ .home_override = home });
+    defer loaded.deinit();
+    try std.testing.expect(loaded.auth == .api_key);
+    try std.testing.expectEqualStrings("ml-key-789", loaded.auth.api_key);
+}
+
+// ── Dynamic provider dispatch e2e (MP7) ──────────────────────────────────────
+// Mirrors `client.zig`'s router e2e but exercises the runtime's name-match
+// routing contract (`DynamicProvider.lookup` semantics): a request whose
+// resolved provider matches the wired backend streams end-to-end; any other
+// (still-registered) provider surfaces `error.NoBackend` with NO dispatch.
+
+// A scripted backend Provider that records the model it was forwarded and emits
+// a text+stop pair. Single Stream allocation, matching the real contract.
+const E2eBackend = struct {
+    provider: core.providers.Provider = .{ .vt = &vt },
+    seen_model: []u8 = &.{},
+    started: usize = 0,
+
+    const vt = core.providers.Provider.Vt{ .start = startFn };
+
+    const E2eStream = struct {
+        stream: core.providers.Stream = .{ .vt = &stream_vt },
+        alloc: std.mem.Allocator,
+        idx: u8 = 0,
+
+        const stream_vt = core.providers.Stream.Vt{ .next = nextFn, .deinit = deinitFn };
+
+        fn nextFn(s: *core.providers.Stream) anyerror!?core.providers.Event {
+            const self: *E2eStream = @fieldParentPtr("stream", s);
+            defer self.idx +|= 1;
+            return switch (self.idx) {
+                0 => .{ .text = "from-dynamic" },
+                1 => .{ .stop = .{ .reason = .done } },
+                else => null,
+            };
+        }
+        fn deinitFn(s: *core.providers.Stream) void {
+            const self: *E2eStream = @fieldParentPtr("stream", s);
+            self.alloc.destroy(self);
+        }
+    };
+
+    fn startFn(p: *core.providers.Provider, req: core.providers.Request) anyerror!*core.providers.Stream {
+        const self: *E2eBackend = @fieldParentPtr("provider", p);
+        self.started += 1;
+        self.seen_model = try std.testing.allocator.dupe(u8, req.model);
+        const st = try std.testing.allocator.create(E2eStream);
+        st.* = .{ .alloc = std.testing.allocator };
+        return &st.stream;
+    }
+
+    fn freeSeen(self: *E2eBackend) void {
+        if (self.seen_model.len != 0) std.testing.allocator.free(self.seen_model);
+    }
+};
+
+// Routing context that reuses the EXACT name-match contract DynamicProvider
+// uses: forward only when the resolved provider equals `kind.name()`.
+const E2eRouteCtx = struct {
+    kind: DynamicKind,
+    backend: *core.providers.Provider,
+
+    fn lookup(self: *E2eRouteCtx, lookup_name: []const u8) ?*core.providers.Provider {
+        if (std.mem.eql(u8, lookup_name, self.kind.name())) return self.backend;
+        return null;
+    }
+};
+
+test "dynamic provider streams end-to-end and strips the model suffix" {
+    var backend = E2eBackend{};
+    defer backend.freeSeen();
+    var ctx = E2eRouteCtx{ .kind = .mistral, .backend = &backend.provider };
+    var router = core.providers.client.Router.init(
+        core.providers.client.DynamicCfg.from(E2eRouteCtx, &ctx, E2eRouteCtx.lookup),
+    );
+
+    // Route by model suffix (`<model>:mistral`): the router resolves mistral,
+    // forwards the BARE model, and the backend streams the canned events.
+    var stream = try router.provider.start(.{ .model = "mistral-large:mistral", .msgs = &.{} });
+    defer stream.deinit();
+
+    const ev0 = (try stream.next()) orelse return error.TestUnexpectedResult;
+    const ev1 = (try stream.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expect((try stream.next()) == null);
+    try std.testing.expectEqualStrings("from-dynamic", ev0.text);
+    try std.testing.expectEqual(core.providers.StopReason.done, ev1.stop.reason);
+
+    // Backend saw the bare model (suffix stripped) and was started exactly once.
+    try std.testing.expectEqual(@as(usize, 1), backend.started);
+    try std.testing.expectEqualStrings("mistral-large", backend.seen_model);
+}
+
+test "dynamic provider rejects a non-matching provider with a named error" {
+    var backend = E2eBackend{};
+    defer backend.freeSeen();
+    var ctx = E2eRouteCtx{ .kind = .mistral, .backend = &backend.provider };
+    var router = core.providers.client.Router.init(
+        core.providers.client.DynamicCfg.from(E2eRouteCtx, &ctx, E2eRouteCtx.lookup),
+    );
+
+    // groq is a registered provider but not the wired backend → NoBackend, and
+    // the backend is never started (no fallback, no silent reroute).
+    try std.testing.expectError(
+        error.NoBackend,
+        router.provider.start(.{ .model = "llama", .provider = "groq", .msgs = &.{} }),
+    );
+    // An unregistered provider fails the dispatch resolve before any lookup.
+    try std.testing.expectError(
+        error.UnknownProvider,
+        router.provider.start(.{ .model = "x", .provider = "not-real", .msgs = &.{} }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), backend.started);
 }
 
 const default_model = "claude-opus-4-6";
@@ -6297,15 +6727,29 @@ const arg_src_kind_map = std.StaticStringMap(enum {
     .{ "logout", .auth_provider },
 });
 
+// CLI/login name → the env var a user may set to supply the API key. Shown in
+// the "Paste API key …" hint and in error messages. Covers every login-able
+// provider so `pz login <provider>` names the right variable (MP4-R2).
 const provider_env_map = std.StaticStringMap([]const u8).initComptime(.{
     .{ "anthropic", "ANTHROPIC_API_KEY" },
     .{ "openai", "OPENAI_API_KEY" },
     .{ "google", "GOOGLE_API_KEY" },
+    .{ "openrouter", "OPENROUTER_API_KEY" },
+    .{ "mistral", "MISTRAL_API_KEY" },
+    .{ "groq", "GROQ_API_KEY" },
+    .{ "deepseek", "DEEPSEEK_API_KEY" },
 });
+// CLI/login name → canonical auth provider tag. `pz login mistral` (and
+// groq/deepseek/openrouter/google) resolves through this to the api-key save +
+// load path. anthropic/openai keep their OAuth-capable tags (MP4-R2).
 const auth_provider_map = std.StaticStringMap(core.providers.auth.Provider).initComptime(.{
     .{ "anthropic", .anthropic },
     .{ "openai", .openai },
     .{ "google", .google },
+    .{ "openrouter", .openrouter },
+    .{ "mistral", .mistral },
+    .{ "groq", .groq },
+    .{ "deepseek", .deepseek },
 });
 
 fn parseAuthProvider(name: []const u8) ?core.providers.auth.Provider {
@@ -9444,6 +9888,10 @@ test "runtime no-config does not read or migrate legacy auth" {
 }
 
 test "runtime print reports unsupported native provider without provider_cmd" {
+    // A provider label that is NOT in the registry (no native client, no dynamic
+    // arm) reports the "native provider unavailable" message and stops. After
+    // MP7, only a genuinely unregistered name (e.g. "cohere") hits this path —
+    // the OpenAI-compatible providers now construct the dynamic arm instead.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -9457,7 +9905,7 @@ test "runtime print reports unsupported native provider without provider_cmd" {
         .cfg = .{
             .mode = .print,
             .model = try std.testing.allocator.dupe(u8, "m"),
-            .provider = try std.testing.allocator.dupe(u8, "google"),
+            .provider = try std.testing.allocator.dupe(u8, "cohere"),
             .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
             .provider_cmd = null,
         },
@@ -9474,6 +9922,47 @@ test "runtime print reports unsupported native provider without provider_cmd" {
 
     const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "native provider unavailable") != null);
+}
+
+test "runtime print reports missing credentials for a dynamic provider (MP7)" {
+    // A registered OpenAI-compatible provider with no credentials now resolves
+    // to the dynamic arm and reports the provider-specific "credentials missing"
+    // message (not "unsupported"). `no_config` forces the AuthNotFound path
+    // deterministically — no env read, no network — so the assertion does not
+    // depend on the test runner's environment.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var cfg = cli.Run{
+        .mode = .print,
+        .prompt = "ping",
+        .no_config = true,
+        .cfg = .{
+            .mode = .print,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "deepseek"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = null,
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var out_buf: [4096]u8 = undefined;
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+
+    try std.testing.expectError(
+        error.ProviderStopped,
+        execWithIo(std.testing.allocator, cfg, eofReader(), &out_fbs),
+    );
+
+    const written = out_fbs.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "deepseek credentials missing") != null);
+    // It must NOT report the unsupported-provider message — deepseek is wired.
+    try std.testing.expect(std.mem.indexOf(u8, written, "native provider unavailable") == null);
 }
 
 test "runtime tui consumes multiple prompts from input stream" {
