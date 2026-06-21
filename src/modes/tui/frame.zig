@@ -182,6 +182,55 @@ pub const Frame = struct {
     }
 };
 
+// -- Custom panel layout composition --
+
+/// Computed regions for a TUI frame that includes an optional custom panel.
+/// Heights are clamped to the frame so reserving a panel never starves the
+/// transcript: the panel only appears when there is room beyond the minimums.
+pub const Layout = struct {
+    transcript: Rect,
+    panel: ?Rect,
+    footer: Rect,
+
+    pub const Request = struct {
+        /// Total drawable region (usually the whole frame).
+        w: usize,
+        h: usize,
+        /// Footer height (status lines).
+        footer_h: usize,
+        /// Desired custom-panel height (0 = no panel).
+        panel_h: usize,
+        /// Place panel directly above the footer (true) or directly below the
+        /// transcript with the footer at the very bottom (kept for slot intent;
+        /// both currently stack panel above footer, transcript fills the rest).
+        panel_above_footer: bool = true,
+    };
+
+    /// Split a `[0,0,w,h]` region into transcript / optional panel / footer.
+    /// The panel is dropped entirely if it cannot fit alongside at least one
+    /// transcript row and the full footer.
+    pub fn compute(req: Request) Layout {
+        const footer_h = @min(req.footer_h, req.h);
+        const after_footer = req.h - footer_h;
+
+        // Reserve the panel only if a transcript row survives.
+        var panel_h: usize = 0;
+        if (req.panel_h > 0 and after_footer > req.panel_h) {
+            panel_h = req.panel_h;
+        }
+        const transcript_h = after_footer - panel_h;
+
+        const transcript = Rect{ .x = 0, .y = 0, .w = req.w, .h = transcript_h };
+        const panel: ?Rect = if (panel_h > 0)
+            .{ .x = 0, .y = transcript_h, .w = req.w, .h = panel_h }
+        else
+            null;
+        const footer = Rect{ .x = 0, .y = transcript_h + panel_h, .w = req.w, .h = footer_h };
+
+        return .{ .transcript = transcript, .panel = panel, .footer = footer };
+    }
+};
+
 // -- Shared UTF-8 / display-width utilities --
 
 pub fn ensureUtf8(text: []const u8) error{InvalidUtf8}!void {
@@ -339,4 +388,54 @@ test "frame write wide char dropped when only 1 col left" {
 
     const wrote = try f.write(1, 0, "中", .{});
     try std.testing.expectEqual(@as(usize, 0), wrote);
+}
+
+test "layout reserves panel rows between transcript and footer" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+    const lay = Layout.compute(.{ .w = 40, .h = 20, .footer_h = 2, .panel_h = 4 });
+    const panel = lay.panel orelse return error.TestUnexpectedResult;
+    const Snap = struct {
+        transcript: Rect,
+        panel: Rect,
+        footer: Rect,
+    };
+    try oh.snap(@src(),
+        \\modes.tui.frame.test.layout reserves panel rows between transcript and footer.Snap
+        \\  .transcript: modes.tui.frame.Rect
+        \\    .x: usize = 0
+        \\    .y: usize = 0
+        \\    .w: usize = 40
+        \\    .h: usize = 14
+        \\  .panel: modes.tui.frame.Rect
+        \\    .x: usize = 0
+        \\    .y: usize = 14
+        \\    .w: usize = 40
+        \\    .h: usize = 4
+        \\  .footer: modes.tui.frame.Rect
+        \\    .x: usize = 0
+        \\    .y: usize = 18
+        \\    .w: usize = 40
+        \\    .h: usize = 2
+    ).expectEqual(Snap{
+        .transcript = lay.transcript,
+        .panel = panel,
+        .footer = lay.footer,
+    });
+}
+
+test "layout drops panel when it would starve the transcript" {
+    // h=5, footer=2 → 3 rows for transcript+panel. panel_h=4 cannot fit (needs
+    // to leave at least 1 transcript row), so the panel is dropped.
+    const lay = Layout.compute(.{ .w = 10, .h = 5, .footer_h = 2, .panel_h = 4 });
+    try std.testing.expect(lay.panel == null);
+    try std.testing.expectEqual(@as(usize, 3), lay.transcript.h);
+    try std.testing.expectEqual(@as(usize, 3), lay.footer.y);
+}
+
+test "layout with no panel fills transcript to footer" {
+    const lay = Layout.compute(.{ .w = 10, .h = 10, .footer_h = 2, .panel_h = 0 });
+    try std.testing.expect(lay.panel == null);
+    try std.testing.expectEqual(@as(usize, 8), lay.transcript.h);
+    try std.testing.expectEqual(@as(usize, 8), lay.footer.y);
 }
