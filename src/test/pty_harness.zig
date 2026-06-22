@@ -938,7 +938,7 @@ test "real pz PTY /login anthropic passes args through picker" {
     const steps = [_]InteractiveStep{
         .{ .wait_for = .{ .text = "drop files", .timeout_ms = 8000 } },
         .{ .inject = "/login anthropic\n" },
-        .{ .wait_for = .{ .text = "oauth", .timeout_ms = 5000 } },
+        .{ .wait_for = .{ .text = "direct provider login disabled by policy", .timeout_ms = 5000 } },
         .{ .inject = "\x03\x03" },
         .{ .sleep = 500 },
     };
@@ -951,8 +951,8 @@ test "real pz PTY /login anthropic passes args through picker" {
         &steps,
     );
     defer out.deinit(std.testing.allocator);
-    // wait_for "oauth" already verified the flow started.
-    // The picker passed args through successfully.
+    // wait_for verified the picker passed args through and the login path
+    // rejected direct provider credentials.
 }
 
 // ── T7c: headless pipeline walkthrough coverage ──
@@ -1697,156 +1697,15 @@ test "real-env PTY: pz starts and exits without crash" {
 }
 
 test "real PTY: hello gets response" {
-    if (!realProviderTestsEnabled()) return error.SkipZigTest;
-    const api_key = getenv("ANTHROPIC_API_KEY") orelse return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "home/.pi/agent");
-    const cwd_abs = try realPathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(cwd_abs);
-    const home_abs = try realPathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_abs);
-
-    // Write auth.json with the real API key (value is safe — it's our own test env).
-    const auth_json = try std.fmt.allocPrint(alloc,
-        \\{{"anthropic":{{"type":"api_key","key":"{s}"}}}}
-    , .{api_key});
-    defer alloc.free(auth_json);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pi/agent/auth.json", .data = auth_json });
-
-    var env = try baseEnv(alloc, home_abs);
-    defer env.deinit();
-    try env.put("ANTHROPIC_API_KEY", api_key);
-
-    const pz_bin = try pzBinAlloc(alloc);
-    defer alloc.free(pz_bin);
-
-    // Use print mode to avoid TUI complexity — send a prompt, get text back.
-    var out = try runProc(
-        alloc,
-        cwd_abs,
-        &env,
-        &.{
-            pz_bin,
-            "--no-config",
-            "--no-session",
-            "--mode",
-            "print",
-            "--model",
-            "claude-sonnet-4-20250514",
-            "--prompt",
-            "Say exactly: PZTEST_OK",
-        },
-        "",
-    );
-    defer out.deinit(alloc);
-
-    switch (out.term) {
-        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
-        else => {
-            if (out.stderr.len > 0) {
-                std.debug.print("stderr: {s}\n", .{out.stderr});
-            }
-            return error.TestUnexpectedResult;
-        },
-    }
-    // Verify we got some response text (the model should include PZTEST_OK).
-    try std.testing.expect(out.stdout.len > 0);
+    return error.SkipZigTest;
 }
 
 test "real PTY TUI: type prompt, get response in transcript" {
-    if (!realProviderTestsEnabled()) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-
-    // Need real auth — try to copy from user's home
-    const real_home = getenv("HOME") orelse return error.SkipZigTest;
-    const auth_src = std.fs.path.join(alloc, &.{ real_home, ".pz/auth.json" }) catch return error.SkipZigTest;
-    defer alloc.free(auth_src);
-    const auth_data = std.Io.Dir.cwd().readFileAlloc(std.testing.io, auth_src, alloc, .limited(64 * 1024)) catch return error.SkipZigTest;
-    defer alloc.free(auth_data);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pz/auth.json", .data = auth_data });
-    const cwd_abs = try realPathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(cwd_abs);
-    const home_abs = try realPathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_abs);
-
-    var env = try baseEnv(alloc, home_abs);
-    defer env.deinit();
-
-    const steps = [_]InteractiveStep{
-        .{ .wait_for = .{ .text = "drop files", .timeout_ms = 10000 } },
-        .{ .inject = "Say exactly: PZTEST_HELLO\n" },
-        .{ .wait_for = .{ .text = "PZTEST_HELLO", .timeout_ms = 30000 } },
-        .{ .inject = "\x03\x03" },
-        .{ .sleep = 500 },
-    };
-
-    var out = try runPtyInteractive(alloc, cwd_abs, &env, &.{
-        "--no-session",
-        "--model",
-        "claude-sonnet-4-20250514",
-    }, &steps);
-    defer out.deinit(alloc);
-
-    try std.testing.expect(out.output.len > 0);
-    // The model's response containing PZTEST_HELLO was already proven by wait_for.
-    // Verify it persists in the final output buffer.
-    try std.testing.expect(std.mem.indexOf(u8, out.output, "PZTEST_HELLO") != null);
+    return error.SkipZigTest;
 }
 
 test "real PTY TUI: cached anthropic oauth token gets response in transcript" {
-    if (!realProviderTestsEnabled()) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-
-    const real_home = getenv("HOME") orelse return error.SkipZigTest;
-    var auth_res = core.providers.auth.loadForProviderWithHooks(alloc, .anthropic, .{
-        .home_override = real_home,
-    }) catch return error.SkipZigTest;
-    defer auth_res.deinit();
-    if (auth_res.auth != .oauth) return error.SkipZigTest;
-
-    const auth_src = std.fs.path.join(alloc, &.{ real_home, ".pz/auth.json" }) catch return error.SkipZigTest;
-    defer alloc.free(auth_src);
-    const auth_data = std.Io.Dir.cwd().readFileAlloc(std.testing.io, auth_src, alloc, .limited(64 * 1024)) catch return error.SkipZigTest;
-    defer alloc.free(auth_data);
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "home/.pz");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.pz/auth.json", .data = auth_data });
-    const cwd_abs = try realPathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(cwd_abs);
-    const home_abs = try realPathAlloc(alloc, tmp.dir, "home");
-    defer alloc.free(home_abs);
-
-    var env = try baseEnv(alloc, home_abs);
-    defer env.deinit();
-
-    const steps = [_]InteractiveStep{
-        .{ .wait_for = .{ .text = "drop files", .timeout_ms = 10000 } },
-        .{ .inject = "Say exactly: PZTEST_OAUTH\n" },
-        .{ .wait_for = .{ .text = "PZTEST_OAUTH", .timeout_ms = 30000 } },
-        .{ .inject = "\x03\x03" },
-        .{ .sleep = 500 },
-    };
-
-    var out = try runPtyInteractive(alloc, cwd_abs, &env, &.{
-        "--no-session",
-        "--model",
-        "claude-sonnet-4-20250514",
-    }, &steps);
-    defer out.deinit(alloc);
-
-    try std.testing.expect(std.mem.indexOf(u8, out.output, "PZTEST_OAUTH") != null);
+    return error.SkipZigTest;
 }
 
 // ── Bidirectional PTY harness ──
@@ -3073,11 +2932,10 @@ test "UX7 walkthrough: missing auth shows guidance" {
     }, &steps);
     defer out.deinit(alloc);
 
-    // Should show guidance about missing provider/credentials.
+    // Should show guidance about the approved provider command adapter path.
     const has_guidance = std.mem.indexOf(u8, out.output, "provider unavailable") != null or
-        std.mem.indexOf(u8, out.output, "credentials missing") != null or
-        std.mem.indexOf(u8, out.output, "/login") != null or
-        std.mem.indexOf(u8, out.output, "ANTHROPIC_API_KEY") != null or
+        std.mem.indexOf(u8, out.output, "direct provider runtimes are disabled by policy") != null or
+        std.mem.indexOf(u8, out.output, "PZ_PROVIDER_CMD") != null or
         std.mem.indexOf(u8, out.output, "provider") != null;
     try std.testing.expect(has_guidance);
 }

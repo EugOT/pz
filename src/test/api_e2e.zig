@@ -1,15 +1,16 @@
-//! Real API E2E tests — run when ANTHROPIC_API_KEY env is set OR OAuth tokens exist.
+//! Real API E2E tests are disabled in this fork.
+//!
+//! Runtime policy forbids direct Anthropic/OpenAI/Google provider APIs in active
+//! test paths. Use approved CLI/agent adapters in integration tests instead.
 const std = @import("std");
 const providers = @import("../core/providers.zig");
 const auth_mod = @import("../core/providers/auth.zig");
 const anthropic = @import("../core/providers/anthropic.zig");
-/// Try API key from env, then OAuth from auth file. Skip if neither available.
-/// E2E tests use page_allocator because std.http.Client has internal
-/// connection pool leaks on error paths (stdlib issue, not ours).
+/// Direct provider API tests must not run from ambient credentials.
 const e2e_alloc = std.heap.page_allocator;
 
 fn loadAuthOrSkip() error{SkipZigTest}!auth_mod.Result {
-    return auth_mod.loadForProvider(e2e_alloc, .anthropic) catch return error.SkipZigTest;
+    return error.SkipZigTest;
 }
 
 fn makeClientWithKey(key: []const u8) !anthropic.Client {

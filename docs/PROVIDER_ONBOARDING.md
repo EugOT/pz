@@ -85,11 +85,13 @@ static table; malformed config is a surfaced error, never a silent default.
 pub const acme = @import("providers/acme.zig");
 ```
 
-In `runtime.zig`, add the provider to the kind enum and the env/CLI map so
-`pz login acme` resolves to the api-key path:
+In `runtime.zig`, add the provider to the kind enum and CLI provider map so
+provider names remain stable for configuration, logout, and compatibility. Direct
+runtime login is disabled in this fork; active model calls must be routed through
+`--provider-cmd`/`PZ_PROVIDER_CMD` with an approved CLI adapter.
 
 ```zig
-// native_provider_kind_map / provider env map
+// native_provider_kind_map / auth_provider_map
 .{ "acme", .acme },
 ```
 
@@ -106,19 +108,20 @@ the existing per-provider `testStream`/`testParse` helpers. The full suite
 
 ## Examples
 
-- **OpenRouter** — aggregator; `api.openrouter.ai`, `/api/v1/chat/completions`,
-  `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`. Model names are `provider/model`
-  slugs, which is why provider-scoped lookup matters.
-- **Google (Gemini)** — OpenAI-compatible endpoint; key via `GOOGLE_API_KEY`.
+- **OpenRouter** — aggregator; `api.openrouter.ai`, `/api/v1/chat/completions`.
+  Model names are `provider/model` slugs, which is why provider-scoped lookup
+  matters. Active use still requires an approved adapter.
+- **Google (Gemini)** — OpenAI-compatible registry metadata only in this fork;
+  active use must go through Antigravity/approved adapter wiring, not direct keys.
 - **Azure OpenAI** — same OpenAI wire format but a per-deployment host/path:
-  set `.base_url_env = "AZURE_OPENAI_BASE_URL"` and point it at your deployment
-  URL; the key flows through the api-key auth path.
+  keep registry metadata separate from runtime policy. Active use requires an
+  approved adapter.
 
 ## Error paths & precedence
 
-1. **Auth resolution** — env var (`<NAME>_API_KEY` / OAuth token) → `~/.pz/auth.json`
-   file entry. A provider with no resolvable credential returns
-   `error.AuthNotFound`; it is never silently skipped.
+1. **Runtime adapter resolution** — active runtime paths require
+   `--provider-cmd`/`PZ_PROVIDER_CMD`. Registry-level direct-provider code is
+   compile/test scaffolding unless the policy is explicitly changed.
 2. **Model config** — `~/.pz/models.json` overrides the static registry by name;
    wildcards (`provider/*`) apply to matching names; a malformed file or invalid
    `ctx_win`/cost surfaces `error.BadModelConfig`.

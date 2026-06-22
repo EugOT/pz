@@ -117,8 +117,12 @@ On macOS, bash tool execution is wrapped with `sandbox-exec` using a generated p
 
 Rules use the pattern `runtime/web/<host>` with tool scoping:
 ```json
-{"pattern": "runtime/web/api.anthropic.com", "effect": "allow", "tool": "web"}
+{"pattern": "runtime/web/docs.internal.example", "effect": "allow", "tool": "web"}
 ```
+
+Direct provider API egress is disabled in the EugOT runtime policy. Keep any
+provider endpoint rules out of active policy bundles unless a separate reviewed
+exception explicitly allows them.
 
 ### Proxy
 
@@ -173,10 +177,12 @@ Controlled by `.pz/policy.json` — rules can restrict which release URLs are al
 
 ## Auth
 
-### OAuth + API Key
+### Provider Adapter Auth Policy
 
-- OAuth callback server (`oauth_callback.zig`) for browser-based auth flows
-- API key auth via environment variables or config files
+- OAuth callback server code remains registry/test scaffolding unless a reviewed
+  policy change re-enables it.
+- Direct provider API key auth through environment variables or config files is
+  disabled by policy; use `PZ_PROVIDER_CMD` with an approved CLI adapter.
 - Auth surface lockable via signed policy (`lock.auth`)
 
 ### CA Bundle
