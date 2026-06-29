@@ -403,7 +403,8 @@ const missing_mistral_provider_msg = missing_provider_msg;
 const missing_groq_provider_msg = missing_provider_msg;
 const missing_deepseek_provider_msg = missing_provider_msg;
 const direct_provider_login_disabled_msg = "direct provider login disabled by policy; configure PZ_PROVIDER_CMD with an approved CLI adapter\n";
-const unsupported_native_provider_msg = "native provider unavailable for this provider label; set --provider-cmd/PZ_PROVIDER_CMD to an approved CLI adapter";
+const unsupported_native_provider_msg = "native provider unavailable for this provider label; " ++
+    "set --provider-cmd/PZ_PROVIDER_CMD to an approved CLI adapter";
 const policy_denied_msg = "blocked by policy";
 
 fn missingProviderMsgForInitErr(kind: NativeProviderKind, err: anyerror) []const u8 {
@@ -3043,7 +3044,12 @@ fn runTui(
                                         ui.ov = null;
                                     },
                                     .login => {
-                                        const msg = try std.fmt.allocPrint(alloc, "Direct {s} login is disabled by policy; configure PZ_PROVIDER_CMD for an approved CLI adapter.", .{sel});
+                                        const msg = try std.fmt.allocPrint(
+                                            alloc,
+                                            "Direct {s} login is disabled by policy; " ++
+                                                "configure PZ_PROVIDER_CMD for an approved CLI adapter.",
+                                            .{sel},
+                                        );
                                         defer alloc.free(msg);
                                         try ui.tr.infoText(msg);
                                         ui.ov.?.deinit(alloc);
@@ -4501,7 +4507,7 @@ fn runRpcLogin(alloc: std.mem.Allocator, req: RpcReq, hooks: core.providers.auth
     const auth_req = try parseAuthReq(req.arg orelse req.text orelse "", req.provider);
     _ = auth_req;
     _ = hooks;
-    return try alloc.dupe(u8, direct_provider_login_disabled_msg);
+    return alloc.dupe(u8, direct_provider_login_disabled_msg);
 }
 
 fn runRpcLogout(
