@@ -1,0 +1,88 @@
+#!/usr/bin/env bun
+// Approved Codex CLI adapter for pz provider-command transport.
+// Reads pz's JSON request from stdin and emits pz stream frames on stdout.
+
+import { spawnSync } from "node:child_process";
+
+const raw = await Bun.stdin.text();
+
+function frame(tag, value) {
+  const text = String(value ?? "");
+  if (text.length === 0) return;
+  for (const line of text.split(/\r?\n/)) {
+    if (line.length > 0) process.stdout.write(`${tag}:${line}\n`);
+  }
+}
+
+function stop(reason) {
+  process.stdout.write(`stop:${reason}\n`);
+}
+
+function partToText(part) {
+  switch (part?.type) {
+    case "text":
+      return part.text ?? "";
+    case "tool_call":
+      return `[tool_call ${part.name ?? "unknown"} ${part.id ?? ""}] ${part.args ?? ""}`;
+    case "tool_result":
+      return `[tool_result ${part.id ?? ""}${part.is_err ? " error" : ""}] ${part.out ?? ""}`;
+    default:
+      return "";
+  }
+}
+
+function promptFromRequest(req) {
+  const chunks = [];
+  for (const msg of req.msgs ?? []) {
+    const role = msg.role ?? "user";
+    const body = (msg.parts ?? []).map(partToText).filter(Boolean).join("\n");
+    if (body.length > 0) chunks.push(`<${role}>\n${body}\n</${role}>`);
+  }
+  if (Array.isArray(req.tools) && req.tools.length > 0) {
+    const tools = req.tools
+      .map((tool) => `- ${tool.name}: ${tool.desc ?? ""}\n  schema: ${tool.schema ?? "{}"}`)
+      .join("\n");
+    chunks.push(`<available_pz_tools>\n${tools}\n</available_pz_tools>`);
+  }
+  return chunks.join("\n\n");
+}
+
+let req;
+try {
+  req = JSON.parse(raw);
+} catch (err) {
+  frame("err", `invalid pz provider request JSON: ${err?.message ?? err}`);
+  stop("err");
+  process.exit(0);
+}
+
+const model = String(req.model || "gpt-5.5").trim() || "gpt-5.5";
+const effort = (Bun.env.PZ_CODEX_REASONING_EFFORT || "medium").trim() || "medium";
+const prompt = promptFromRequest(req);
+
+const child = spawnSync(
+  "codex",
+  [
+    "exec",
+    "-m",
+    model,
+    "-c",
+    `model_reasoning_effort="${effort}"`,
+    "-",
+  ],
+  {
+    input: prompt,
+    encoding: "utf8",
+  },
+);
+
+if (child.status !== 0) {
+  const err = String(child.stderr ?? "").trim();
+  frame("err", err || child.error?.message || `codex exec exited ${child.status}`);
+  stop("err");
+  process.exit(0);
+}
+
+const out = String(child.stdout ?? "").trim();
+frame("text", out);
+stop("done");

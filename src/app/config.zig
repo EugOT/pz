@@ -9,6 +9,7 @@ fn defaultIo() std.Io {
 
 pub const model_default = "default";
 pub const provider_default = "default";
+pub const provider_cmd_default = "pz-provider-codex";
 pub const session_dir_default = ".pz/sessions";
 pub const auto_cfg_path = ".pz/settings.json";
 pub const policy_rel_path = ".pz/policy.json";
@@ -279,6 +280,7 @@ pub fn discover(
         .model = try alloc.dupe(u8, model_default),
         .provider = try alloc.dupe(u8, provider_default),
         .session_dir = try alloc.dupe(u8, session_dir_default),
+        .provider_cmd = try alloc.dupe(u8, provider_cmd_default),
     };
     errdefer out.deinit(alloc);
 
@@ -626,7 +628,8 @@ test "config uses defaults when no sources are present" {
     try std.testing.expectEqualStrings(provider_default, cfg.provider);
     try std.testing.expectEqualStrings(session_dir_default, cfg.session_dir);
     try std.testing.expect(cfg.theme == null);
-    try std.testing.expect(cfg.provider_cmd == null);
+    try std.testing.expect(cfg.provider_cmd != null);
+    try std.testing.expectEqualStrings(provider_cmd_default, cfg.provider_cmd.?);
     try std.testing.expect(cfg.ca_file == null);
 }
 
@@ -671,7 +674,8 @@ test "config no-config bypasses file source" {
     try std.testing.expectEqualStrings(model_default, cfg.model);
     try std.testing.expectEqualStrings(provider_default, cfg.provider);
     try std.testing.expect(cfg.theme == null);
-    try std.testing.expect(cfg.provider_cmd == null);
+    try std.testing.expect(cfg.provider_cmd != null);
+    try std.testing.expectEqualStrings(provider_cmd_default, cfg.provider_cmd.?);
 }
 
 test "config no-config suppresses global settings" {
@@ -1049,7 +1053,8 @@ test "config works with null HOME (env isolation)" {
     try std.testing.expectEqualStrings(provider_default, cfg.provider);
     try std.testing.expectEqualStrings(session_dir_default, cfg.session_dir);
     try std.testing.expect(cfg.theme == null);
-    try std.testing.expect(cfg.provider_cmd == null);
+    try std.testing.expect(cfg.provider_cmd != null);
+    try std.testing.expectEqualStrings(provider_cmd_default, cfg.provider_cmd.?);
     try std.testing.expect(cfg.ca_file == null);
 }
 

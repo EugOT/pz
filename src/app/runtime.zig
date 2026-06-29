@@ -6494,8 +6494,8 @@ test "dynamic provider rejects a non-matching provider with a named error" {
     try std.testing.expectEqual(@as(usize, 0), backend.started);
 }
 
-const default_model = "claude-opus-4-6";
-const default_provider = "anthropic";
+const default_model = "gpt-5.5";
+const default_provider = "codex";
 
 fn resolveDefault(model: []const u8) []const u8 {
     return if (std.mem.eql(u8, model, "default")) default_model else model;
@@ -6567,8 +6567,8 @@ fn buildSystemPrompt(alloc: std.mem.Allocator, run_cmd: cli.Run, home: ?[]const 
 
 const model_cycle = [_][]const u8{
     default_model,
-    "claude-sonnet-4-5",
-    "claude-haiku-4-5-20251001",
+    "claude-opus-4-8",
+    "gemini-3.5-flash",
 };
 
 const provider_args = core.providers.auth.provider_names;
