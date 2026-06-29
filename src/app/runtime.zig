@@ -394,15 +394,17 @@ fn oauthExpiredTag(auth: core.providers.auth.Auth, tag: core.providers.auth.Prov
     return null;
 }
 
-const missing_provider_msg = "provider unavailable; choose a supported provider with credentials or set --provider-cmd/PZ_PROVIDER_CMD";
-const missing_anthropic_provider_msg = "anthropic credentials missing; set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN, run /login anthropic, or set --provider-cmd/PZ_PROVIDER_CMD";
-const missing_openai_provider_msg = "openai credentials missing; set OPENAI_API_KEY, run /login openai, or set --provider-cmd/PZ_PROVIDER_CMD";
-const missing_openrouter_provider_msg = "openrouter credentials missing; run /login openrouter <key> or set --provider-cmd/PZ_PROVIDER_CMD";
-const missing_google_provider_msg = "google credentials missing; set GOOGLE_API_KEY, run /login google <key>, or set --provider-cmd/PZ_PROVIDER_CMD";
-const missing_mistral_provider_msg = "mistral credentials missing; run /login mistral <key> or set --provider-cmd/PZ_PROVIDER_CMD";
-const missing_groq_provider_msg = "groq credentials missing; run /login groq <key> or set --provider-cmd/PZ_PROVIDER_CMD";
-const missing_deepseek_provider_msg = "deepseek credentials missing; run /login deepseek <key> or set --provider-cmd/PZ_PROVIDER_CMD";
-const unsupported_native_provider_msg = "native provider unavailable for this provider label; use a supported provider or set --provider-cmd/PZ_PROVIDER_CMD";
+const missing_provider_msg = "direct provider runtimes are disabled by policy; set --provider-cmd/PZ_PROVIDER_CMD to an approved CLI adapter";
+const missing_anthropic_provider_msg = missing_provider_msg;
+const missing_openai_provider_msg = missing_provider_msg;
+const missing_openrouter_provider_msg = missing_provider_msg;
+const missing_google_provider_msg = missing_provider_msg;
+const missing_mistral_provider_msg = missing_provider_msg;
+const missing_groq_provider_msg = missing_provider_msg;
+const missing_deepseek_provider_msg = missing_provider_msg;
+const direct_provider_login_disabled_msg = "direct provider login disabled by policy; configure PZ_PROVIDER_CMD with an approved CLI adapter\n";
+const unsupported_native_provider_msg = "native provider unavailable for this provider label; " ++
+    "set --provider-cmd/PZ_PROVIDER_CMD to an approved CLI adapter";
 const policy_denied_msg = "blocked by policy";
 
 fn missingProviderMsgForInitErr(kind: NativeProviderKind, err: anyerror) []const u8 {
@@ -2074,7 +2076,6 @@ fn execWithIoTuiHooks(
     tui_hooks: TuiHooks,
 ) (Err || anyerror)![]u8 {
     var provider_rt: ProviderRuntime = undefined;
-    var native_rt: NativeProviderRuntime = undefined;
     var hooks = audit_hooks;
     hooks.io = run_cmd.io;
     if (hooks.ca_file == null) hooks.ca_file = run_cmd.cfg.ca_file;
@@ -2086,9 +2087,7 @@ fn execWithIoTuiHooks(
     };
     var provider: *core.providers.Provider = undefined;
     var has_provider_rt = false;
-    var has_native_rt = false;
     defer if (has_provider_rt) provider_rt.deinit();
-    defer if (has_native_rt) native_rt.deinit();
 
     const home = run_cmd.home;
     var pol = try RuntimePolicy.load(alloc, defaultIo(), home);
@@ -2190,7 +2189,7 @@ fn execWithIoTuiHooks(
     const reader = if (in) |r| r else &stdin_reader.interface;
 
     // Init provider
-    var needs_login: ?NativeProviderKind = null;
+    const needs_login: ?NativeProviderKind = null;
     if (run_cmd.cfg.provider_cmd) |provider_cmd| {
         try provider_rt.init(alloc, defaultIo(), provider_cmd);
         has_provider_rt = true;
@@ -2198,21 +2197,8 @@ fn execWithIoTuiHooks(
     } else {
         const provider_name = resolveDefaultProvider(run_cmd.cfg.provider);
         if (parseNativeProviderKind(provider_name)) |native_kind| {
-            if (run_cmd.no_config) {
-                missing_provider.msg = missingProviderMsgForInitErr(native_kind, error.AuthNotFound);
-                provider = &missing_provider.provider;
-            } else if (NativeProviderRuntime.init(alloc, native_kind, hooks.auth())) |nr| {
-                native_rt = nr;
-                has_native_rt = true;
-                if (el) |*e| native_rt.setEventLoop(e);
-                provider = native_rt.providerPtr();
-            } else |err| {
-                if (err == error.AuthNotFound and run_cmd.mode == .tui) {
-                    needs_login = native_kind;
-                }
-                missing_provider.msg = missingProviderMsgForInitErr(native_kind, err);
-                provider = &missing_provider.provider;
-            }
+            missing_provider.msg = missingProviderMsgForInitErr(native_kind, error.AuthNotFound);
+            provider = &missing_provider.provider;
         } else {
             missing_provider.msg = unsupported_native_provider_msg;
             provider = &missing_provider.provider;
@@ -2266,7 +2252,7 @@ fn execWithIoTuiHooks(
                 writer,
                 sys_prompt,
                 audit_hooks,
-                has_native_rt and native_rt.isSub(),
+                false,
             ),
             .json => try runJson(
                 alloc,
@@ -2280,7 +2266,7 @@ fn execWithIoTuiHooks(
                 writer,
                 sys_prompt,
                 hooks,
-                has_native_rt and native_rt.isSub(),
+                false,
             ),
             .tui => try runTui(
                 alloc,
@@ -2295,10 +2281,10 @@ fn execWithIoTuiHooks(
                 session_dir_path,
                 run_cmd.no_session,
                 sys_prompt,
-                has_native_rt and native_rt.isSub(),
+                false,
                 hooks,
                 tui_hooks,
-                if (has_native_rt) &native_rt else null,
+                null,
                 needs_login,
             ),
             .rpc => try runRpc(
@@ -2315,7 +2301,7 @@ fn execWithIoTuiHooks(
                 run_cmd.no_session,
                 sys_prompt,
                 hooks,
-                has_native_rt and native_rt.isSub(),
+                false,
             ),
         }
     }
@@ -3058,15 +3044,14 @@ fn runTui(
                                         ui.ov = null;
                                     },
                                     .login => {
-                                        // Set env var hint in editor for API key entry
-                                        const env_var = provider_env_map.get(sel) orelse "GOOGLE_API_KEY";
-                                        const msg = try std.fmt.allocPrint(alloc, "Paste {s} API key (or set {s} env var):", .{ sel, env_var });
+                                        const msg = try std.fmt.allocPrint(
+                                            alloc,
+                                            "Direct {s} login is disabled by policy; " ++
+                                                "configure PZ_PROVIDER_CMD for an approved CLI adapter.",
+                                            .{sel},
+                                        );
                                         defer alloc.free(msg);
                                         try ui.tr.infoText(msg);
-                                        // Set editor to /login <provider>; API key or OAuth can follow.
-                                        const prompt_text = try std.fmt.allocPrint(alloc, "/login {s} ", .{sel});
-                                        defer alloc.free(prompt_text);
-                                        try ui.ed.setText(prompt_text);
                                         ui.ov.?.deinit(alloc);
                                         ui.ov = null;
                                     },
@@ -3280,7 +3265,7 @@ fn runTui(
                             }
                             if (cmd == .select_login) {
                                 var ov = tui_overlay.Overlay.init(&core.providers.auth.provider_names, 0);
-                                ov.title = "Login (set API key)";
+                                ov.title = "Login disabled by policy";
                                 ov.kind = .login;
                                 ui.ov = ov;
                                 try ui.draw(out);
@@ -4472,72 +4457,10 @@ fn runLoginFlow(
     req: AuthReq,
     hooks: core.providers.auth.Hooks,
 ) !void {
-    const kind = classifyLoginInput(req.prov, req.key);
-    const oauth_info = core.providers.auth.oauthLoginInfo(req.prov);
-    if (kind == .oauth_start) {
-        const info = oauth_info orelse return error.OAuthNotSupported;
-        const oauth_name = core.providers.auth.providerName(req.prov);
-
-        var listener = core.providers.oauth_callback.Listener.init(alloc, .{
-            .path = info.callback_path,
-            .redirect_host = info.redirect_host,
-            .success_redirect_url = info.success_redirect_url,
-        }) catch |err| {
-            const em = try report.cli(alloc, "start local oauth callback server", err);
-            defer alloc.free(em);
-            try out.writeAll(em);
-            return;
-        };
-        defer listener.deinit();
-
-        var flow = core.providers.auth.beginOAuthWithRedirect(alloc, req.prov, listener.redirect_uri) catch |err| {
-            const em = try report.cli(alloc, info.start_action, err);
-            defer alloc.free(em);
-            try out.writeAll(em);
-            return;
-        };
-        defer flow.deinit(alloc);
-
-        runOAuthCallbackLogin(alloc, out, req.prov, oauth_name, &listener, &flow, hooks) catch |err| switch (err) {
-            error.OAuthCallbackTimeout => {
-                const em = try report.cli(alloc, "wait for oauth callback", err);
-                defer alloc.free(em);
-                try out.writeAll(em);
-                return;
-            },
-            else => {
-                const em = try report.cli(alloc, info.complete_action, err);
-                defer alloc.free(em);
-                try out.writeAll(em);
-                return;
-            },
-        };
-        return;
-    }
-    if (kind == .oauth_complete) {
-        const info = oauth_info orelse return error.OAuthNotSupported;
-        const oauth_name = core.providers.auth.providerName(req.prov);
-        const verifier = takePendingVerifier(req.prov) orelse {
-            try out.writeAll("no pending oauth verifier; start a new /login flow first\n");
-            return;
-        };
-        defer clearPendingVerifier();
-        core.providers.auth.completeOAuthWithHooks(alloc, req.prov, req.key, verifier, hooks) catch |err| {
-            const em = try report.cli(alloc, info.complete_action, err);
-            defer alloc.free(em);
-            try out.writeAll(em);
-            return;
-        };
-        try writeTextLine(alloc, out, "{s} oauth login complete\n", .{oauth_name});
-        return;
-    }
-    if (req.key.len == 0) {
-        const env_var = provider_env_map.get(req.prov_name) orelse "API_KEY";
-        try writeTextLine(alloc, out, "Paste API key: /login {s} <key> (or set {s})\n", .{ req.prov_name, env_var });
-        return;
-    }
-    try core.providers.auth.saveApiKeyWithHooks(alloc, req.prov, req.key, hooks);
-    try writeTextLine(alloc, out, "API key saved for {s}\n", .{req.prov_name});
+    _ = alloc;
+    _ = req;
+    _ = hooks;
+    try out.writeAll(direct_provider_login_disabled_msg);
 }
 
 fn runOAuthCallbackLogin(
@@ -4582,39 +4505,9 @@ fn runOAuthCallbackLogin(
 
 fn runRpcLogin(alloc: std.mem.Allocator, req: RpcReq, hooks: core.providers.auth.Hooks) ![]u8 {
     const auth_req = try parseAuthReq(req.arg orelse req.text orelse "", req.provider);
-    const kind = classifyLoginInput(auth_req.prov, auth_req.key);
-    const oauth_info = core.providers.auth.oauthLoginInfo(auth_req.prov);
-    if (kind == .oauth_start) {
-        const info = oauth_info orelse return error.OAuthNotSupported;
-        const oauth_name = core.providers.auth.providerName(auth_req.prov);
-
-        var listener = try core.providers.oauth_callback.Listener.init(alloc, .{
-            .path = info.callback_path,
-            .redirect_host = info.redirect_host,
-            .success_redirect_url = info.success_redirect_url,
-        });
-        defer listener.deinit();
-
-        var flow = try core.providers.auth.beginOAuthWithRedirect(alloc, auth_req.prov, listener.redirect_uri);
-        defer flow.deinit(alloc);
-
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        errdefer out.deinit();
-        try runOAuthCallbackLogin(alloc, &out.writer, auth_req.prov, oauth_name, &listener, &flow, hooks);
-        return try out.toOwnedSlice();
-    }
-    if (kind == .oauth_complete) {
-        const verifier = takePendingVerifier(auth_req.prov) orelse return error.MissingOAuthVerifier;
-        defer clearPendingVerifier();
-        try core.providers.auth.completeOAuthWithHooks(alloc, auth_req.prov, auth_req.key, verifier, hooks);
-        return std.fmt.allocPrint(alloc, "{s} oauth login complete\n", .{core.providers.auth.providerName(auth_req.prov)});
-    }
-    if (auth_req.key.len == 0) {
-        const env_var = provider_env_map.get(auth_req.prov_name) orelse "API_KEY";
-        return std.fmt.allocPrint(alloc, "Paste API key: /login {s} <key> (or set {s})\n", .{ auth_req.prov_name, env_var });
-    }
-    try core.providers.auth.saveApiKeyWithHooks(alloc, auth_req.prov, auth_req.key, hooks);
-    return std.fmt.allocPrint(alloc, "API key saved for {s}\n", .{auth_req.prov_name});
+    _ = auth_req;
+    _ = hooks;
+    return alloc.dupe(u8, direct_provider_login_disabled_msg);
 }
 
 fn runRpcLogout(
@@ -4778,7 +4671,7 @@ fn handleSlashCommand(
                 \\  /fork [id]         Fork session
                 \\  /compact           Compact session
                 \\  /reload            Reload context files
-                \\  /login             Login (OAuth/API key)
+                \\  /login             Show provider-command policy guidance
                 \\  /logout            Logout
                 \\  /changelog         What's new
                 \\  /hotkeys           Keyboard shortcuts
@@ -5155,12 +5048,8 @@ fn handleSlashCommand(
                 try writeTextLine(alloc, out, "unknown provider: {s}\n", .{prov_name});
                 return .handled;
             };
-            runLoginFlow(alloc, out, req, audit_hooks.auth()) catch |err| {
-                const em = try report.cli(alloc, "login", err);
-                defer alloc.free(em);
-                try out.writeAll(em);
-                return .handled;
-            };
+            _ = req;
+            try out.writeAll(direct_provider_login_disabled_msg);
             return .handled;
         },
         .logout => {
@@ -6427,19 +6316,20 @@ test "DynamicKind name and auth tag round-trip through the registry" {
     try std.testing.expectEqual(core.providers.auth.Provider.google, DynamicKind.google.authTag());
 }
 
-test "missingProviderMsgForInitErr is provider-specific for native and dynamic" {
-    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.anthropic, error.AuthNotFound), "ANTHROPIC_API_KEY") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.openai, error.AuthNotFound), "OPENAI_API_KEY") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.google, error.AuthNotFound), "GOOGLE_API_KEY") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.mistral, error.AuthNotFound), "mistral") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.groq, error.AuthNotFound), "groq") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.deepseek, error.AuthNotFound), "deepseek") != null);
-    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.openrouter, error.AuthNotFound), "openrouter") != null);
+test "missingProviderMsgForInitErr directs users to approved provider command adapters" {
+    const msg = missingProviderMsgForInitErr(.anthropic, error.AuthNotFound);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "direct provider runtimes are disabled by policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "PZ_PROVIDER_CMD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "approved CLI adapter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "ANTHROPIC_API_KEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.openai, error.AuthNotFound), "OPENAI_API_KEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.google, error.AuthNotFound), "GOOGLE_API_KEY") == null);
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.deepseek, error.AuthNotFound), "PZ_PROVIDER_CMD") != null);
 }
 
-// MP4-R2: `pz login <newprovider>` must resolve to the api-key path. These
-// tests exercise the runtime's CLI-name → auth.Provider resolution + the env
-// var map a user is told to set, for every login-able provider.
+// MP4-R2: `pz login <newprovider>` must resolve provider names, but direct
+// credential capture is disabled in this fork. Runtime access goes through an
+// explicit `--provider-cmd`/`PZ_PROVIDER_CMD` approved CLI adapter.
 test "login name resolves to auth provider for native and new providers" {
     try std.testing.expectEqual(core.providers.auth.Provider.anthropic, parseAuthProvider("anthropic").?);
     try std.testing.expectEqual(core.providers.auth.Provider.openai, parseAuthProvider("openai").?);
@@ -6453,32 +6343,30 @@ test "login name resolves to auth provider for native and new providers" {
     try std.testing.expect(parseAuthProvider("nope") == null);
 }
 
-test "pz login <newprovider> classifies as api-key (no OAuth) with env hint" {
-    // For every api-key-only provider, the login flow must classify input as an
-    // API key, not an OAuth start, and name a dedicated env var.
-    const cases = [_]struct { name: []const u8, env: []const u8, tag: core.providers.auth.Provider }{
-        .{ .name = "mistral", .env = "MISTRAL_API_KEY", .tag = .mistral },
-        .{ .name = "groq", .env = "GROQ_API_KEY", .tag = .groq },
-        .{ .name = "deepseek", .env = "DEEPSEEK_API_KEY", .tag = .deepseek },
-        .{ .name = "openrouter", .env = "OPENROUTER_API_KEY", .tag = .openrouter },
+test "pz login <newprovider> resolves names but rejects direct credential capture" {
+    const cases = [_]struct { name: []const u8, tag: core.providers.auth.Provider }{
+        .{ .name = "mistral", .tag = .mistral },
+        .{ .name = "groq", .tag = .groq },
+        .{ .name = "deepseek", .tag = .deepseek },
+        .{ .name = "openrouter", .tag = .openrouter },
     };
     for (cases) |c| {
         const prov = parseAuthProvider(c.name) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(c.tag, prov);
-        // Empty key + non-OAuth-capable provider → api_key flow (prompt to paste).
-        try std.testing.expectEqual(LoginInputKind.api_key, classifyLoginInput(prov, ""));
-        // A pasted key is also classified api_key (saved directly, no OAuth).
-        try std.testing.expectEqual(LoginInputKind.api_key, classifyLoginInput(prov, "sk-secret-123"));
-        // The env-var hint shown to the user is the provider-specific one.
-        const env = provider_env_map.get(c.name) orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings(c.env, env);
+
+        const req = try parseAuthReq(c.name, null);
+        try std.testing.expectEqual(c.tag, req.prov);
+        var out_buf: [512]u8 = undefined;
+        var out_writer: std.Io.Writer = .fixed(&out_buf);
+        try runLoginFlow(std.testing.allocator, &out_writer, req, .{});
+        const written = out_writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, written, "direct provider login disabled by policy") != null);
+        try std.testing.expect(std.mem.indexOf(u8, written, "PZ_PROVIDER_CMD") != null);
+        try std.testing.expect(std.mem.indexOf(u8, written, "API_KEY") == null);
     }
 }
 
-test "pz login <newprovider> end-to-end saves an api key via the runtime flow" {
-    // Drive the same parse → classify → save path the CLI uses, proving
-    // `pz login mistral <key>` lands the credential on disk under the right
-    // provider (the api-key path, never OAuth).
+test "pz login <newprovider> does not save direct provider api keys" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
@@ -6493,14 +6381,8 @@ test "pz login <newprovider> end-to-end saves an api key via the runtime flow" {
     var out_buf: [512]u8 = undefined;
     var out_writer: std.Io.Writer = .fixed(&out_buf);
     try runLoginFlow(std.testing.allocator, &out_writer, req, .{ .home_override = home });
-    try std.testing.expect(std.mem.indexOf(u8, out_writer.buffered(), "API key saved for mistral") != null);
-
-    // The credential resolves back through the same provider-scoped loader the
-    // runtime uses (env first — empty for mistral — then the file).
-    var loaded = try core.providers.auth.loadForProviderWithHooks(std.testing.allocator, .mistral, .{ .home_override = home });
-    defer loaded.deinit();
-    try std.testing.expect(loaded.auth == .api_key);
-    try std.testing.expectEqualStrings("ml-key-789", loaded.auth.api_key);
+    try std.testing.expect(std.mem.indexOf(u8, out_writer.buffered(), "direct provider login disabled by policy") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, ".pz/auth.json", .{}));
 }
 
 // ── Dynamic provider dispatch e2e (MP7) ──────────────────────────────────────
@@ -6727,21 +6609,9 @@ const arg_src_kind_map = std.StaticStringMap(enum {
     .{ "logout", .auth_provider },
 });
 
-// CLI/login name → the env var a user may set to supply the API key. Shown in
-// the "Paste API key …" hint and in error messages. Covers every login-able
-// provider so `pz login <provider>` names the right variable (MP4-R2).
-const provider_env_map = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "anthropic", "ANTHROPIC_API_KEY" },
-    .{ "openai", "OPENAI_API_KEY" },
-    .{ "google", "GOOGLE_API_KEY" },
-    .{ "openrouter", "OPENROUTER_API_KEY" },
-    .{ "mistral", "MISTRAL_API_KEY" },
-    .{ "groq", "GROQ_API_KEY" },
-    .{ "deepseek", "DEEPSEEK_API_KEY" },
-});
-// CLI/login name → canonical auth provider tag. `pz login mistral` (and
-// groq/deepseek/openrouter/google) resolves through this to the api-key save +
-// load path. anthropic/openai keep their OAuth-capable tags (MP4-R2).
+// CLI/login name → canonical auth provider tag. Direct credential capture is
+// disabled by policy, but command parsing and logout still need stable provider
+// identity resolution.
 const auth_provider_map = std.StaticStringMap(core.providers.auth.Provider).initComptime(.{
     .{ "anthropic", .anthropic },
     .{ "openai", .openai },
@@ -9883,7 +9753,9 @@ test "runtime no-config does not read or migrate legacy auth" {
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "ANTHROPIC_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "direct provider runtimes are disabled by policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "PZ_PROVIDER_CMD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ANTHROPIC_API_KEY") == null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "home/.pz/auth.json", .{}));
 }
 
@@ -9924,12 +9796,10 @@ test "runtime print reports unsupported native provider without provider_cmd" {
     try std.testing.expect(std.mem.indexOf(u8, written, "native provider unavailable") != null);
 }
 
-test "runtime print reports missing credentials for a dynamic provider (MP7)" {
-    // A registered OpenAI-compatible provider with no credentials now resolves
-    // to the dynamic arm and reports the provider-specific "credentials missing"
-    // message (not "unsupported"). `no_config` forces the AuthNotFound path
-    // deterministically — no env read, no network — so the assertion does not
-    // depend on the test runner's environment.
+test "runtime print disables direct dynamic providers without provider_cmd" {
+    // A registered OpenAI-compatible provider is still known, but direct runtime
+    // construction is disabled unless the caller supplies an explicit approved
+    // provider command adapter.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -9960,8 +9830,9 @@ test "runtime print reports missing credentials for a dynamic provider (MP7)" {
     );
 
     const written = out_fbs.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "deepseek credentials missing") != null);
-    // It must NOT report the unsupported-provider message — deepseek is wired.
+    try std.testing.expect(std.mem.indexOf(u8, written, "direct provider runtimes are disabled by policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "PZ_PROVIDER_CMD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "deepseek credentials missing") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "native provider unavailable") == null);
 }
 
@@ -11429,10 +11300,7 @@ test "runtime rpc bg command starts lists and stops jobs" {
     );
 }
 
-test "runtime rpc auth commands emit audited success and failure records" {
-    const OhSnap = @import("ohsnap");
-    const oh = OhSnap{};
-
+test "runtime rpc auth commands reject direct login and audit logout records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -11491,7 +11359,9 @@ test "runtime rpc auth commands emit audited success and failure records" {
 
     const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"rpc_auth\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "API key saved for openai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "direct provider login disabled by policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "PZ_PROVIDER_CMD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "API key saved for openai") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "logged out of openai") != null);
 
     var fail_cfg = cli.Run{
@@ -11532,460 +11402,23 @@ test "runtime rpc auth commands emit audited success and failure records" {
     defer std.testing.allocator.free(fail_sid);
 
     const fail_written = fail_out_fbs.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, fail_written, "\"type\":\"rpc_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fail_written, "\"type\":\"rpc_auth\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fail_written, "direct provider login disabled by policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fail_written, "\"type\":\"rpc_error\"") == null);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const trace = try auditTraceSnap(arena.allocator(), rows.rows.items);
-    try oh.snap(@src(),
-        \\[]app.runtime.AuditEntrySnap
-        \\  [0]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [1]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-        \\  [2]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "save_api_key"
-        \\    .msg: ?[]const u8
-        \\      "api key save start"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "api_key"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [3]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .notice
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "save_api_key"
-        \\    .msg: ?[]const u8
-        \\      "api key save complete"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "api_key"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [4]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 3
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [5]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 4
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-        \\  [6]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "logout"
-        \\    .msg: ?[]const u8
-        \\      "logout start"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "stored"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [7]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .notice
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "logout"
-        \\    .msg: ?[]const u8
-        \\      "logout complete"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "stored"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [8]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 5
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [9]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 6
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-        \\  [10]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [11]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-        \\  [12]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "save_api_key"
-        \\    .msg: ?[]const u8
-        \\      "api key save start"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "api_key"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [13]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .err
-        \\    .outcome: core.audit.Outcome
-        \\      .fail
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "save_api_key"
-        \\    .msg: ?[]const u8
-        \\      "[mask]"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "api_key"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [14]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 3
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [15]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 4
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "drain"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "drain"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-    ).expectEqual(trace);
+    var saw_save_api_key = false;
+    var saw_logout = false;
+    for (trace) |entry| {
+        if (entry.op) |op| {
+            if (std.mem.eql(u8, op, "save_api_key")) saw_save_api_key = true;
+            if (std.mem.eql(u8, op, "logout")) saw_logout = true;
+        }
+    }
+    try std.testing.expect(!saw_save_api_key);
+    try std.testing.expect(saw_logout);
 }
 
 test "runtime rpc bg commands emit audited redacted control records" {
@@ -12498,10 +11931,7 @@ test "runtime rpc bg commands emit audited redacted control records" {
     ).expectEqual(trace);
 }
 
-test "runtime tui auth commands emit audited success and failure records" {
-    const OhSnap = @import("ohsnap");
-    const oh = OhSnap{};
-
+test "runtime tui auth commands reject direct login and audit logout records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -12555,7 +11985,9 @@ test "runtime tui auth commands emit audited success and failure records" {
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "API key saved for openai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "direct provider login disabled by policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "PZ_PROVIDER_CMD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "API key saved for openai") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "logged out of openai") != null);
 
     var fail_cfg = cli.Run{
@@ -12593,460 +12025,22 @@ test "runtime tui auth commands emit audited success and failure records" {
     defer std.testing.allocator.free(fail_sid);
 
     const fail_written = fail_out_fbs.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, fail_written, "error: login failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fail_written, "direct provider login disabled by policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fail_written, "error: login failed") == null);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const trace = try auditTraceSnap(arena.allocator(), rows.rows.items);
-    try oh.snap(@src(),
-        \\[]app.runtime.AuditEntrySnap
-        \\  [0]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [1]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-        \\  [2]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "save_api_key"
-        \\    .msg: ?[]const u8
-        \\      "api key save start"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "api_key"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [3]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .notice
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "save_api_key"
-        \\    .msg: ?[]const u8
-        \\      "api key save complete"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "api_key"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [4]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 3
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [5]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 4
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-        \\  [6]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "logout"
-        \\    .msg: ?[]const u8
-        \\      "logout start"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "stored"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [7]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .notice
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "logout"
-        \\    .msg: ?[]const u8
-        \\      "logout complete"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "stored"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [8]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 5
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [9]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 6
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-        \\  [10]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [11]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-        \\  [12]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 1
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "save_api_key"
-        \\    .msg: ?[]const u8
-        \\      "api key save start"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "api_key"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [13]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "auth"
-        \\    .seq: u64 = 2
-        \\    .kind: core.audit.EventKind
-        \\      .auth
-        \\    .severity: core.audit.Severity
-        \\      .err
-        \\    .outcome: core.audit.Outcome
-        \\      .fail
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .auth
-        \\    .res_name: ?[]const u8
-        \\      "openai"
-        \\    .op: ?[]const u8
-        \\      "save_api_key"
-        \\    .msg: ?[]const u8
-        \\      "[mask]"
-        \\    .data_name: ?[]const u8
-        \\      null
-        \\    .call_id: ?[]const u8
-        \\      null
-        \\    .auth_mech: ?[]const u8
-        \\      "api_key"
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [14]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 3
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control start"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      (empty)
-        \\  [15]: app.runtime.AuditEntrySnap
-        \\    .sid: []const u8
-        \\      "bg"
-        \\    .seq: u64 = 4
-        \\    .kind: core.audit.EventKind
-        \\      .tool
-        \\    .severity: core.audit.Severity
-        \\      .info
-        \\    .outcome: core.audit.Outcome
-        \\      .ok
-        \\    .res_kind: ?core.audit.ResourceKind
-        \\      .cmd
-        \\    .res_name: ?[]const u8
-        \\      "bg"
-        \\    .op: ?[]const u8
-        \\      "list"
-        \\    .msg: ?[]const u8
-        \\      "bg control success"
-        \\    .data_name: ?[]const u8
-        \\      "bg"
-        \\    .call_id: ?[]const u8
-        \\      "list"
-        \\    .auth_mech: ?[]const u8
-        \\      null
-        \\    .attrs: []const app.runtime.AuditAttrSnap
-        \\      [0]: app.runtime.AuditAttrSnap
-        \\        .key: []const u8
-        \\          "count"
-        \\        .vis: core.audit.Vis
-        \\          .pub
-        \\        .ty: []const u8
-        \\          "uint"
-    ).expectEqual(trace);
+    var saw_save_api_key = false;
+    var saw_logout = false;
+    for (trace) |entry| {
+        if (entry.op) |op| {
+            if (std.mem.eql(u8, op, "save_api_key")) saw_save_api_key = true;
+            if (std.mem.eql(u8, op, "logout")) saw_logout = true;
+        }
+    }
+    try std.testing.expect(!saw_save_api_key);
+    try std.testing.expect(saw_logout);
 }
 
 test "runtime tui bg commands emit audited redacted control records" {
@@ -14170,7 +13164,10 @@ test "slash logout without explicit provider frees logged-in list cleanly" {
     );
     defer std.testing.allocator.free(sid);
 
-    try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "API key saved for openai") != null);
+    const written = out_fbs.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "direct provider login disabled by policy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "no providers logged in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "API key saved for openai") == null);
 }
 
 test "LiveTurn tracks last_stop last_err and last_model" {
@@ -15297,19 +14294,18 @@ test "UX7: /provider with arg switches active provider" {
     try std.testing.expect(std.mem.indexOf(u8, out_fbs.buffered(), "provider set to openai") != null);
 }
 
-test "UX7: missing credential hint includes login instruction" {
-    // Anthropic auth-not-found message includes /login and env var hint
+test "UX7: missing provider hint points to approved provider command adapters" {
     const msg = missingProviderMsgForInitErr(.anthropic, error.AuthNotFound);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "/login anthropic") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "ANTHROPIC_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "PZ_PROVIDER_CMD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "approved CLI adapter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "/login anthropic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "ANTHROPIC_API_KEY") == null);
 
-    // Openai auth-not-found message includes /login and env var hint
     const omsg = missingProviderMsgForInitErr(.openai, error.AuthNotFound);
-    try std.testing.expect(std.mem.indexOf(u8, omsg, "/login openai") != null);
-    try std.testing.expect(std.mem.indexOf(u8, omsg, "OPENAI_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, omsg, "PZ_PROVIDER_CMD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, omsg, "OPENAI_API_KEY") == null);
 
-    // Generic provider message hints at credentials
-    try std.testing.expect(std.mem.indexOf(u8, missing_provider_msg, "credentials") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missing_provider_msg, "direct provider runtimes are disabled by policy") != null);
 }
 
 test "UX10: version check notice appears when update available" {

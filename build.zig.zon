@@ -21,8 +21,8 @@
             .hash = "mvzr-0.3.9-ZSOky_lvAQDe3gx6pFgM_NG-jl9NO_83u5OI1MF8-2PC",
         },
         .zcheck = .{
-            .url = "https://github.com/joelreymont/zcheck/archive/refs/heads/master.tar.gz",
-            .hash = "zcheck-0.1.0-Px1bihTWAAAkvAodyD2kta9DXdUztoCIfdS1s6TzqghA",
+            .url = "https://github.com/joelreymont/zcheck/archive/4b3b885864b30fd09ecf7ca397aedce4da7c39be.tar.gz",
+            .hash = "zcheck-0.1.0-Px1biqfWAACMYPXbbytGNG8-bE6dy3Qa0rF9Xgzyk0pe",
         },
     },
     .paths = .{

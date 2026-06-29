@@ -227,3 +227,9 @@ Detecting ESC during streaming requires a dedicated InputWatcher thread (mirrors
 - Don't assume `generateSummary` can be reused for different output shapes — verify the actual struct
 - Don't use `tool_result` events for non-tool data — Anthropic API validates tool_use pairing
 - Don't claim proofs verify "existing code" when they model planned code — label clearly
+
+## Session Notes (2026-06-22)
+
+### Runtime Policy Cutovers
+- Direct-provider runtime work must fail closed in the app entry points, not only in docs. Gate native provider construction behind `--provider-cmd`/`PZ_PROVIDER_CMD`, make `/login` refuse credential capture, and update tests so API-key save expectations cannot silently re-enable direct provider APIs.
+- Real-provider E2E/PTY tests must skip unless they exercise an approved CLI adapter path. Ambient `ANTHROPIC_API_KEY`, OAuth files, or copied `~/.pz/auth.json` are not acceptable validation paths for this fork.

@@ -24,7 +24,7 @@ A security-first coding harness rewritten from the ground up in Zig for enterpri
 - **9 built-in tools** — `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `ask`, `web`
 - **Skills** — discoverable `/skillname` slash commands with frontmatter, registry, and policy gating
 - **Session management** — persist, resume, fork, name, export, share as gist
-- **OAuth + API key auth** — automatic token refresh, multi-provider support
+- **Provider command adapters** — route model calls through explicit approved CLI adapters
 - **Thinking modes** — adaptive and budget-capped extended thinking
 - **Prompt caching** — automatic cache_control on system messages
 - **Headless modes** — `--print`, `--json`, and `rpc` for scripting and integration
@@ -88,8 +88,8 @@ Release builds require `-Dgit-hash=<hash>` and embed `CHANGELOG.md`. Debug build
 # Canonical state lives under ~/.pz/ and ./.pz/
 pz
 
-# Explicit provider and model
-pz --provider anthropic --model claude-sonnet-4-20250514
+# Explicit approved provider command adapter
+PZ_PROVIDER_CMD='<approved-pz-provider-adapter>' pz --provider anthropic --model claude-sonnet-4-20250514
 
 # Headless
 pz --print "explain this codebase"
@@ -113,7 +113,7 @@ Canonical `pz` state lives under `.pz/`:
 
 - `~/.pz/settings.json` — global defaults
 - `./.pz/settings.json` — project-local overrides
-- `~/.pz/auth.json` — OAuth / API key credentials
+- `~/.pz/auth.json` — legacy auth file; direct provider login is disabled in this fork
 - `~/.pz/state.json` — local machine state
 - `~/.pz/sessions/` and `./.pz/sessions/` — persisted sessions
 - `~/.pz/policy.json` and `./.pz/policy.json` — authoritative signed policy bundles

@@ -671,6 +671,14 @@ pub const Manager = struct {
         ctx.mgr.onExit(ctx.job_id, ended_at_ms, wait_term);
     }
 
+    fn childTermCode(value: anytype) i32 {
+        return switch (@typeInfo(@TypeOf(value))) {
+            .@"enum" => @intCast(@intFromEnum(value)),
+            .int, .comptime_int => @intCast(value),
+            else => @compileError("unsupported child wait term payload"),
+        };
+    }
+
     fn onExit(self: *Manager, id: u64, ended_at_ms: i64, wait_term: std.process.Child.WaitError!std.process.Child.Term) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -688,17 +696,17 @@ pub const Manager = struct {
                 },
                 .signal => |sig| {
                     job.state = .signaled;
-                    job.code = @intCast(@intFromEnum(sig));
+                    job.code = childTermCode(sig);
                     job.err_name = null;
                 },
                 .stopped => |sig| {
                     job.state = .stopped;
-                    job.code = @intCast(sig);
+                    job.code = childTermCode(sig);
                     job.err_name = null;
                 },
                 .unknown => |sig| {
                     job.state = .unknown;
-                    job.code = @intCast(sig);
+                    job.code = childTermCode(sig);
                     job.err_name = null;
                 },
             }

@@ -8,12 +8,15 @@ All notable changes to this project will be documented in this file.
 - Native OpenAI streaming provider (`/v1/responses`) with text, reasoning, tool-call, usage, and stop/error event mapping.
 
 ### Changed
+- Direct provider runtime paths now fail closed unless `--provider-cmd` or `PZ_PROVIDER_CMD` supplies an approved CLI adapter.
+- `/login` and RPC login now reject direct provider credential capture instead of saving API keys or starting provider OAuth.
 - Runtime native-provider selection is now provider-aware (`anthropic` and `openai`) instead of Anthropic-only.
 - OAuth token refresh is now provider-scoped in shared auth code (`refreshOAuthForProvider`), with Anthropic and OpenAI using the same typed flow.
 - Missing-provider diagnostics are now provider-specific for native providers and explicit for unsupported native labels.
 - Removed Pi-parity-specific snapshot/doc naming from runtime/TUI tests and docs in favor of pz-owned behavior coverage.
 
 ### Tests
+- Updated runtime, RPC, TUI, PTY, and provider-bridge coverage to reject direct provider API credentials and real provider calls.
 - Added comprehensive OpenAI provider unit tests for SSE event parsing, tool-call assembly, usage/stop mapping, and request-body conversion.
 - Added auth unit tests for provider-specific refresh request encoding and unsupported-provider rejection.
 - Added runtime regression for unsupported native provider labels when `--provider-cmd` is not set.

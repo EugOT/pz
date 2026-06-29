@@ -291,28 +291,28 @@ const rule_map = std.StaticStringMap(Rule).initComptime(.{
         "RefreshFailed",
         Rule{
             .summary = "OAuth token refresh failed",
-            .next = "run /login to re-authenticate",
+            .next = "configure PZ_PROVIDER_CMD with an approved CLI adapter",
         },
     },
     .{
         "RefreshInvalidGrant",
         Rule{
             .summary = "OAuth refresh token expired or revoked",
-            .next = "run /login to re-authenticate",
+            .next = "configure PZ_PROVIDER_CMD with an approved CLI adapter",
         },
     },
     .{
         "AuthNotFound",
         Rule{
-            .summary = "no credentials found",
-            .next = "run /login or set ANTHROPIC_API_KEY",
+            .summary = "direct provider credentials are disabled",
+            .next = "configure PZ_PROVIDER_CMD with an approved CLI adapter",
         },
     },
     .{
         "AuthCorrupt",
         Rule{
             .summary = "credentials file is corrupt",
-            .next = "delete ~/.pz/auth.json and run /login",
+            .next = "remove stale ~/.pz/auth.json entries and configure PZ_PROVIDER_CMD",
         },
     },
     .{
@@ -389,21 +389,21 @@ const rule_map = std.StaticStringMap(Rule).initComptime(.{
         "ProviderNotConfigured",
         Rule{
             .summary = "no provider configured",
-            .next = "run /login or set ANTHROPIC_API_KEY to configure a provider",
+            .next = "configure PZ_PROVIDER_CMD with an approved CLI adapter",
         },
     },
     .{
         "MissingProviderStream",
         Rule{
             .summary = "no provider available",
-            .next = "run /login to authenticate or set an API key",
+            .next = "configure PZ_PROVIDER_CMD with an approved CLI adapter",
         },
     },
     .{
         "TokenExchangeFailed",
         Rule{
-            .summary = "OAuth authorization failed",
-            .next = "try /login again; if it persists, check console.anthropic.com for account issues",
+            .summary = "OAuth authorization is disabled by policy",
+            .next = "configure PZ_PROVIDER_CMD with an approved CLI adapter",
         },
     },
 });
