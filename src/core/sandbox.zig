@@ -282,6 +282,12 @@ fn isWithin(root: []const u8, path: []const u8) bool {
 pub const sensitive_env = [_][]const u8{
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "VERTEX_API_KEY",
+    "VERTEX_PROJECT",
+    "VERTEX_LOCATION",
     "PZ_API_KEY",
     "PZ_AUTH_TOKEN",
     "AWS_SECRET_ACCESS_KEY",
@@ -373,6 +379,10 @@ test "scrubEnv removes sensitive keys and preserves others" {
     try env.put("PATH", "/usr/bin");
     try env.put("ANTHROPIC_API_KEY", "sk-secret");
     try env.put("OPENAI_API_KEY", "sk-openai");
+    try env.put("GOOGLE_API_KEY", "google-secret");
+    try env.put("GEMINI_API_KEY", "gemini-secret");
+    try env.put("GOOGLE_APPLICATION_CREDENTIALS", "/tmp/gcp.json");
+    try env.put("VERTEX_PROJECT", "vertex-project");
     try env.put("HOME", "/home/user");
     try env.put("GITHUB_TOKEN", "ghp_tok");
 
@@ -380,6 +390,10 @@ test "scrubEnv removes sensitive keys and preserves others" {
 
     try std.testing.expect(env.get("ANTHROPIC_API_KEY") == null);
     try std.testing.expect(env.get("OPENAI_API_KEY") == null);
+    try std.testing.expect(env.get("GOOGLE_API_KEY") == null);
+    try std.testing.expect(env.get("GEMINI_API_KEY") == null);
+    try std.testing.expect(env.get("GOOGLE_APPLICATION_CREDENTIALS") == null);
+    try std.testing.expect(env.get("VERTEX_PROJECT") == null);
     try std.testing.expect(env.get("GITHUB_TOKEN") == null);
     try std.testing.expectEqualStrings("/usr/bin", env.get("PATH").?);
     try std.testing.expectEqualStrings("/home/user", env.get("HOME").?);

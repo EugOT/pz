@@ -88,8 +88,11 @@ Release builds require `-Dgit-hash=<hash>` and embed `CHANGELOG.md`. Debug build
 # Canonical state lives under ~/.pz/ and ./.pz/
 pz
 
-# Explicit approved provider command adapter
-PZ_PROVIDER_CMD='<approved-pz-provider-adapter>' pz --provider anthropic --model claude-sonnet-4-20250514
+# Default approved provider command adapter
+pz --provider codex --model gpt-5.5
+
+# Explicit approved provider command adapter override
+PZ_PROVIDER_CMD='pz-provider-codex' pz --provider codex --model gpt-5.5
 
 # Headless
 pz --print "explain this codebase"

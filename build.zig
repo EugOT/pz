@@ -99,6 +99,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("build_options", options);
     b.installArtifact(exe);
+    b.installFile("tools/provider-codex", "bin/pz-provider-codex");
     test_options.addOptionPath("pz_bin_path", exe.getEmittedBin());
 
     const build_step = b.step("build", "Build the executable");

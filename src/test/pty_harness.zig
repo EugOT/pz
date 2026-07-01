@@ -213,13 +213,21 @@ fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
     while (off < data.len) off += try fdWrite(fd, data[off..]);
 }
 
+fn waitSignal(value: anytype) std.posix.SIG {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .int, .comptime_int => @enumFromInt(value),
+        .@"enum" => @enumFromInt(@intFromEnum(value)),
+        else => @compileError("wait status signal must be integer-like"),
+    };
+}
+
 fn mapWaitStatus(status: c_int) std.process.Child.Term {
     return if (c.WIFEXITED(status))
         .{ .exited = @intCast(c.WEXITSTATUS(status)) }
     else if (c.WIFSIGNALED(status))
-        .{ .signal = @enumFromInt(c.WTERMSIG(status)) }
+        .{ .signal = waitSignal(c.WTERMSIG(status)) }
     else if (c.WIFSTOPPED(status))
-        .{ .stopped = @intCast(c.WSTOPSIG(status)) }
+        .{ .stopped = waitSignal(c.WSTOPSIG(status)) }
     else
         .{ .unknown = @intCast(status) };
 }
@@ -1158,7 +1166,7 @@ test "UX1 PTY startup shows version, hints, cwd and quits cleanly" {
 
     const steps = [_]InteractiveStep{
         .{ .wait_for = .{ .text = "drop files", .timeout_ms = 8000 } },
-        .{ .wait_for = .{ .text = "claude-opus-4-6", .timeout_ms = 5000 } },
+        .{ .wait_for = .{ .text = "gpt-5.5", .timeout_ms = 5000 } },
         .{ .inject = "\x03" }, // ctrl-c once (clear)
         .{ .sleep = 400 },
         .{ .inject = "\x03" }, // ctrl-c again (quit)
@@ -2906,23 +2914,46 @@ test "UX6 walkthrough: new and name" {
     try std.testing.expect(out.output.len > 0);
 }
 
-test "UX7 walkthrough: missing auth shows guidance" {
+test "UX7 walkthrough: default provider command uses codex adapter" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "home/.pz");
+    try tmp.dir.createDirPath(std.testing.io, "bin");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "bin/pz-provider-codex",
+        .data =
+        \\#!/bin/sh
+        \\cat >/dev/null
+        \\printf 'text:default codex adapter\nstop:done\n'
+        ,
+    });
+    try tmp.dir.setFilePermissions(
+        std.testing.io,
+        "bin/pz-provider-codex",
+        .fromMode(0o755),
+        .{},
+    );
     const cwd = try realPathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(cwd);
     const home = try realPathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
+    const bin = try realPathAlloc(alloc, tmp.dir, "bin");
+    defer alloc.free(bin);
     var env = try baseEnv(alloc, home);
     defer env.deinit();
 
-    // Start pz with no provider-cmd and no credentials, then submit a prompt.
+    const old_path = env.get("PATH") orelse "";
+    const path = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ bin, old_path });
+    defer alloc.free(path);
+    try env.put("PATH", path);
+
+    // Start pz with no explicit provider-cmd. The default pz-provider-codex
+    // adapter on PATH should handle the request, not a direct provider client.
     const steps = [_]InteractiveStep{
         .{ .wait_for = .{ .text = "drop files", .timeout_ms = 8000 } },
         .{ .inject = "hello\n" },
-        .{ .wait_for = .{ .text = "provider", .timeout_ms = 10000 } },
+        .{ .wait_for = .{ .text = "default codex adapter", .timeout_ms = 10000 } },
         .{ .inject = "\x03\x03" },
         .{ .sleep = 500 },
     };
@@ -2932,12 +2963,7 @@ test "UX7 walkthrough: missing auth shows guidance" {
     }, &steps);
     defer out.deinit(alloc);
 
-    // Should show guidance about the approved provider command adapter path.
-    const has_guidance = std.mem.indexOf(u8, out.output, "provider unavailable") != null or
-        std.mem.indexOf(u8, out.output, "direct provider runtimes are disabled by policy") != null or
-        std.mem.indexOf(u8, out.output, "PZ_PROVIDER_CMD") != null or
-        std.mem.indexOf(u8, out.output, "provider") != null;
-    try std.testing.expect(has_guidance);
+    try std.testing.expect(std.mem.indexOf(u8, out.output, "default codex adapter") != null);
 }
 
 test "UX8 walkthrough: bg run and list" {

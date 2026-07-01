@@ -42,7 +42,8 @@ jobs:
       - name: package
         run: |
           cd zig-out/bin
-          tar czf ../../${{ matrix.artifact }}.tar.gz pz
+          test -x pz-provider-codex
+          tar czf ../../${{ matrix.artifact }}.tar.gz pz pz-provider-codex
           cd ../..
 
       - name: upload artifact
