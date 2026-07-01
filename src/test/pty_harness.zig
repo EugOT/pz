@@ -219,7 +219,7 @@ fn mapWaitStatus(status: c_int) std.process.Child.Term {
     else if (c.WIFSIGNALED(status))
         .{ .signal = @enumFromInt(c.WTERMSIG(status)) }
     else if (c.WIFSTOPPED(status))
-        .{ .stopped = @enumFromInt(c.WSTOPSIG(status)) }
+        .{ .stopped = @intCast(c.WSTOPSIG(status)) }
     else
         .{ .unknown = @intCast(status) };
 }
