@@ -213,13 +213,21 @@ fn writeAllFd(fd: std.posix.fd_t, data: []const u8) !void {
     while (off < data.len) off += try fdWrite(fd, data[off..]);
 }
 
+fn waitSignal(value: anytype) std.posix.SIG {
+    return switch (@typeInfo(@TypeOf(value))) {
+        .int, .comptime_int => @enumFromInt(value),
+        .@"enum" => @enumFromInt(@intFromEnum(value)),
+        else => @compileError("wait status signal must be integer-like"),
+    };
+}
+
 fn mapWaitStatus(status: c_int) std.process.Child.Term {
     return if (c.WIFEXITED(status))
         .{ .exited = @intCast(c.WEXITSTATUS(status)) }
     else if (c.WIFSIGNALED(status))
-        .{ .signal = @enumFromInt(c.WTERMSIG(status)) }
+        .{ .signal = waitSignal(c.WTERMSIG(status)) }
     else if (c.WIFSTOPPED(status))
-        .{ .stopped = @intCast(c.WSTOPSIG(status)) }
+        .{ .stopped = waitSignal(c.WSTOPSIG(status)) }
     else
         .{ .unknown = @intCast(status) };
 }
